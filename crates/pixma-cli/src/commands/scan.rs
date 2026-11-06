@@ -30,13 +30,7 @@ pub async fn execute_scan(
         .map_err(|e| anyhow::anyhow!("Unsupported scanning resolution: {e}"))?;
     let color_mode: ScanColorMode = mode_arg.into();
     let full = ScanGeometry::full_platen(resolution);
-    let max_safe_w = if color_mode.bytes_per_pixel() == 3 {
-        // Buffer is 65536 bytes; 16 lines => 4095 bytes/line => 1365 pixels
-        (65500 / (3 * 16)).min(full.width)
-    } else {
-        full.width
-    };
-    let width = width_opt.unwrap_or(max_safe_w).min(full.width).max(1);
+    let width = width_opt.unwrap_or(full.width).min(full.width).max(1);
     let height = height_opt.unwrap_or(full.height).min(full.height).max(1);
 
     let geometry = ScanGeometry {

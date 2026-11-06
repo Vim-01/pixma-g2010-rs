@@ -51,11 +51,11 @@ impl ScanResolution {
     }
 
     /// Maximum flatbed scan dimensions `(max_width_px, max_height_px)` at this resolution
-    /// ($8.5\text{"} \times 11.7\text{"}$ platen).
+    /// (638 x 877 pixels at 75 DPI base platen geometry for Canon PIXMA G2010 `04a9:183a`).
     pub const fn max_flatbed_pixels(self) -> (u32, u32) {
         let dpi = self.as_dpi() as u32;
-        let max_w = (dpi * 85) / 10;
-        let max_h = (dpi * 117) / 10;
+        let max_w = (dpi * 638) / 75;
+        let max_h = (dpi * 877) / 75;
         (max_w, max_h)
     }
 }

@@ -17,12 +17,13 @@ use pixma_protocol::ivec::{
     build_bjl_set_time_send_data, build_cancel_job, build_cleaning_cmd, build_end_job,
     build_get_status_cmd, build_manual_alignment_values_cmd, build_mode_shift,
     build_roller_cleaning_cmd, build_send_data_header, build_set_job_configuration,
-    build_set_page_configuration, build_start_job, build_test_print_cmd, parse_status_response,
+    build_set_maintenance_job_configuration, build_set_page_configuration, build_start_job,
+    build_test_print_cmd, parse_status_response,
 };
 use pixma_protocol::mp2_scanner::{
-    build_cancel_or_finish_scan, build_get_calibration_status, build_get_data_status,
-    build_read_scan_chunk, build_set_lamp, build_set_scan_parameter, build_start_scan,
-    parse_scan_chunk_response,
+    aligned_scan_width, build_cancel_or_finish_scan, build_gamma_table,
+    build_get_calibration_status, build_read_scan_chunk_with_req, build_set_scan_parameter,
+    build_start_scan, build_start_session, parse_scan_chunk_response,
 };
 use pixma_protocol::pwg_raster::{encode_pwg_page, PwgRasterHeader};
 
@@ -199,22 +200,14 @@ impl<T: UsbTransport> G2010Controller<T> {
 
         let mut rx_buf = [0u8; 1024];
 
-        // Frame maintenance operation in protocol-2 job lifecycle:
-        // SetJobConfiguration -> StartJob -> BJL SetTime -> Maintenance XML -> EndJob
-        let set_job = build_set_job_configuration(job_id, None);
-        self.transport.write_printer(set_job.as_bytes()).await?;
-        let _ = self.transport.read_printer(&mut rx_buf).await;
-
-        let start_job = build_start_job("print", job_id);
+        // Frame maintenance operation in Canon protocol-2 maintenance job lifecycle:
+        // StartJob("maintenance") -> SetJobConfiguration("maintenance") -> Maintenance XML -> EndJob("maintenance")
+        let start_job = build_start_job("maintenance", job_id);
         self.transport.write_printer(start_job.as_bytes()).await?;
         let _ = self.transport.read_printer(&mut rx_buf).await;
 
-        let bjl_send_data = build_bjl_set_time_send_data(job_id);
-        self.transport
-            .write_printer(bjl_send_data.as_bytes())
-            .await?;
-        let bjl_payload = BjlBuilder::time_sync_payload("20261107003000");
-        self.transport.write_printer(&bjl_payload).await?;
+        let set_job = build_set_maintenance_job_configuration(job_id, "20261107025500");
+        self.transport.write_printer(set_job.as_bytes()).await?;
         let _ = self.transport.read_printer(&mut rx_buf).await;
 
         match action {
@@ -243,7 +236,7 @@ impl<T: UsbTransport> G2010Controller<T> {
             }
         }
 
-        let end_job = build_end_job("print", job_id);
+        let end_job = build_end_job("maintenance", job_id);
         self.transport.write_printer(end_job.as_bytes()).await?;
         let _ = self.transport.read_printer(&mut rx_buf).await;
 
@@ -401,70 +394,208 @@ impl<T: UsbTransport> G2010Controller<T> {
         let scan_job_id = self.next_job_id();
         let mut rx_buf = [0u8; 1024];
 
-        // 1. IVEC StartJob
+        // 1. IVEC StartJob (with automatic recovery if a previous scan aborted in MP2 binary mode)
         let start_job = build_start_job("scan", scan_job_id);
         self.transport.write_scanner(start_job.as_bytes()).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
+        match self.transport.read_scanner(&mut rx_buf).await {
+            Ok(n) if n >= 5 && &rx_buf[..5] == b"<?xml" => {}
+            _ => {
+                let cancel = build_cancel_or_finish_scan();
+                let _ = self.transport.write_scanner(&cancel).await;
+                let _ = self.transport.read_scanner(&mut rx_buf).await;
+                let end_prev = build_end_job("scan", 1);
+                let _ = self.transport.write_scanner(end_prev.as_bytes()).await;
+                let _ = self.transport.read_scanner(&mut rx_buf).await;
+                self.transport.write_scanner(start_job.as_bytes()).await?;
+                let _ = self.transport.read_scanner(&mut rx_buf).await?;
+            }
+        }
 
         // 2. ModeShift to binary MP2 mode
         let mode_shift = build_mode_shift("scan", scan_job_id, 1);
         self.transport.write_scanner(mode_shift.as_bytes()).await?;
         let _ = self.transport.read_scanner(&mut rx_buf).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // 3. GetDataStatus
-        let cmd = build_get_data_status();
+        // 3. StartSession (0xDB20), recovering if a previous session was left open
+        let cmd = build_start_session();
         self.transport.write_scanner(&cmd).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
-
-        // 4. GetCalibrationStatus
-        let cmd = build_get_calibration_status();
-        self.transport.write_scanner(&cmd).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
-
-        // 5. SetLamp (ON)
-        let cmd = build_set_lamp(true);
-        self.transport.write_scanner(&cmd).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
-
-        // 6. SetScanParameter (72 bytes)
-        let cmd =
-            build_set_scan_parameter(params).map_err(|e| DriverError::Protocol(e.to_string()))?;
-        self.transport.write_scanner(&cmd).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
-
-        // 7. StartScan
-        let cmd = build_start_scan();
-        self.transport.write_scanner(&cmd).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
-
-        // 8. Loop ReadScanChunk
-        let mut accumulated_bytes = Vec::new();
-        let mut chunk_buf = vec![0u8; 65536];
-
-        loop {
-            let cmd = build_read_scan_chunk();
+        let n = self.transport.read_scanner(&mut rx_buf).await?;
+        if n >= 2 && rx_buf[0] == 0x15 && rx_buf[1] == 0x15 {
+            let cancel = build_cancel_or_finish_scan();
+            let _ = self.transport.write_scanner(&cancel).await;
+            let _ = self.transport.read_scanner(&mut rx_buf).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             self.transport.write_scanner(&cmd).await?;
-            let n = self.transport.read_scanner(&mut chunk_buf).await?;
-            if n == 0 {
-                break;
-            }
+            let _ = self.transport.read_scanner(&mut rx_buf).await?;
+        }
 
-            let packet = parse_scan_chunk_response(&chunk_buf[..n])
-                .map_err(|e| DriverError::Protocol(e.to_string()))?;
-
-            accumulated_bytes.extend_from_slice(&packet.payload);
-
-            if packet.is_scan_complete {
-                break;
+        // 4. SendGammaTable (0xEE20, 2072 bytes) x 3 channels (R, G, B) using hardware sRGB 2.2 LUT
+        let gamma_cmd = build_gamma_table(2.2);
+        for ch in 0..3 {
+            self.transport.write_scanner(&gamma_cmd).await?;
+            let n = self.transport.read_scanner(&mut rx_buf).await?;
+            if n < 2 || rx_buf[0] != 0x06 || rx_buf[1] != 0x06 {
+                let cancel = build_cancel_or_finish_scan();
+                let _ = self.transport.write_scanner(&cancel).await;
+                let _ = self.transport.read_scanner(&mut rx_buf).await;
+                let end_job = build_end_job("scan", scan_job_id);
+                let _ = self.transport.write_scanner(end_job.as_bytes()).await;
+                let _ = self.transport.read_scanner(&mut rx_buf).await;
+                return Err(DriverError::Protocol(format!(
+                    "Scanner rejected SendGammaTable (channel {ch}): {:02X?}",
+                    &rx_buf[..n.min(8)]
+                )));
             }
         }
 
-        // 9. SetLamp (OFF)
-        let cmd = build_set_lamp(false);
-        let _ = self.transport.write_scanner(&cmd).await;
-        let _ = self.transport.read_scanner(&mut rx_buf).await;
+        // 5. SetScanParameter (0xD820, 72 bytes)
+        let cmd =
+            build_set_scan_parameter(params).map_err(|e| DriverError::Protocol(e.to_string()))?;
+        self.transport.write_scanner(&cmd).await?;
+        let n = self.transport.read_scanner(&mut rx_buf).await?;
+        if n < 2 || rx_buf[0] != 0x06 || rx_buf[1] != 0x06 {
+            let cancel = build_cancel_or_finish_scan();
+            let _ = self.transport.write_scanner(&cancel).await;
+            let _ = self.transport.read_scanner(&mut rx_buf).await;
+            let end_job = build_end_job("scan", scan_job_id);
+            let _ = self.transport.write_scanner(end_job.as_bytes()).await;
+            let _ = self.transport.read_scanner(&mut rx_buf).await;
+            return Err(DriverError::Protocol(format!(
+                "Scanner rejected SetScanParameter (0xD820): {:02X?}",
+                &rx_buf[..n.min(8)]
+            )));
+        }
 
-        // 10. CancelOrFinishScan
+        // 6. StartScan (0xD920)
+        let cmd = build_start_scan();
+        self.transport.write_scanner(&cmd).await?;
+        let n = self.transport.read_scanner(&mut rx_buf).await?;
+        if n < 2 || rx_buf[0] != 0x06 || rx_buf[1] != 0x06 {
+            let cancel = build_cancel_or_finish_scan();
+            let _ = self.transport.write_scanner(&cancel).await;
+            let _ = self.transport.read_scanner(&mut rx_buf).await;
+            let end_job = build_end_job("scan", scan_job_id);
+            let _ = self.transport.write_scanner(end_job.as_bytes()).await;
+            let _ = self.transport.read_scanner(&mut rx_buf).await;
+            return Err(DriverError::Protocol(format!(
+                "Scanner rejected StartScan (0xD920): {:02X?}",
+                &rx_buf[..n.min(8)]
+            )));
+        }
+
+        // 7. Poll GetCalibrationStatus (0xDA20) until (resp[8] & 0x03) != 0 (calibrated & ready)
+        for iter in 0..60 {
+            let cmd = build_get_calibration_status();
+            self.transport.write_scanner(&cmd).await?;
+            let n = self.transport.read_scanner(&mut rx_buf).await?;
+            if n >= 9 && rx_buf[0] == 0x06 && rx_buf[1] == 0x06 && (rx_buf[8] & 0x03) != 0 {
+                if iter > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                break;
+            }
+            let _ = self.transport.poll_interrupt().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 8. Loop ReadScanChunk (0xD420)
+        let raw_width = aligned_scan_width(params) as usize;
+        let target_width = params.geometry.width as usize;
+        let xs = (params.geometry.x_offset & 31) as usize;
+        let bpp = params.color_mode.bytes_per_pixel();
+        let height = params.geometry.height as usize;
+        let target_raw_bytes = raw_width * height * bpp;
+
+        let mut accumulated_bytes = Vec::with_capacity(target_raw_bytes);
+        let mut chunk_buf = vec![0u8; 262_160];
+        let req_word: u32 = 0x0008_0008;
+        let mut busy_retries = 0u32;
+
+        loop {
+            let cmd = build_read_scan_chunk_with_req(req_word);
+            self.transport.write_scanner(&cmd).await?;
+            let mut total_read = self.transport.read_scanner(&mut chunk_buf[..512]).await?;
+            if total_read == 0 {
+                break;
+            }
+
+            if total_read == 8 && chunk_buf[0] == 0x15 && chunk_buf[1] == 0x15 {
+                busy_retries += 1;
+                if busy_retries > 2000 {
+                    let cancel = build_cancel_or_finish_scan();
+                    let _ = self.transport.write_scanner(&cancel).await;
+                    let _ = self.transport.read_scanner(&mut rx_buf).await;
+                    let end_job = build_end_job("scan", scan_job_id);
+                    let _ = self.transport.write_scanner(end_job.as_bytes()).await;
+                    let _ = self.transport.read_scanner(&mut rx_buf).await;
+                    return Err(DriverError::Protocol(
+                        "Scanner returned 0x1515 (NAK/BUSY) during ReadScanChunk".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            busy_retries = 0;
+
+            if total_read >= 16 && chunk_buf[0] == 0x06 && chunk_buf[1] == 0x06 {
+                let payload_len =
+                    u32::from_be_bytes(chunk_buf[12..16].try_into().unwrap()) as usize;
+                let expected_total = 16 + payload_len;
+                if chunk_buf.len() < expected_total {
+                    chunk_buf.resize(expected_total, 0);
+                }
+                while total_read < expected_total {
+                    let more = self
+                        .transport
+                        .read_scanner(&mut chunk_buf[total_read..expected_total])
+                        .await?;
+                    if more == 0 {
+                        break;
+                    }
+                    total_read += more;
+                }
+            }
+
+            let packet = parse_scan_chunk_response(&chunk_buf[..total_read])
+                .map_err(|e| DriverError::Protocol(e.to_string()))?;
+
+            if !packet.payload.is_empty() {
+                accumulated_bytes.extend_from_slice(&packet.payload);
+            }
+
+            if packet.is_scan_complete
+                || accumulated_bytes.len() >= target_raw_bytes
+                || (packet.is_page_end && packet.payload.is_empty())
+            {
+                break;
+            }
+
+            if packet.payload.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // 9. Crop 32-pixel aligned hardware scanline width down to requested width if needed
+        if raw_width > target_width || xs > 0 {
+            let raw_stride = raw_width * bpp;
+            let target_stride = target_width * bpp;
+            let xs_bytes = xs * bpp;
+            if accumulated_bytes.len() >= raw_stride * height
+                && xs_bytes + target_stride <= raw_stride
+            {
+                let mut cropped = Vec::with_capacity(target_stride * height);
+                for y in 0..height {
+                    let row_start = y * raw_stride + xs_bytes;
+                    cropped.extend_from_slice(
+                        &accumulated_bytes[row_start..row_start + target_stride],
+                    );
+                }
+                accumulated_bytes = cropped;
+            }
+        }
+
+        // 10. CancelOrFinishScan (0xEF20)
         let cmd = build_cancel_or_finish_scan();
         let _ = self.transport.write_scanner(&cmd).await;
         let _ = self.transport.read_scanner(&mut rx_buf).await;

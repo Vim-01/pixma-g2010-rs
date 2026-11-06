@@ -57,25 +57,48 @@ pub fn build_set_job_configuration(job_id: u32, document_title: Option<&str>) ->
     )
 }
 
-/// Generates the `StartJob` IVEC XML command for a print or scan session.
+/// Generates the `StartJob` IVEC XML command for a print, scan, or maintenance session.
 pub fn build_start_job(service_type: &str, job_id: u32) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>StartJob</ivec:operation>
-    <ivec:param_set servicetype="{service_type}">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:bidi>1</ivec:bidi>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>StartJob</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:bidi>0</ivec:bidi><ivec:jobname/><ivec:username/><ivec:computername/><ivec:job_description><![CDATA[1]]></ivec:job_description><vcn:host_environment>linux</vcn:host_environment></ivec:param_set></ivec:contents></cmd>"#
+    )
+}
+
+/// Generates the `SetJobConfiguration` IVEC XML command for a maintenance session.
+pub fn build_set_maintenance_job_configuration(job_id: u32, datetime: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>SetJobConfiguration</ivec:operation><ivec:param_set servicetype="maintenance"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:datetime>{datetime}</ivec:datetime></ivec:param_set></ivec:contents></cmd>"#
+    )
+}
+
+/// Generates the `SetConfiguration` IVEC XML command for a print job.
+pub fn build_set_print_configuration(config: &PrintJobConfig) -> String {
+    let borderless_str = if config.borderless.is_borderless() {
+        "ON"
+    } else {
+        "OFF"
+    };
+    let colormode_str = if config.color.grayscale {
+        "monochrome"
+    } else {
+        "color"
+    };
+    let duplex_print = match config.duplex {
+        DuplexMode::Off => "OFF",
+        DuplexMode::LongEdge | DuplexMode::ShortEdge => "ON",
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>SetConfiguration</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:papersize>{papersize}</ivec:papersize><ivec:papertype>{mediatype}</ivec:papertype><ivec:borderlessprint>{borderless_str}</ivec:borderlessprint><ivec:printcolormode>{colormode_str}</ivec:printcolormode><ivec:duplexprint>{duplex_print}</ivec:duplexprint></ivec:param_set></ivec:contents></cmd>"#,
+        job_id = config.job_id,
+        papersize = config.paper_size.ivec_xml_value(),
+        mediatype = config.media_type.ivec_xml_value(),
     )
 }
 
 /// Generates the `SendData` IVEC XML header for BJL time synchronization.
 ///
-/// Data format is `RAW` with exact data size `62` bytes.
+/// Format is `RAW` with exact data size `62` bytes.
 pub fn build_bjl_set_time_send_data(job_id: u32) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
@@ -84,7 +107,7 @@ pub fn build_bjl_set_time_send_data(job_id: u32) -> String {
     <ivec:operation>SendData</ivec:operation>
     <ivec:param_set servicetype="print">
       <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:dataformat>RAW</ivec:dataformat>
+      <ivec:format>RAW</ivec:format>
       <ivec:datasize>62</ivec:datasize>
     </ivec:param_set>
   </ivec:contents>
@@ -171,37 +194,16 @@ pub fn build_set_page_configuration(config: &PrintJobConfig, page_no: u32) -> St
 
 /// Generates the `SendData` IVEC XML header preceding page raster payloads.
 pub fn build_send_data_header(job_id: u32, page_no: u32, format: &str, data_size: usize) -> String {
+    let _ = page_no;
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>SendData</ivec:operation>
-    <ivec:param_set servicetype="print">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:phase>start</ivec:phase>
-      <ivec:PageNo>{page_no}</ivec:PageNo>
-      <ivec:dataformat>{format}</ivec:dataformat>
-      <ivec:datasize>{data_size}</ivec:datasize>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>SendData</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:format>{format}</ivec:format><ivec:datasize>{data_size}</ivec:datasize></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
 /// Generates the `ModeShift` IVEC XML command (e.g. switching interface 0 into binary MP2 mode).
 pub fn build_mode_shift(service_type: &str, job_id: u32, mode: u8) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}">
-  <ivec:contents>
-    <ivec:operation>VendorCmd</ivec:operation>
-    <ivec:param_set servicetype="{service_type}">
-      <vcn:ijoperation>ModeShift</vcn:ijoperation>
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <vcn:ijmode>{mode}</vcn:ijmode>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>VendorCmd</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID><vcn:ijoperation>ModeShift</vcn:ijoperation><vcn:ijmode>{mode}</vcn:ijmode></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
@@ -242,18 +244,7 @@ pub fn build_cancel_job(service_type: &str, job_id: u32) -> String {
 /// Generates the `Cleaning` IVEC maintenance command (`regular`, `deep`, or `choke`).
 pub fn build_cleaning_cmd(job_id: u32, kind: CleaningType, target: CleaningTarget) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>Cleaning</ivec:operation>
-    <ivec:param_set servicetype="maintenance">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:type>{kind}</ivec:type>
-      <ivec:target>{target}</ivec:target>
-      <ivec:bidirectional>OFF</ivec:bidirectional>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>Cleaning</ivec:operation><ivec:param_set servicetype="maintenance"><ivec:inkgroup>{target}</ivec:inkgroup><ivec:type>{kind}</ivec:type><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#,
         kind = kind.ivec_xml_value(),
         target = target.ivec_xml_value(),
     )
@@ -262,16 +253,7 @@ pub fn build_cleaning_cmd(job_id: u32, kind: CleaningType, target: CleaningTarge
 /// Generates the `RollerCleaning` IVEC maintenance command (`roller` or `platen`).
 pub fn build_roller_cleaning_cmd(job_id: u32, target: RollerCleanTarget) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>RollerCleaning</ivec:operation>
-    <ivec:param_set servicetype="maintenance">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:target>{target}</ivec:target>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>RollerCleaning</ivec:operation><ivec:param_set servicetype="maintenance"><ivec:target>{target}</ivec:target><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#,
         target = target.ivec_xml_value(),
     )
 }
@@ -279,16 +261,7 @@ pub fn build_roller_cleaning_cmd(job_id: u32, target: RollerCleanTarget) -> Stri
 /// Generates the `TestPrint` IVEC diagnostic pattern command (e.g. `nozzle_check`).
 pub fn build_test_print_cmd(job_id: u32, kind: TestPrintType) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>TestPrint</ivec:operation>
-    <ivec:param_set servicetype="maintenance">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:type>{kind}</ivec:type>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>TestPrint</ivec:operation><ivec:param_set servicetype="maintenance"><ivec:type>{kind}</ivec:type><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#,
         kind = kind.ivec_xml_value(),
     )
 }
@@ -583,7 +556,7 @@ mod tests {
     fn builds_bjl_set_time_send_data_xml() {
         let xml = build_bjl_set_time_send_data(3);
         assert!(xml.contains("<ivec:operation>SendData</ivec:operation>"));
-        assert!(xml.contains("<ivec:dataformat>RAW</ivec:dataformat>"));
+        assert!(xml.contains("<ivec:format>RAW</ivec:format>"));
         assert!(xml.contains("<ivec:datasize>62</ivec:datasize>"));
     }
 
@@ -603,8 +576,7 @@ mod tests {
     fn builds_send_data_header_xml() {
         let xml = build_send_data_header(2, 1, "PWGRaster", 123456);
         assert!(xml.contains("<ivec:operation>SendData</ivec:operation>"));
-        assert!(xml.contains("<ivec:PageNo>1</ivec:PageNo>"));
-        assert!(xml.contains("<ivec:dataformat>PWGRaster</ivec:dataformat>"));
+        assert!(xml.contains("<ivec:format>PWGRaster</ivec:format>"));
         assert!(xml.contains("<ivec:datasize>123456</ivec:datasize>"));
     }
 
@@ -626,7 +598,7 @@ mod tests {
         let clean = build_cleaning_cmd(1, CleaningType::InkFlush, CleaningTarget::All);
         assert!(clean.contains("<ivec:operation>Cleaning</ivec:operation>"));
         assert!(clean.contains("<ivec:type>choke</ivec:type>"));
-        assert!(clean.contains("<ivec:target>all</ivec:target>"));
+        assert!(clean.contains("<ivec:inkgroup>all</ivec:inkgroup>"));
 
         let roller = build_roller_cleaning_cmd(2, RollerCleanTarget::FeedRoller);
         assert!(roller.contains("<ivec:operation>RollerCleaning</ivec:operation>"));

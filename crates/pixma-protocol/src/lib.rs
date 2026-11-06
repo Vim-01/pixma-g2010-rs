@@ -24,13 +24,16 @@ pub use ivec::{
     build_bjl_set_time_send_data, build_cancel_job, build_cleaning_cmd, build_end_job,
     build_get_status_cmd, build_manual_alignment_values_cmd, build_mode_shift,
     build_roller_cleaning_cmd, build_send_data_header, build_set_job_configuration,
-    build_set_page_configuration, build_start_job, build_test_print_cmd, parse_status_response,
+    build_set_maintenance_job_configuration, build_set_page_configuration,
+    build_set_print_configuration, build_start_job, build_test_print_cmd, parse_status_response,
     IVEC_COMMON_NS, VCN_CANON_NS,
 };
 pub use mp2_scanner::{
-    build_cancel_or_finish_scan, build_get_calibration_status, build_get_data_status,
-    build_get_opu_mode, build_read_scan_chunk, build_set_lamp, build_set_scan_parameter,
-    build_start_scan, parse_scan_chunk_response, Mp2Opcode, ScanChunkPacket,
+    aligned_scan_width, build_cancel_or_finish_scan, build_gamma_table,
+    build_get_calibration_status, build_get_data_status, build_get_opu_mode, build_read_scan_chunk,
+    build_read_scan_chunk_with_req, build_set_lamp, build_set_scan_parameter, build_start_scan,
+    build_start_session, compute_mp2_checksum, parse_scan_chunk_response, Mp2Opcode,
+    ScanChunkPacket,
 };
 pub use pwg_raster::{
     decode_packbits_scanline, encode_packbits_scanline, encode_pwg_page, CnclIpcFrameHeader,

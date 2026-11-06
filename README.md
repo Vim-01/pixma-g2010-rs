@@ -15,7 +15,7 @@ Full-featured, memory-safe Linux driver, scanner backend, maintenance utility, a
 Canon's official Linux driver packages (`cnijfilter2` and `scangearmp2`) treat the G2010 as an afterthought:
 - **Missing USB IDs & PPDs**: USB Product ID `04a9:183a` (`G2010 series`) and `04a9:183c` (`G1010 series`) are completely omitted from `80-canon_mfp2.rules`, `canon_mfp2.conf`, and `/usr/share/cups/model/`.
 - **Locked Print Engine**: Even when forced to run with a G3010 PPD, `rastertocanonij` only passes 4 flags (`--papersize`, `--media`, `--grayscale`, `--duplex`), locking print resolution to a single 600 DPI preset and ignoring draft mode (`300x300`), fine photo passes, borderless extension sliders, paper gap control, ink drying times, and manual C/M/Y color balance.
-- **65%+ of Hardware Maintenance Missing**: `cmdtocanonij3` hardcodes only three commands (`PrintSelfTestPage`, `Clean all`, `com.canon.autoalignment`). Crucial CISS operations supported by the printer's firmware — independent Black (`group1`) vs Color (`group2`) cleaning, Deep Cleaning (`deep`), **System Ink Flush (`choke`)** for purging air from CISS ink tubes, Roller Cleaning (`roller`), Bottom Plate Cleaning (`platen`), and Manual Head Alignment (`manual_registration` — the only alignment mode G2010/G3010 actually support) — are unreachable on Linux.
+- **65%+ of Hardware Maintenance Missing**: `cmdtocanonij3` hardcodes only three commands (`PrintSelfTestPage`, `Clean all`, `com.canon.autoalignment`). Crucial CISS operations supported by the printer's firmware — independent Black (`inkgroup1`) vs Color (`inkgroup2`) cleaning, Deep Cleaning (`deep`), **System Ink Flush (`choke`)** for purging air from CISS ink tubes, Roller Cleaning (`roller`), Bottom Plate Cleaning (`platen`), and Manual Head Alignment (`manual_registration` — the only alignment mode G2010/G3010 actually support) — are unreachable on Linux.
 - **Discarded Telemetry**: `cnijlgmon3` queries `<ivec:operation>GetStatus</ivec:operation>` over USB, receives full XML telemetry (`<vcn:supportcode>`, `<vcn:statusdetail>`, `<vcn:ink>`, waste ink absorber counters), and throws almost all of it away.
 - **Crippled Scanner**: `scangearmp2` caps flatbed resolution at 600 DPI and lacks CIS line-stagger compensation, auto-multi-crop, deskew, FFT moire descreening, dust removal, gutter shadow correction, and spline tone curves.
 
@@ -121,6 +121,21 @@ pixma-cli scan --dpi 600 --deskew --descreen --auto-crop --output scan.pdf
 # Print an image or internal calibration test page with full media and color controls
 pixma-cli print --test-page --media plain --paper a4 --quality 3
 ```
+
+---
+
+## Secure Print & Scan Server Mode (Public Wi-Fi / Coworking Hardened)
+
+When running on an Arch Linux laptop that travels across untrusted public or coworking networks:
+- `pixma-printer-app.service` (`127.0.0.1:8631`) and `pixma-escl.service` (`127.0.0.1:8080`) bind **exclusively to loopback (`127.0.0.1`)** by default — **zero TCP ports are exposed** on Wi-Fi or LAN interfaces (`0.0.0.0` is never used).
+- `pixmad.service` listens on a local Unix socket (`/run/pixma/pixmad.sock`, mode `0660`, group `lp`) with `ProtectSystem=strict`, `ProtectHome=true`, and `PrivateTmp=true`.
+- **Printing & Scanning from a Desktop Workstation to the Laptop**:
+  - **Via SSH Tunnel (Zero Firewall Changes)**:
+    ```bash
+    ssh -N -L 8631:127.0.0.1:8631 -L 8080:127.0.0.1:8080 user@arch-laptop
+    ```
+    Then point your desktop CUPS / IPP client to `ipp://127.0.0.1:8631/ipp/print` and `sane-airscan` to `http://127.0.0.1:8080/eSCL/`.
+  - **Via WireGuard / Tailscale**: Bind `--bind <wg0-ip>:8631` only on the encrypted tunnel interface and drop incoming traffic on `wlan0` via `nftables`/`ufw`.
 
 ---
 

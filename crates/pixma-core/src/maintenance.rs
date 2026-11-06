@@ -55,14 +55,14 @@ impl CleaningType {
     }
 }
 
-/// Ink group target for cleaning (`all`, `group1` Black, `group2` Color).
+/// Ink group target for cleaning (`all`, `inkgroup1` Black, `inkgroup2` Color).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CleaningTarget {
     /// Both Black (PGBK) and Color (CMY) heads.
     All,
-    /// Black (GI-790 PGBK / BH-4) only (`group1`).
+    /// Black (GI-790 PGBK / BH-4) only (`inkgroup1`).
     BlackOnly,
-    /// Color (GI-790 C/M/Y / CH-41) only (`group2`).
+    /// Color (GI-790 C/M/Y / CH-41) only (`inkgroup2`).
     ColorOnly,
 }
 
@@ -70,8 +70,8 @@ impl CleaningTarget {
     pub const fn ivec_xml_value(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::BlackOnly => "group1",
-            Self::ColorOnly => "group2",
+            Self::BlackOnly => "inkgroup1",
+            Self::ColorOnly => "inkgroup2",
         }
     }
 }

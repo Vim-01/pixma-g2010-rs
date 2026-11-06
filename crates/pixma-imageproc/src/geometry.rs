@@ -35,25 +35,70 @@ pub fn auto_multi_crop(
 
     // Determine whether platen background is bright (white lid closed) or dark (lid open)
     let corner_luma = compute_corner_luminance(img);
-    let is_bright_background = corner_luma > 128.0;
+    let p85_luma = compute_percentile_luminance(img, 0.85);
+    let is_bright_background = if background_threshold == 0 {
+        p85_luma > 180
+    } else {
+        corner_luma > 128.0
+    };
+    let effective_bright_thresh = if background_threshold == 0 && is_bright_background {
+        threshold.max(p85_luma.saturating_sub(28))
+    } else {
+        threshold
+    };
+    let border_bright_thresh = p85_luma.saturating_sub(55);
 
     // Downsample for high-speed connected component analysis on large scans
     let max_dim = width.max(height);
     let scale = (max_dim / 400).max(1);
     let grid_w = (width / scale).max(1);
     let grid_h = (height / scale).max(1);
+    let rim_x = if background_threshold == 0 {
+        (width / 80).max(1)
+    } else {
+        0
+    };
+    let rim_y = if background_threshold == 0 {
+        (height / 110).max(1)
+    } else {
+        0
+    };
+    let border_band_x = if background_threshold == 0 {
+        (width / 22).max(2)
+    } else {
+        0
+    };
+    let border_band_y = if background_threshold == 0 {
+        (height / 32).max(2)
+    } else {
+        0
+    };
 
     let mut mask = vec![false; (grid_w * grid_h) as usize];
     for gy in 0..grid_h {
         for gx in 0..grid_w {
             let src_x = (gx * scale).min(width - 1);
             let src_y = (gy * scale).min(height - 1);
+            if src_x < rim_x || src_y < rim_y || src_x + rim_x >= width || src_y + rim_y >= height {
+                continue;
+            }
+            let in_border_band = src_x < border_band_x
+                || src_y < border_band_y
+                || src_x + border_band_x >= width
+                || src_y + border_band_y >= height;
             let p = img.get_pixel(src_x, src_y);
             let luma =
                 (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).round() as u8;
+            let max_c = p[0].max(p[1]).max(p[2]);
+            let min_c = p[0].min(p[1]).min(p[2]);
+            let chroma = max_c.saturating_sub(min_c);
 
             let is_foreground = if is_bright_background {
-                luma < threshold
+                if in_border_band && background_threshold == 0 {
+                    luma < border_bright_thresh || chroma > 20
+                } else {
+                    luma < effective_bright_thresh || (background_threshold == 0 && chroma > 18)
+                }
             } else {
                 luma > threshold
             };
@@ -123,9 +168,13 @@ pub fn auto_multi_crop(
             let box_h = orig_max_y.saturating_sub(orig_min_y);
             let box_area = box_w * box_h;
 
-            // Filter out dust speckles, border lines, or components that encompass the entire platen
+            // Filter out dust speckles, thin bezel shadow strips, or full-platen boxes
             let platen_area = width * height;
+            let is_thin_border_strip = background_threshold == 0
+                && ((box_w < (width / 20).max(4) && box_h > box_w * 4)
+                    || (box_h < (height / 20).max(4) && box_w > box_h * 4));
             if box_area >= min_area_px
+                && !is_thin_border_strip
                 && (box_area as f64) < (platen_area as f64 * 0.95)
                 && pixel_count >= 8
             {
@@ -392,6 +441,30 @@ fn compute_otsu_threshold(img: &RgbImage) -> u8 {
     best_thresh
 }
 
+/// Computes the requested luminance percentile (`0.0..=1.0`) across the image histogram.
+fn compute_percentile_luminance(img: &RgbImage, quantile: f32) -> u8 {
+    let mut hist = [0u32; 256];
+    let mut total = 0u64;
+    for p in img.pixels() {
+        let luma =
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).round() as usize;
+        hist[luma.min(255)] += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return 255;
+    }
+    let target = ((total as f64) * (quantile.clamp(0.0, 1.0) as f64)).round() as u64;
+    let mut acc = 0u64;
+    for (val, &count) in hist.iter().enumerate() {
+        acc += count as u64;
+        if acc >= target {
+            return val as u8;
+        }
+    }
+    255
+}
+
 /// Measures the average luminance at the 4 corners of the platen image.
 fn compute_corner_luminance(img: &RgbImage) -> f32 {
     let w = img.width();
@@ -410,50 +483,60 @@ fn compute_corner_luminance(img: &RgbImage) -> f32 {
     sum / corners.len() as f32
 }
 
-/// Merges overlapping or adjacent bounding boxes.
+/// Merges overlapping or adjacent bounding boxes until convergence.
 fn merge_overlapping_boxes(boxes: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32, u32, u32)> {
     if boxes.is_empty() {
         return Vec::new();
     }
 
-    let mut merged: Vec<(u32, u32, u32, u32)> = Vec::new();
-    for &(bx, by, bw, bh) in boxes {
-        let mut did_merge = false;
-        let b_right = bx + bw;
-        let b_bottom = by + bh;
+    let mut current: Vec<(u32, u32, u32, u32)> = boxes.to_vec();
+    loop {
+        let mut merged: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut any_merged = false;
 
-        for m in &mut merged {
-            let m_right = m.0 + m.2;
-            let m_bottom = m.1 + m.3;
+        for &(bx, by, bw, bh) in &current {
+            let mut did_merge = false;
+            let b_right = bx + bw;
+            let b_bottom = by + bh;
 
-            // Check overlap
-            let overlap_x = bx <= m_right && b_right >= m.0;
-            let overlap_y = by <= m_bottom && b_bottom >= m.1;
+            for m in &mut merged {
+                let m_right = m.0 + m.2;
+                let m_bottom = m.1 + m.3;
 
-            if overlap_x && overlap_y {
-                let new_min_x = m.0.min(bx);
-                let new_min_y = m.1.min(by);
-                let new_max_x = m_right.max(b_right);
-                let new_max_y = m_bottom.max(b_bottom);
+                let overlap_x = bx <= m_right && b_right >= m.0;
+                let overlap_y = by <= m_bottom && b_bottom >= m.1;
 
-                *m = (
-                    new_min_x,
-                    new_min_y,
-                    new_max_x - new_min_x,
-                    new_max_y - new_min_y,
-                );
-                did_merge = true;
-                break;
+                if overlap_x && overlap_y {
+                    let new_min_x = m.0.min(bx);
+                    let new_min_y = m.1.min(by);
+                    let new_max_x = m_right.max(b_right);
+                    let new_max_y = m_bottom.max(b_bottom);
+
+                    *m = (
+                        new_min_x,
+                        new_min_y,
+                        new_max_x - new_min_x,
+                        new_max_y - new_min_y,
+                    );
+                    did_merge = true;
+                    any_merged = true;
+                    break;
+                }
+            }
+
+            if !did_merge {
+                merged.push((bx, by, bw, bh));
             }
         }
 
-        if !did_merge {
-            merged.push((bx, by, bw, bh));
+        current = merged;
+        if !any_merged {
+            break;
         }
     }
 
-    merged.sort_by_key(|a| (a.1, a.0));
-    merged
+    current.sort_by_key(|a| (a.1, a.0));
+    current
 }
 
 #[cfg(test)]
@@ -544,5 +627,36 @@ mod tests {
         let img = RgbImage::from_pixel(16, 16, Rgb([10, 20, 30]));
         let rotated = rotate_bilinear(&img, 0.0);
         assert_eq!(rotated, img);
+    }
+
+    #[test]
+    fn auto_multi_crop_ignores_bezel_lid_shadow() {
+        // Simulate 300-DPI-like white platen with soft grey bezel shadow on left/right edges
+        let mut img = RgbImage::from_pixel(250, 350, Rgb([248, 248, 248]));
+        for y in 0..350 {
+            for x in 0..8 {
+                img.put_pixel(x, y, Rgb([210, 210, 210]));
+            }
+            for x in 244..250 {
+                img.put_pixel(x, y, Rgb([215, 215, 215]));
+            }
+        }
+        // Colored mint tea packet placed near left edge (x=5..150, y=130..320)
+        for y in 130..320 {
+            for x in 5..150 {
+                img.put_pixel(x, y, Rgb([150, 205, 180]));
+            }
+        }
+
+        let crops = auto_multi_crop(&img, 0, 1000);
+        assert_eq!(crops.len(), 1);
+        let (geom, sub) = &crops[0];
+        assert!(
+            geom.y_offset >= 115,
+            "Unexpected top margin: {}",
+            geom.y_offset
+        );
+        assert!(sub.width() >= 140 && sub.width() <= 165);
+        assert!(sub.height() >= 185 && sub.height() <= 215);
     }
 }

@@ -253,7 +253,9 @@ impl UsbTransport for NusbTransport {
 
         let res = tokio::time::timeout(Duration::from_secs(3), self.printer_iface.control_in(ctrl))
             .await
-            .map_err(|_| DriverError::Transport("GET_DEVICE_ID control transfer timed out".into()))?;
+            .map_err(|_| {
+                DriverError::Transport("GET_DEVICE_ID control transfer timed out".into())
+            })?;
         res.status
             .map_err(|e| DriverError::Transport(format!("GET_DEVICE_ID transfer failed: {e}")))?;
 
@@ -309,12 +311,10 @@ impl UsbTransport for NusbTransport {
             data: &[],
         };
 
-        let res = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.printer_iface.control_out(ctrl),
-        )
-        .await
-        .map_err(|_| DriverError::Transport("SOFT_RESET timed out".into()))?;
+        let res =
+            tokio::time::timeout(Duration::from_secs(3), self.printer_iface.control_out(ctrl))
+                .await
+                .map_err(|_| DriverError::Transport("SOFT_RESET timed out".into()))?;
         res.status
             .map_err(|e| DriverError::Transport(format!("SOFT_RESET failed: {e}")))?;
 
@@ -371,9 +371,10 @@ impl UsbTransport for NusbTransport {
             DriverError::Transport("Scanner interface not available on this model".into())
         })?;
 
-        let req = RequestBuffer::new(buf.len().max(512));
+        let aligned_len = buf.len().max(512).div_ceil(512) * 512;
+        let req = RequestBuffer::new(aligned_len);
         let res = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(10),
             iface.bulk_in(self.scanner_ep_in, req),
         )
         .await

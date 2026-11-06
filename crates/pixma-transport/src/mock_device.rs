@@ -253,6 +253,13 @@ impl UsbTransport for MockG2010Transport {
             } else if text.contains("StartJob") {
                 self.recorded_ivec_ops.push("StartJob".to_string());
                 self.queue_printer_ok();
+            } else if text.contains("<ivec:operation>SetJobConfiguration</ivec:operation>") {
+                self.recorded_ivec_ops
+                    .push("SetJobConfiguration".to_string());
+                self.queue_printer_ok();
+            } else if text.contains("<ivec:operation>SetConfiguration</ivec:operation>") {
+                self.recorded_ivec_ops.push("SetConfiguration".to_string());
+                self.queue_printer_ok();
             } else if text.contains("VendorCmd") {
                 if text.contains("SetJobConfiguration") {
                     self.recorded_ivec_ops
@@ -338,10 +345,12 @@ impl UsbTransport for MockG2010Transport {
                     self.scanner_rx_queue.extend(resp);
                 }
                 0xDA20 => {
-                    // GetCalibrationStatus -> 12-byte response
-                    let mut resp = [0u8; 12];
+                    // GetCalibrationStatus -> 16-byte response (resp[8] = 0x02 ready)
+                    let mut resp = [0u8; 16];
                     resp[0] = 0x06;
                     resp[1] = 0x06;
+                    resp[8] = 0x02;
+                    resp[15] = 0xFE;
                     self.scanner_rx_queue.extend(resp);
                 }
                 0xDC20 => {

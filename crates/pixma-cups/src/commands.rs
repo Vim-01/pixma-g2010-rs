@@ -3,11 +3,10 @@
 use pixma_core::maintenance::{
     CleaningTarget, CleaningType, MaintenanceAction, RollerCleanTarget, TestPrintType,
 };
-use pixma_protocol::bjl::BjlBuilder;
 use pixma_protocol::ivec::{
-    build_bjl_set_time_send_data, build_cleaning_cmd, build_end_job, build_get_status_cmd,
-    build_manual_alignment_values_cmd, build_roller_cleaning_cmd, build_set_job_configuration,
-    build_start_job, build_test_print_cmd,
+    build_cleaning_cmd, build_end_job, build_get_status_cmd, build_manual_alignment_values_cmd,
+    build_roller_cleaning_cmd, build_set_maintenance_job_configuration, build_start_job,
+    build_test_print_cmd,
 };
 
 /// High-level CUPS maintenance or diagnostic command parsed from `#CUPS-COMMAND` files.
@@ -227,11 +226,10 @@ pub fn compile_cups_command_stream(cmds: &[CupsCommand], job_id: u32) -> Vec<u8>
     for cmd in cmds {
         match cmd {
             CupsCommand::Maintenance(action, _token) => {
-                xml_stream
-                    .extend_from_slice(build_set_job_configuration(job_id, None).as_bytes());
-                xml_stream.extend_from_slice(build_start_job("print", job_id).as_bytes());
-                xml_stream.extend_from_slice(build_bjl_set_time_send_data(job_id).as_bytes());
-                xml_stream.extend_from_slice(&BjlBuilder::time_sync_payload("20261107003000"));
+                xml_stream.extend_from_slice(build_start_job("maintenance", job_id).as_bytes());
+                xml_stream.extend_from_slice(
+                    build_set_maintenance_job_configuration(job_id, "20261107025500").as_bytes(),
+                );
 
                 match action {
                     MaintenanceAction::Clean { kind, target } => {
@@ -245,9 +243,8 @@ pub fn compile_cups_command_stream(cmds: &[CupsCommand], job_id: u32) -> Vec<u8>
                         );
                     }
                     MaintenanceAction::TestPrint(test_type) => {
-                        xml_stream.extend_from_slice(
-                            build_test_print_cmd(job_id, *test_type).as_bytes(),
-                        );
+                        xml_stream
+                            .extend_from_slice(build_test_print_cmd(job_id, *test_type).as_bytes());
                     }
                     MaintenanceAction::ApplyManualAlignment { column_values } => {
                         xml_stream.extend_from_slice(
@@ -256,7 +253,7 @@ pub fn compile_cups_command_stream(cmds: &[CupsCommand], job_id: u32) -> Vec<u8>
                     }
                 }
 
-                xml_stream.extend_from_slice(build_end_job("print", job_id).as_bytes());
+                xml_stream.extend_from_slice(build_end_job("maintenance", job_id).as_bytes());
             }
             CupsCommand::ReportLevels | CupsCommand::ReportStatus => {
                 xml_stream.extend_from_slice(build_get_status_cmd().as_bytes());
@@ -402,7 +399,7 @@ ReportStatus
 
         assert!(xml_str.contains("<ivec:operation>Cleaning</ivec:operation>"));
         assert!(xml_str.contains("<ivec:type>regular</ivec:type>"));
-        assert!(xml_str.contains("<ivec:target>all</ivec:target>"));
+        assert!(xml_str.contains("<ivec:inkgroup>all</ivec:inkgroup>"));
         assert!(xml_str.contains("<ivec:jobID>00000042</ivec:jobID>"));
         assert!(xml_str.contains("<ivec:operation>GetStatus</ivec:operation>"));
     }

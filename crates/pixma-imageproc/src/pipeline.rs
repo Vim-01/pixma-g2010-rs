@@ -59,9 +59,10 @@ pub fn execute_scan_pipeline(
         current = unsharp_mask(&current, 1.5, 0.7);
     }
 
-    // 6. Midtone Gamma / Tone Curve Correction
-    if (params.gamma - 1.0).abs() > 0.01 && params.gamma > 0.0 {
-        let curve = ToneCurve::from_gamma(params.gamma);
+    // 6. Midtone Gamma / Tone Curve Correction (relative to 2.2 sRGB hardware gamma LUT)
+    let rel_gamma = params.gamma / 2.2;
+    if (rel_gamma - 1.0).abs() > 0.01 && params.gamma > 0.0 {
+        let curve = ToneCurve::from_gamma(rel_gamma);
         current = curve.apply_to_image(&current);
     }
 

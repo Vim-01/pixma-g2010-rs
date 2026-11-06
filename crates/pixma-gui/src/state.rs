@@ -452,21 +452,11 @@ impl StudioViewModel {
     ) -> Result<Vec<RgbImage>, String> {
         self.is_busy = true;
 
-        // Ensure scan geometry matches resolution
+        // Ensure scan geometry matches full platen resolution
         let full = ScanGeometry::full_platen(self.scan_params.resolution);
-        let max_safe_w = if self.scan_params.color_mode.bytes_per_pixel() == 3 {
-            (65500 / (3 * 16)).min(full.width)
-        } else {
-            full.width
-        };
 
         let mut scan_params = self.scan_params.clone();
-        scan_params.geometry = ScanGeometry {
-            x_offset: 0,
-            y_offset: 0,
-            width: max_safe_w,
-            height: full.height,
-        };
+        scan_params.geometry = full;
 
         let raw_bytes = client
             .acquire_scan(&scan_params)
