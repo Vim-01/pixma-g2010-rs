@@ -1,0 +1,129 @@
+# pixma-g2010-rs (Русская документация)
+
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Platform: Arch Linux](https://img.shields.io/badge/Platform-Arch_Linux-1793d1.svg)](https://archlinux.org)
+[![Rust: 1.78+](https://img.shields.io/badge/Rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
+
+**[English Documentation (README.md)](./README.md)**
+
+Полнофункциональный, безопасный по памяти драйвер печати, бэкенд сканера, сервисная утилита и графический центр управления (GTK4/Libadwaita) для МФУ **Canon PIXMA G2010** (а также совместимых моделей серии MegaTank G1010 / G2000 / G2020 / G3000 / G3010 / G4000 / G4010) под Arch Linux, написанный с нуля на Rust.
+
+---
+
+## Зачем создан этот проект
+
+Официальные пакеты Canon под Linux (`cnijfilter2` и `scangearmp2`) содержат критические пробелы для владельцев G2010:
+- **Отсутствие USB ID и PPD для G2010**: идентификаторы `04a9:183a` (`G2010 series`) и `04a9:183c` (`G1010 series`) вообще не прописаны в `80-canon_mfp2.rules`, `canon_mfp2.conf` и `/usr/share/cups/model/`.
+- **Урезанный конвейер печати**: даже при подстановке PPD от G3010 фильтр `rastertocanonij` передаёт всего 4 параметра (`--papersize`, `--media`, `--grayscale`, `--duplex`), жёстко фиксируя печать на одном режиме 600 DPI без выбора чернового режима (`300x300`), высокого фото-качества (`1200x1200`), степени расширения при печати без полей (0–3), увеличенного зазора печатающей головки, времени высыхания чернил и ручного баланса C/M/Y.
+- **Заблокировано более 65% сервисных команд**: `cmdtocanonij3` принимает только 3 захардкоженные строки (`PrintSelfTestPage`, `Clean all`, `com.canon.autoalignment`). При этом сама прошивка принтера по протоколу IVEC XML поддерживает раздельную чистку чёрной (`group1`) и цветной (`group2`) головок, глубокую чистку (`deep`), **системную прокачку чернил (`choke` / Ink Flush)** для удаления воздуха из трубок СНПЧ, чистку роликов подачи (`roller`), чистку нижней пластины (`platen`) и ручное выравнивание головок (`manual_registration` — единственный режим калибровки, который реально поддерживают G2010/G3010).
+- **Потеря телеметрии**: `cnijlgmon3` получает от принтера полный XML-статус (`<vcn:supportcode>`, `<vcn:statusdetail>`, `<vcn:ink>`), но отбрасывает его, не показывая ни кодов ошибок (`1000`..`5B00`), ни состояния картриджей и абсорбера.
+- **Урезанный сканер**: `scangearmp2` искусственно ограничивает разрешение 600 DPI и не имеет ни компенсации смещения линий CIS-сенсора, ни авто-мультикадрирования нескольких фото на стекле, ни выравнивания горизонта (`deskew`), ни подавления муара (2D-FFT `descreen`), ни удаления пыли/царапин, ни коррекции тени книжного переплёта.
+
+`pixma-g2010-rs` полностью заменяет проприетарный стек на модульную Clean-Room реализацию на Rust.
+
+---
+
+## Защита механики и печатающих головок
+
+В Canon PIXMA G2010 используются термоструйные (TIJ) головки **FINE BH-4** (чёрная, 320 дюз) и **CH-41** (цветная, 1152 дюзы), где тонкоплёночные нагреватели импульсно разогреваются свыше $300^\circ\text{C}$ и **охлаждаются исключительно потоком жидких чернил**, а в ёмкостях СНПЧ **нет физических датчиков уровня жидкости**.
+
+В драйвер встроены 5 уровней защиты оборудования:
+1. **Контроль границ каретки и листа на уровне типов (`pixma-core::safety`)**:
+   - Типы `ValidatedRasterLine` и `PrintJobTypestate<State>` проверяют физические пределы хода каретки (`2550` точек при 300 DPI, `5100` при 600 DPI, `10200` при 1200 DPI) до формирования пакетов PWG Raster или BJRaster3.
+2. **Защита от сухого перегрева головок (Duty-Cycle Throttling & Fast Abort)**:
+   - `DutyCycleMonitor` отслеживает плотность заполнения полос и при непрерывной заливке >85% вставляет межкареточные паузы охлаждения ($200\ \text{мс}$).
+   - При получении любого кода ошибки головки или перегрева (`1401`, `1403`, `1470`, `1471`, `1472`, `5200` / `P08`) подача растра мгновенно прерывается командой `CancelJob`.
+3. **Правильное разделение чернил MegaTank GI-790 (`pixma-color`)**:
+   - **Обычная бумага**: используется UCR/GCR с выводом чёрного текста (`#000000`) на 100% пигментным чёрным (`PGBK`).
+   - **Глянцевая / Luster / Platinum фотобумага**: пигментный чёрный не впитывается в микропористое покрытие глянца и осыпается. На всех глянцевых носителях драйвер принудительно отключает `PGBK = 0%` и формирует глубокий чёрный цвет композитным смешением водных красителей `C + M + Y`.
+4. **Защита от переполнения абсорбера («памперса» `5B00` / `P07`) при прокачке `Ink Flush`**:
+   - Одна системная прокачка чернил (`choke`) сливает **~45 мл чернил** и увеличивает счётчик абсорбера (`D-Counter`) на **~20%**.
+   - `MaintenanceSupervisor` обеспечивает жёсткий **24-часовой кулдаун** между прокачками, блокирует запуск при `D-Counter >= 80%` и требует явного подтверждения (`YES-DRAIN-INK` в CLI или подтверждение с таймером в GUI).
+5. **Изоляция опасных записей в EEPROM**:
+   - Все операции выполняются строго через штатные `<ivec:operation>` XML и растровые потоки. Сырые заводские `@BJL`-команды записи в EEPROM (способные вызвать блокировку платы `Error 006`) полностью исключены.
+
+---
+
+## Архитектура рабочего пространства (Workspace Architecture)
+
+| Крейт | Описание |
+| :--- | :--- |
+| [`crates/pixma-core`](./crates/pixma-core) | Модели оборудования, ограниченные координаты (`Dots`, `Microns`, `ValidatedRasterLine`), typestate-автомат заданий печати, `MaintenanceSupervisor` и база кодов ошибок (`E02`..`P10` / `1000`..`5B00`). |
+| [`crates/pixma-protocol`](./crates/pixma-protocol) | Фрейминг BJL, генераторы и парсеры IVEC XML, шифр `CNCL` (`XOR 0x39`), PWG Raster (`RaS2` + PackBits RLE), BJRaster3 (`ESC (`) и бинарные команды сканера MP2 (`0xF320`, `0xD820`, `0xD920`, `0xD420`, `0xEF20`). |
+| [`crates/pixma-transport`](./crates/pixma-transport) | Асинхронный USB-транспорт на базе `nusb` (Interface 0 Scanner + Interface 1 Printer), авто-отключение ядерного модуля `usblp`, резервная синхронизация через `flock` и эмулятор оборудования `MockG2010Transport`. |
+| [`crates/pixma-color`](./crates/pixma-color) | Управление цветом ICC/sRGB (`qcms`), LUT-коррекция баланса C/M/Y, яркости, контраста и гаммы, а также разделение чернил PGBK и композитного CMY в зависимости от типа бумаги. |
+| [`crates/pixma-raster`](./crates/pixma-raster) | Чтение CUPS/PWG растра, движок компоновки страниц (Fit-to-Page, масштабирование, N-up, плакат, буклет, расширение без полей 0–3), дизеринг Blue-Noise и Sierra/Jarvis-Judice-Ninke. |
+| [`crates/pixma-imageproc`](./crates/pixma-imageproc) | Компенсация вертикального смещения RGB-линий CIS-сенсора (`LineStaggerBuffer`), авто-мультикадрирование по Оцу, выравнивание горизонта (`deskew`), 2D-FFT подавление муара (`descreen`), нерезкое маскирование, удаление пыли и царапин, коррекция тени книжного переплёта, гистограммы, сплайновые кривые тонов и экспорт в PDF/TIFF/PNG/JPEG. |
+| [`crates/pixma-daemon`](./crates/pixma-daemon) | Фоновый USB-мультиплексор `pixmad` (`/run/pixma/pixmad.sock`), координирующий печать, сканирование и опрос телеметрии без коллизий на шине USB. |
+| [`crates/pixma-cups`](./crates/pixma-cups) | Нативные фильтры CUPS 2.x (`rastertopixma-g2010`, `cmdtopixma-g2010`), USB-бэкенд (`cnusb-g2010`) и полноценный PPD (`assets/ppd/pixma-g2010.ppd`). |
+| [`crates/pixma-printer-app`](./crates/pixma-printer-app) | Сервер печати без драйверов IPP Everywhere (`127.0.0.1:8631`) для совместимости с CUPS 3.x. |
+| [`crates/pixma-sane`](./crates/pixma-sane) | Разделяемая библиотека стандарта SANE v1.04 C ABI (`libsane-pixma_g2010.so.1`) с защитой от паник на границе FFI для Simple Scan, Skanpage, GIMP и `scanimage`. |
+| [`crates/pixma-escl`](./crates/pixma-escl) | HTTP/XML-сервер сканирования без драйверов eSCL / AirScan (`127.0.0.1:8080`). |
+| [`crates/pixma-cli`](./crates/pixma-cli) | Консольная утилита `pixma-cli` для проверки статуса, чистки головок и роликов, теста дюз, калибровки, сканирования и прямой печати. |
+| [`crates/pixma-gui`](./crates/pixma-gui) | **PIXMA G2010 Studio** (`pixma-studio`) — нативное графическое приложение для Wayland/X11 на базе Relm4 (GTK4 + Libadwaita). |
+
+---
+
+## Установка на Arch Linux
+
+### Вариант 1: Интерактивный модульный установщик (выбор нужных компонентов)
+```bash
+./scripts/install.sh
+```
+Позволяет отметить галочками только нужные модули (`core`, `cups`, `sane`, `escl`, `printer-app`, `cli`, `gui`).
+
+### Вариант 2: Сборка split-пакетов Arch Linux (`makepkg`)
+```bash
+cd packaging/arch
+makepkg -si
+```
+Собирает модульные пакеты:
+- `pixma-g2010-core` (`pixmad` + правила udev)
+- `pixma-g2010-cups` (фильтры CUPS, бэкенд, PPD)
+- `pixma-g2010-sane` (`libsane-pixma_g2010.so.1`)
+- `pixma-g2010-escl` (сервер AirScan)
+- `pixma-g2010-printer-app` (сервер IPP Everywhere)
+- `pixma-g2010-cli` (`pixma-cli`)
+- `pixma-g2010-gui` (`pixma-studio`)
+- `pixma-g2010-meta` (полный комплект для рабочего стола)
+
+---
+
+## Примеры использования CLI (`pixma-cli`)
+
+```bash
+# Статус устройства, уровни чернил, заполнение абсорбера и расшифровка кодов ошибок
+pixma-cli status
+
+# Печать проверочной сетки дюз
+pixma-cli nozzle-check
+
+# Обычная чистка (обе головки, только чёрная или только цветная)
+pixma-cli clean --kind regular --target black
+
+# Глубокая чистка
+pixma-cli clean --kind deep --target all
+
+# Системная прокачка чернил (требует токен подтверждения и соблюдает 24ч кулдаун)
+pixma-cli clean --kind flush --target all --confirm YES-DRAIN-INK
+
+# Чистка роликов подачи бумаги или нижней пластины
+pixma-cli roller-clean --target roller
+pixma-cli roller-clean --target platen
+
+# Выравнивание печатающих головок (печать 2-страничного шаблона или запись поправок A..N)
+pixma-cli align --action print-manual
+pixma-cli align --action apply --values "0,1,-1,0,0,2,0,-1,0,0,1,0,0,0"
+
+# Сканирование в 600 DPI с авто-кадрированием, выравниванием горизонта и удалением муара в PDF
+pixma-cli scan --dpi 600 --deskew --descreen --auto-crop --output scan.pdf
+
+# Печать тестовой страницы или изображения с выбором типа бумаги и качества
+pixma-cli print --test-page --media plain --paper a4 --quality 3
+```
+
+---
+
+## Лицензия
+
+Проект распространяется под лицензией **GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`)**. Полный текст приведён в файле [`LICENSE`](./LICENSE).

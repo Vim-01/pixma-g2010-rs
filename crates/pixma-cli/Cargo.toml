@@ -1,0 +1,35 @@
+[package]
+name = "pixma-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless CLI administration, maintenance, status monitoring, printing, and scanning utility for Canon PIXMA G2010"
+
+[lib]
+name = "pixma_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pixma-cli"
+path = "src/main.rs"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-color.workspace = true
+pixma-raster.workspace = true
+pixma-imageproc.workspace = true
+pixma-daemon.workspace = true
+pixma-cups.workspace = true
+image.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,105 @@
+# Maintainer: Vim-01
+pkgbase=pixma-g2010-rs
+pkgname=(
+  'pixma-g2010-core'
+  'pixma-g2010-cups'
+  'pixma-g2010-sane'
+  'pixma-g2010-escl'
+  'pixma-g2010-printer-app'
+  'pixma-g2010-cli'
+  'pixma-g2010-gui'
+  'pixma-g2010-meta'
+)
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Modern memory-safe Rust software suite for Canon PIXMA G2010 on Arch Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Vim-01/pixma-g2010-rs"
+license=('AGPL-3.0-or-later')
+makedepends=('cargo' 'git' 'pkgconf' 'gtk4' 'libadwaita')
+source=()
+sha256sums=()
+
+build() {
+  cd "$srcdir" || return 1
+  # When building within workspace root:
+  cargo build --release --locked --workspace
+}
+
+package_pixma-g2010-core() {
+  pkgdesc="Core USB transport, udev rules, and pixmad multiplexer for Canon PIXMA G2010"
+  depends=('glibc')
+
+  install -Dm755 target/release/pixmad "$pkgdir/usr/bin/pixmad"
+  install -Dm644 assets/udev/70-pixma-g2010.rules "$pkgdir/usr/lib/udev/rules.d/70-pixma-g2010.rules"
+  install -Dm644 assets/systemd/pixmad.service "$pkgdir/usr/lib/systemd/system/pixmad.service"
+}
+
+package_pixma-g2010-cups() {
+  pkgdesc="Native CUPS filters, backend, and PPD generator for Canon PIXMA G2010"
+  depends=('cups' 'pixma-g2010-core')
+
+  install -Dm755 target/release/rastertopixma-g2010 "$pkgdir/usr/lib/cups/filter/rastertopixma-g2010"
+  install -Dm755 target/release/cmdtopixma-g2010 "$pkgdir/usr/lib/cups/filter/cmdtopixma-g2010"
+  install -Dm755 target/release/cnusb-g2010 "$pkgdir/usr/lib/cups/backend/cnusb-g2010"
+  install -Dm644 assets/ppd/pixma-g2010.ppd "$pkgdir/usr/share/cups/model/pixma-g2010.ppd"
+}
+
+package_pixma-g2010-sane() {
+  pkgdesc="Native SANE C ABI backend for Canon PIXMA G2010 (libsane-pixma_g2010.so)"
+  depends=('sane' 'pixma-g2010-core')
+
+  install -Dm755 target/release/libsane_pixma_g2010.so "$pkgdir/usr/lib/sane/libsane-pixma_g2010.so.1.0.0"
+  ln -sf libsane-pixma_g2010.so.1.0.0 "$pkgdir/usr/lib/sane/libsane-pixma_g2010.so.1"
+  ln -sf libsane-pixma_g2010.so.1 "$pkgdir/usr/lib/sane/libsane-pixma_g2010.so"
+
+  mkdir -p "$pkgdir/etc/sane.d/dll.d"
+  echo "pixma_g2010" > "$pkgdir/etc/sane.d/dll.d/pixma_g2010"
+}
+
+package_pixma-g2010-escl() {
+  pkgdesc="Driverless eSCL (AirScan) HTTP/XML microserver for Canon PIXMA G2010"
+  depends=('pixma-g2010-core')
+
+  install -Dm755 target/release/pixma-escl-server "$pkgdir/usr/bin/pixma-escl-server"
+  install -Dm644 assets/systemd/pixma-escl.service "$pkgdir/usr/lib/systemd/system/pixma-escl.service"
+}
+
+package_pixma-g2010-printer-app() {
+  pkgdesc="Driverless IPP Everywhere Printer Application (CUPS 3.x ready) for Canon PIXMA G2010"
+  depends=('pixma-g2010-core')
+
+  install -Dm755 target/release/pixma-printer-app "$pkgdir/usr/bin/pixma-printer-app"
+  install -Dm644 assets/systemd/pixma-printer-app.service "$pkgdir/usr/lib/systemd/system/pixma-printer-app.service"
+}
+
+package_pixma-g2010-cli() {
+  pkgdesc="Headless maintenance and control CLI tool for Canon PIXMA G2010"
+  depends=('pixma-g2010-core')
+
+  install -Dm755 target/release/pixma-cli "$pkgdir/usr/bin/pixma-cli"
+}
+
+package_pixma-g2010-gui() {
+  pkgdesc="PIXMA G2010 Studio - GTK4/Libadwaita Control Center, ScanGear Pro & Maintenance Assistant"
+  depends=('gtk4' 'libadwaita' 'pixma-g2010-core')
+
+  install -Dm755 target/release/pixma-studio "$pkgdir/usr/bin/pixma-studio"
+  install -Dm644 assets/desktop/org.pixma.G2010Studio.desktop "$pkgdir/usr/share/applications/org.pixma.G2010Studio.desktop"
+  install -Dm644 assets/desktop/org.pixma.G2010Studio.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.pixma.G2010Studio.svg"
+}
+
+package_pixma-g2010-meta() {
+  pkgdesc="Complete meta-package for Canon PIXMA G2010 suite on Arch Linux"
+  depends=(
+    'pixma-g2010-core'
+    'pixma-g2010-cups'
+    'pixma-g2010-sane'
+    'pixma-g2010-cli'
+    'pixma-g2010-gui'
+  )
+  optdepends=(
+    'pixma-g2010-escl: Driverless network scanning over eSCL AirScan'
+    'pixma-g2010-printer-app: Driverless CUPS 3.x IPP Everywhere server'
+  )
+}

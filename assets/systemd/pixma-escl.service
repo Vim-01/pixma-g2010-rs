@@ -1,0 +1,19 @@
+[Unit]
+Description=Canon PIXMA G2010 Driverless eSCL (AirScan) HTTP Scanner Server
+Documentation=https://github.com/Vim-01/pixma-g2010-rs
+After=network.target pixmad.service
+Wants=pixmad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pixma-escl-server --bind 127.0.0.1:8080
+Group=lp
+SupplementaryGroups=scanner
+Restart=on-failure
+RestartSec=3s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

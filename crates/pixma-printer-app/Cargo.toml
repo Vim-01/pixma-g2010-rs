@@ -1,0 +1,32 @@
+[package]
+name = "pixma-printer-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driverless IPP Everywhere Printer Application (CUPS 3.x compatible) for Canon PIXMA G2010"
+
+[[bin]]
+name = "pixma-printer-app"
+path = "src/bin/pixma-printer-app.rs"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-raster.workspace = true
+pixma-daemon.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+image.workspace = true

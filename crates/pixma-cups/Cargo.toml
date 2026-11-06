@@ -1,0 +1,33 @@
+[package]
+name = "pixma-cups"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native CUPS filters (rastertopixma-g2010, cmdtopixma-g2010), backend (cnusb-g2010), and PPD generator"
+
+[[bin]]
+name = "rastertopixma-g2010"
+path = "src/bin/rastertopixma-g2010.rs"
+
+[[bin]]
+name = "cmdtopixma-g2010"
+path = "src/bin/cmdtopixma-g2010.rs"
+
+[[bin]]
+name = "cnusb-g2010"
+path = "src/bin/cnusb-g2010.rs"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-color.workspace = true
+pixma-raster.workspace = true
+pixma-daemon.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

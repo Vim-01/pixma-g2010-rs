@@ -1,0 +1,17 @@
+[package]
+name = "pixma-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Canon PIXMA G2010 BJL, IVEC XML, CNCL codec, PWG Raster (RaS2), BJRaster3, and MP2 Scanner protocol engine"
+
+[dependencies]
+pixma-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quick-xml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

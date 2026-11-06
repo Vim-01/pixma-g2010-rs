@@ -1,0 +1,18 @@
+[Unit]
+Description=Canon PIXMA G2010 Driverless IPP Everywhere Printer Application (CUPS 3.x)
+Documentation=https://github.com/Vim-01/pixma-g2010-rs
+After=network.target pixmad.service
+Wants=pixmad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pixma-printer-app --bind 127.0.0.1:8631
+Group=lp
+Restart=on-failure
+RestartSec=3s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# Canon PIXMA G2010 / G1010 / G2000 / G3010 / G4010 USB permissions and SANE/CUPS integration
+# Vendor: 0x04a9 (Canon Inc.)
+
+# G2010 / G2410 (0x183a)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04a9", ATTRS{idProduct}=="183a", \
+    TAG+="uaccess", MODE="0664", GROUP="lp", ENV{libsane_matched}="yes", ENV{ID_CANON_PIXMA}="1"
+
+# G3010 (0x183b)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04a9", ATTRS{idProduct}=="183b", \
+    TAG+="uaccess", MODE="0664", GROUP="lp", ENV{libsane_matched}="yes", ENV{ID_CANON_PIXMA}="1"
+
+# G1010 (0x183c)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04a9", ATTRS{idProduct}=="183c", \
+    TAG+="uaccess", MODE="0664", GROUP="lp", ENV{ID_CANON_PIXMA}="1"
+
+# G4010 (0x183d)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04a9", ATTRS{idProduct}=="183d", \
+    TAG+="uaccess", MODE="0664", GROUP="lp", ENV{libsane_matched}="yes", ENV{ID_CANON_PIXMA}="1"
+
+# G3000 (0x1794), G2000 (0x1795), G4000 (0x181d), G2020 (0x18bd)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04a9", ATTRS{idProduct}=="1794|1795|181d|18bd", \
+    TAG+="uaccess", MODE="0664", GROUP="lp", ENV{libsane_matched}="yes", ENV{ID_CANON_PIXMA}="1"

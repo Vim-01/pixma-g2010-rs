@@ -1,0 +1,17 @@
+[package]
+name = "pixma-raster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CUPS/PWG raster parser, page layout engine, Blue-Noise and Sierra/JJN dithering, and BJRaster3/PWG formatter"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-color.workspace = true
+pixma-protocol.workspace = true
+image.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

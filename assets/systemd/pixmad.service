@@ -1,0 +1,25 @@
+[Unit]
+Description=Canon PIXMA G2010 USB Multiplexer & Hardware Telemetry Daemon
+Documentation=https://github.com/Vim-01/pixma-g2010-rs
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pixmad --socket /run/pixma/pixmad.sock
+RuntimeDirectory=pixma
+RuntimeDirectoryMode=0775
+StateDirectory=pixma-g2010
+StateDirectoryMode=0755
+Group=lp
+SupplementaryGroups=scanner
+Restart=on-failure
+RestartSec=3s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

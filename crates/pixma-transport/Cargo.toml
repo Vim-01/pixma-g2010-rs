@@ -1,0 +1,18 @@
+[package]
+name = "pixma-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust async USB transport (nusb), kernel usblp detachment, flock fallback, and virtual G2010 hardware emulator"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+tokio.workspace = true
+nusb.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=PIXMA G2010 Studio
+Name[ru]=Студия управления PIXMA G2010
+Comment=Print preferences, ScanGear Pro restoration scanner, and head maintenance for Canon PIXMA G2010
+Comment[ru]=Настройки печати, сканирование ScanGear Pro и обслуживание печатающих головок Canon PIXMA G2010
+Exec=pixma-studio
+Icon=org.pixma.G2010Studio
+Terminal=false
+Type=Application
+Categories=System;Settings;HardwareSettings;Printing;Scanning;GTK;
+Keywords=Canon;PIXMA;G2010;Printer;Scanner;Maintenance;Ink;Clean;
+StartupNotify=true

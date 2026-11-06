@@ -1,0 +1,23 @@
+[package]
+name = "pixma-sane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SANE Standard v1.04 C ABI backend (libsane-pixma_g2010.so) written in safe Rust"
+
+[lib]
+name = "sane_pixma_g2010"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-imageproc.workspace = true
+pixma-daemon.workspace = true
+image.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,35 @@
+[package]
+name = "pixma-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PIXMA G2010 Studio - Native GTK4/Libadwaita (Relm4) Control Center, ScanGear Pro & Maintenance Assistant"
+
+[lib]
+name = "pixma_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pixma-studio"
+path = "src/main.rs"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-color.workspace = true
+pixma-raster.workspace = true
+pixma-imageproc.workspace = true
+pixma-daemon.workspace = true
+pixma-cups.workspace = true
+image.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+relm4 = { version = "0.9", features = ["libadwaita", "macros"] }

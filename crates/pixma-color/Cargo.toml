@@ -1,0 +1,15 @@
+[package]
+name = "pixma-color"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Color management, sRGB/ICC transforms, dynamic GCR/UCR PGBK vs composite CMY separation, and color balance"
+
+[dependencies]
+pixma-core.workspace = true
+qcms.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

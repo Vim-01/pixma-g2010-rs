@@ -1,0 +1,19 @@
+[package]
+name = "pixma-imageproc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust scanner post-processing: CIS line-stagger alignment, auto-multi-crop, deskew, 2D-FFT descreen, unsharp mask, dust removal, gutter shadow, and PDF/TIFF/PNG/JPEG export"
+
+[dependencies]
+pixma-core.workspace = true
+image.workspace = true
+imageproc.workspace = true
+rustfft.workspace = true
+rayon.workspace = true
+pdf-writer.workspace = true
+thiserror.workspace = true
+miniz_oxide = "0.8"

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="16" y="36" width="96" height="56" rx="10" fill="#24292e" stroke="#444d56" stroke-width="3"/>
+  <rect x="32" y="18" width="64" height="22" rx="4" fill="#f6f8fa" stroke="#586069" stroke-width="2"/>
+  <rect x="32" y="76" width="64" height="34" rx="4" fill="#ffffff" stroke="#586069" stroke-width="2"/>
+  <!-- MegaTank CISS Ink Windows (PGBK, C, M, Y) -->
+  <rect x="22" y="54" width="10" height="24" rx="2" fill="#1b1f23" stroke="#959da5" stroke-width="1.5"/>
+  <rect x="78" y="54" width="8" height="24" rx="2" fill="#00b4d8" stroke="#959da5" stroke-width="1.5"/>
+  <rect x="89" y="54" width="8" height="24" rx="2" fill="#e63946" stroke="#959da5" stroke-width="1.5"/>
+  <rect x="100" y="54" width="8" height="24" rx="2" fill="#ffb703" stroke="#959da5" stroke-width="1.5"/>
+  <!-- Status LED -->
+  <circle cx="27" cy="46" r="3.5" fill="#2ea043"/>
+</svg>

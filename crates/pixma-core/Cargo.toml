@@ -1,0 +1,15 @@
+[package]
+name = "pixma-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core hardware types, mechanical safety bounds, maintenance interlocks, and error codes for Canon PIXMA G2010 series"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

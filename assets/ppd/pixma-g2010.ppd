@@ -1,0 +1,213 @@
+*PPD-Adobe: "4.3"
+*% Canon PIXMA G2010 Full-Feature PPD for CUPS (pixma-g2010-rs)
+*% Licensed under GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "PIXMAG2010.PPD"
+*Manufacturer: "Canon"
+*Product: "(Canon PIXMA G2010 series)"
+*ModelName: "Canon PIXMA G2010 series"
+*ShortNickName: "PIXMA G2010"
+*NickName: "Canon PIXMA G2010 series (pixma-g2010-rs Full Driver)"
+*PSVersion: "(3010.000) 705"
+*LanguageLevel: "3"
+*ColorDevice: True
+*DefaultColorSpace: RGB
+*FileSystem: False
+*Throughput: "9"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*1284DeviceID: "MFG:Canon;MDL:G2010 series;CMD:BJL,BJRaster3,NCCe,IVEC,PWGRaster;CLS:PRINTER;DES:Canon G2010 series;"
+
+*cupsVersion: 2.4
+*cupsModelNumber: 183
+*cupsManualCopies: False
+*cupsFilter: "application/vnd.cups-raster 0 rastertopixma-g2010"
+*cupsFilter: "application/vnd.cups-command 0 cmdtopixma-g2010"
+*cupsCommands: "Clean CleanBlack CleanColor DeepClean DeepCleanBlack DeepCleanColor InkFlush RollerClean BottomPlateClean PrintSelfTestPage AutoAlign ManualAlign AlignmentCheck ReportLevels ReportStatus"
+
+*OpenUI *PageSize/Page Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: A4
+*PageSize A4/A4 (210 x 297 mm): "<</PageSize[595 842]/ImagingBBox null>>setpagedevice"
+*PageSize A4.bl/A4 Borderless: "<</PageSize[595 842]/ImagingBBox null>>setpagedevice"
+*PageSize A5/A5 (148 x 210 mm): "<</PageSize[420 595]/ImagingBBox null>>setpagedevice"
+*PageSize A6/A6 (105 x 148 mm): "<</PageSize[298 420]/ImagingBBox null>>setpagedevice"
+*PageSize B5/JIS B5 (182 x 257 mm): "<</PageSize[516 729]/ImagingBBox null>>setpagedevice"
+*PageSize Letter/US Letter (8.5 x 11 in): "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageSize Letter.bl/US Letter Borderless: "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageSize Legal/US Legal (8.5 x 14 in): "<</PageSize[612 1008]/ImagingBBox null>>setpagedevice"
+*PageSize Executive/Executive (7.25 x 10.5 in): "<</PageSize[522 756]/ImagingBBox null>>setpagedevice"
+*PageSize 4x6/Photo 4"x6" (10 x 15 cm): "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*PageSize 4x6.bl/Photo 4"x6" Borderless: "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*PageSize 5x7/Photo 5"x7" (13 x 18 cm): "<</PageSize[360 504]/ImagingBBox null>>setpagedevice"
+*PageSize 5x7.bl/Photo 5"x7" Borderless: "<</PageSize[360 504]/ImagingBBox null>>setpagedevice"
+*PageSize 8x10/Photo 8"x10" (20 x 25 cm): "<</PageSize[576 720]/ImagingBBox null>>setpagedevice"
+*PageSize 8x10.bl/Photo 8"x10" Borderless: "<</PageSize[576 720]/ImagingBBox null>>setpagedevice"
+*PageSize l/Photo L (89 x 127 mm): "<</PageSize[252 360]/ImagingBBox null>>setpagedevice"
+*PageSize l.bl/Photo L Borderless: "<</PageSize[252 360]/ImagingBBox null>>setpagedevice"
+*PageSize square5x5.bl/Square 5"x5" (127 x 127 mm) Borderless: "<</PageSize[360 360]/ImagingBBox null>>setpagedevice"
+*PageSize businesscard/Business Card (55 x 91 mm): "<</PageSize[156 258]/ImagingBBox null>>setpagedevice"
+*PageSize businesscard.bl/Business Card Borderless: "<</PageSize[156 258]/ImagingBBox null>>setpagedevice"
+*PageSize Env10/Envelope Com 10: "<</PageSize[297 684]/ImagingBBox null>>setpagedevice"
+*PageSize EnvDL/Envelope DL: "<</PageSize[312 624]/ImagingBBox null>>setpagedevice"
+*PageSize Postcard/Hagaki (100 x 148 mm): "<</PageSize[283 420]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion/Page Size: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: A4
+*PageRegion A4/A4 (210 x 297 mm): "<</PageSize[595 842]/ImagingBBox null>>setpagedevice"
+*PageRegion A4.bl/A4 Borderless: "<</PageSize[595 842]/ImagingBBox null>>setpagedevice"
+*PageRegion A5/A5 (148 x 210 mm): "<</PageSize[420 595]/ImagingBBox null>>setpagedevice"
+*PageRegion A6/A6 (105 x 148 mm): "<</PageSize[298 420]/ImagingBBox null>>setpagedevice"
+*PageRegion B5/JIS B5 (182 x 257 mm): "<</PageSize[516 729]/ImagingBBox null>>setpagedevice"
+*PageRegion Letter/US Letter (8.5 x 11 in): "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageRegion Letter.bl/US Letter Borderless: "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageRegion Legal/US Legal (8.5 x 14 in): "<</PageSize[612 1008]/ImagingBBox null>>setpagedevice"
+*PageRegion Executive/Executive (7.25 x 10.5 in): "<</PageSize[522 756]/ImagingBBox null>>setpagedevice"
+*PageRegion 4x6/Photo 4"x6" (10 x 15 cm): "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*PageRegion 4x6.bl/Photo 4"x6" Borderless: "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*PageRegion 5x7/Photo 5"x7" (13 x 18 cm): "<</PageSize[360 504]/ImagingBBox null>>setpagedevice"
+*PageRegion 5x7.bl/Photo 5"x7" Borderless: "<</PageSize[360 504]/ImagingBBox null>>setpagedevice"
+*PageRegion 8x10/Photo 8"x10" (20 x 25 cm): "<</PageSize[576 720]/ImagingBBox null>>setpagedevice"
+*PageRegion 8x10.bl/Photo 8"x10" Borderless: "<</PageSize[576 720]/ImagingBBox null>>setpagedevice"
+*PageRegion l/Photo L (89 x 127 mm): "<</PageSize[252 360]/ImagingBBox null>>setpagedevice"
+*PageRegion l.bl/Photo L Borderless: "<</PageSize[252 360]/ImagingBBox null>>setpagedevice"
+*PageRegion square5x5.bl/Square 5"x5" (127 x 127 mm) Borderless: "<</PageSize[360 360]/ImagingBBox null>>setpagedevice"
+*PageRegion businesscard/Business Card (55 x 91 mm): "<</PageSize[156 258]/ImagingBBox null>>setpagedevice"
+*PageRegion businesscard.bl/Business Card Borderless: "<</PageSize[156 258]/ImagingBBox null>>setpagedevice"
+*PageRegion Env10/Envelope Com 10: "<</PageSize[297 684]/ImagingBBox null>>setpagedevice"
+*PageRegion EnvDL/Envelope DL: "<</PageSize[312 624]/ImagingBBox null>>setpagedevice"
+*PageRegion Postcard/Hagaki (100 x 148 mm): "<</PageSize[283 420]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: A4
+*ImageableArea A4: "9.64 14.18 585.64 833.50"
+*ImageableArea A4.bl: "0 0 595 842"
+*ImageableArea A5: "9.64 13.98 409.84 586.50"
+*ImageableArea A6: "9.64 14.66 287.92 411.50"
+*ImageableArea B5: "9.64 14.78 506.20 720.50"
+*ImageableArea Letter: "18.14 14.18 594.14 783.50"
+*ImageableArea Letter.bl: "0 0 612 792"
+*ImageableArea Legal: "18.14 14.18 594.14 999.50"
+*ImageableArea Executive: "9.64 14.18 512.44 747.50"
+*ImageableArea 4x6: "9.64 14.18 278.36 423.50"
+*ImageableArea 4x6.bl: "0 0 288 432"
+*ImageableArea 5x7: "9.64 14.18 350.36 495.50"
+*ImageableArea 5x7.bl: "0 0 360 504"
+*ImageableArea 8x10: "9.64 14.18 566.36 711.50"
+*ImageableArea 8x10.bl: "0 0 576 720"
+*ImageableArea l: "9.64 14.18 242.36 351.50"
+*ImageableArea l.bl: "0 0 252 360"
+*ImageableArea square5x5.bl: "0 0 360 360"
+*ImageableArea businesscard: "9.64 14.18 146.36 249.50"
+*ImageableArea businesscard.bl: "0 0 156 258"
+*ImageableArea Env10: "9.64 75.12 287.35 656.50"
+*ImageableArea EnvDL: "9.64 75.26 302.17 596.50"
+*ImageableArea Postcard: "9.64 14.18 273.80 411.50"
+
+*DefaultPaperDimension: A4
+*PaperDimension A4: "595 842"
+*PaperDimension A4.bl: "595 842"
+*PaperDimension A5: "420 595"
+*PaperDimension A6: "298 420"
+*PaperDimension B5: "516 729"
+*PaperDimension Letter: "612 792"
+*PaperDimension Letter.bl: "612 792"
+*PaperDimension Legal: "612 1008"
+*PaperDimension Executive: "522 756"
+*PaperDimension 4x6: "288 432"
+*PaperDimension 4x6.bl: "288 432"
+*PaperDimension 5x7: "360 504"
+*PaperDimension 5x7.bl: "360 504"
+*PaperDimension 8x10: "576 720"
+*PaperDimension 8x10.bl: "576 720"
+*PaperDimension l: "252 360"
+*PaperDimension l.bl: "252 360"
+*PaperDimension square5x5.bl: "360 360"
+*PaperDimension businesscard: "156 258"
+*PaperDimension businesscard.bl: "156 258"
+*PaperDimension Env10: "297 684"
+*PaperDimension EnvDL: "312 624"
+*PaperDimension Postcard: "283 420"
+
+*OpenUI *MediaType/Media Type: PickOne
+*OrderDependency: 20 AnySetup *MediaType
+*DefaultMediaType: plain
+*MediaType plain/Plain Paper (Pigment Black Text): "<</MediaType(plain)>>setpagedevice"
+*MediaType glossygold/Photo Paper Plus Glossy II (PP-201): "<</MediaType(glossygold)>>setpagedevice"
+*MediaType proplat/Photo Paper Pro Platinum (PT-101): "<</MediaType(proplat)>>setpagedevice"
+*MediaType luster/Photo Paper Pro Luster (LU-101): "<</MediaType(luster)>>setpagedevice"
+*MediaType semigloss/Photo Paper Plus Semi-gloss (SG-201): "<</MediaType(semigloss)>>setpagedevice"
+*MediaType glossypaper/Glossy Photo Paper (GP-501): "<</MediaType(glossypaper)>>setpagedevice"
+*MediaType matte/Matte Photo Paper (MP-101): "<</MediaType(matte)>>setpagedevice"
+*MediaType highres/High Resolution Paper (HR-101N): "<</MediaType(highres)>>setpagedevice"
+*MediaType envelope/Envelope: "<</MediaType(envelope)>>setpagedevice"
+*MediaType ijpostcard/Inkjet Hagaki: "<</MediaType(ijpostcard)>>setpagedevice"
+*MediaType postcard/Hagaki: "<</MediaType(postcard)>>setpagedevice"
+*MediaType tshirt/T-Shirt Transfers: "<</MediaType(tshirt)>>setpagedevice"
+*MediaType cardstock/Greeting Card / Cardstock: "<</MediaType(cardstock)>>setpagedevice"
+*CloseUI: *MediaType
+
+*OpenUI *Resolution/Print Quality & Resolution: PickOne
+*OrderDependency: 30 AnySetup *Resolution
+*DefaultResolution: 600dpi
+*Resolution 300dpi/Level 5 - Fast Draft (300x300 dpi): "<</HWResolution[300 300]/cupsCompression 5>>setpagedevice"
+*Resolution 600dpi/Level 3 - Standard (600x600 dpi): "<</HWResolution[600 600]/cupsCompression 3>>setpagedevice"
+*Resolution 601dpi/Level 2 - High Quality (600x600 Multi-Pass): "<</HWResolution[600 600]/cupsCompression 2>>setpagedevice"
+*Resolution 1200dpi/Level 1 - Ultra Fine Photo (1200x1200 dpi): "<</HWResolution[1200 1200]/cupsCompression 1>>setpagedevice"
+*CloseUI: *Resolution
+
+*OpenUI *ColorModel/Color Mode: PickOne
+*OrderDependency: 40 AnySetup *ColorModel
+*DefaultColorModel: RGB
+*ColorModel RGB/Color (sRGB / ICC Managed): "<</cupsColorSpace 19/cupsColorOrder 0/cupsBitsPerColor 8>>setpagedevice"
+*ColorModel Gray/Grayscale (Pigment Black / Composite): "<</cupsColorSpace 18/cupsColorOrder 0/cupsBitsPerColor 8>>setpagedevice"
+*CloseUI: *ColorModel
+
+*OpenUI *CNBorderlessExtension/Borderless Amount of Extension: PickOne
+*OrderDependency: 50 AnySetup *CNBorderlessExtension
+*DefaultCNBorderlessExtension: Ext2
+*CNBorderlessExtension Off/Standard Borders (Off): ""
+*CNBorderlessExtension Ext0/Level 0 - No Extension (Exact Size): ""
+*CNBorderlessExtension Ext1/Level 1 - Small Extension: ""
+*CNBorderlessExtension Ext2/Level 2 - Medium Extension (Recommended): ""
+*CNBorderlessExtension Ext3/Level 3 - Large Extension (Zero White Edge): ""
+*CloseUI: *CNBorderlessExtension
+
+*OpenUI *CNInkDryingTime/Ink Drying Wait Time: PickOne
+*OrderDependency: 60 AnySetup *CNInkDryingTime
+*DefaultCNInkDryingTime: Normal
+*CNInkDryingTime Short/Short: ""
+*CNInkDryingTime Normal/Normal: ""
+*CNInkDryingTime Long/Long: ""
+*CNInkDryingTime ExtraLong/Extra Long: ""
+*CloseUI: *CNInkDryingTime
+
+*OpenUI *CNAbrasion/Prevent Paper Abrasion (Wide Head Gap): Boolean
+*OrderDependency: 70 AnySetup *CNAbrasion
+*DefaultCNAbrasion: False
+*CNAbrasion False/Off (Normal Head Height): ""
+*CNAbrasion True/On (Wide Head Clearance for Thick Media): ""
+*CloseUI: *CNAbrasion
+
+*OpenUI *CNQuietMode/Quiet Mode: PickOne
+*OrderDependency: 80 AnySetup *CNQuietMode
+*DefaultCNQuietMode: Off
+*CNQuietMode Off/Do Not Use Quiet Mode: ""
+*CNQuietMode Always/Always Use Quiet Mode: ""
+*CloseUI: *CNQuietMode
+
+*OpenUI *Duplex/Manual Duplex Printing: PickOne
+*OrderDependency: 90 AnySetup *Duplex
+*DefaultDuplex: None
+*Duplex None/Off: "<</Duplex false>>setpagedevice"
+*Duplex DuplexNoTumble/Long-Edge Binding: "<</Duplex true/Tumble false>>setpagedevice"
+*Duplex DuplexTumble/Short-Edge Binding: "<</Duplex true/Tumble true>>setpagedevice"
+*CloseUI: *Duplex
+
+*DefaultFont: Courier
+*Font Courier: Standard "(001.001)" Standard ROM

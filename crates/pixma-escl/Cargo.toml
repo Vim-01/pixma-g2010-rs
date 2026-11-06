@@ -1,0 +1,30 @@
+[package]
+name = "pixma-escl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driverless eSCL (AirScan) HTTP/XML scanner microserver for Canon PIXMA G2010"
+
+[[bin]]
+name = "pixma-escl-server"
+path = "src/bin/pixma-escl-server.rs"
+
+[dependencies]
+pixma-core.workspace = true
+pixma-protocol.workspace = true
+pixma-transport.workspace = true
+pixma-imageproc.workspace = true
+pixma-daemon.workspace = true
+image.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
