@@ -278,6 +278,13 @@ pub enum Commands {
         #[arg(long, help = "Enable acoustic quiet mode")]
         quiet: bool,
     },
+
+    /// Generate shell autocompletion scripts (bash, zsh, fish, powershell, elvish).
+    Completions {
+        /// Target shell for autocompletions.
+        #[arg(value_enum, help = "Target shell")]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

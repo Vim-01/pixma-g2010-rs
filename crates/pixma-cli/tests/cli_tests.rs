@@ -472,3 +472,28 @@ async fn test_headless_roller_clean_and_align_on_mock() {
     .await;
     assert!(align_res.is_ok());
 }
+
+#[test]
+fn test_cli_parse_completions() {
+    let args = vec!["pixma-cli", "completions", "bash"];
+    let cli = Cli::try_parse_from(args).expect("Failed to parse completions");
+    assert_eq!(
+        cli.command,
+        Commands::Completions {
+            shell: clap_complete::Shell::Bash
+        }
+    );
+
+    let mut buf = Vec::new();
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(
+        clap_complete::Shell::Bash,
+        &mut cmd,
+        "pixma-cli",
+        &mut buf,
+    );
+    let out = String::from_utf8(buf).expect("Invalid UTF-8");
+    assert!(out.contains("_pixma__cli") || out.contains("pixma-cli"));
+    assert!(out.contains("nozzle-check"));
+    assert!(out.contains("status"));
+}

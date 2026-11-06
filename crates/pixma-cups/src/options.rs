@@ -327,11 +327,14 @@ fn tokenize_cups_options(input: &str) -> Vec<(String, Option<String>)> {
 fn parse_paper_size_and_borderless(raw: &str) -> (PaperSize, bool) {
     let lower = raw.trim().to_ascii_lowercase();
     let is_bl = lower.ends_with(".bl")
+        || lower.ends_with(".fullbleed")
         || lower.ends_with(".borderless")
         || lower.ends_with("_borderless")
         || lower.starts_with("borderless_");
 
     let base = if let Some(stripped) = lower.strip_suffix(".bl") {
+        stripped
+    } else if let Some(stripped) = lower.strip_suffix(".fullbleed") {
         stripped
     } else if let Some(stripped) = lower.strip_suffix(".borderless") {
         stripped
@@ -356,7 +359,7 @@ fn parse_paper_size_and_borderless(raw: &str) -> (PaperSize, bool) {
         "8x10" | "photo8x10" | "na_govt-letter_8x10in" | "8x10in" => PaperSize::Photo8x10,
         "l" | "photol" | "oe_photo-l_3.5x5in" | "3.5x5" => PaperSize::PhotoL,
         "square5x5" | "5x5" | "oe_square-5x5_5x5in" => PaperSize::Square5x5,
-        "businesscard" | "oe_business-card_55x91mm" | "card" => PaperSize::BusinessCard,
+        "businesscard" | "oe_business-card_55x91mm" | "card" | "55x91mm" => PaperSize::BusinessCard,
         "env10" | "envelopecom10" | "com10" | "na_number-10_4.125x9.5in" => {
             PaperSize::EnvelopeCom10
         }

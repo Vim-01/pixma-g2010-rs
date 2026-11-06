@@ -1,0 +1,20 @@
+[Unit]
+Description=Canon PIXMA G2010 Secure Reverse SSH Tunnel (Laptop to Workstation)
+Documentation=https://github.com/Vim-01/pixma-g2010-rs
+After=network.target pixmad.service pixma-printer-app.service pixma-escl.service
+Wants=pixmad.service pixma-printer-app.service pixma-escl.service
+
+[Service]
+Type=simple
+# Replace 'workstation' with your desktop workstation host/IP
+ExecStart=/usr/bin/ssh -N -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -R 8631:127.0.0.1:8631 -R 8080:127.0.0.1:8080 %u@workstation
+Restart=always
+RestartSec=5s
+
+# Security sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

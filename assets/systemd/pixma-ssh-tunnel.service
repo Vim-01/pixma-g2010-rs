@@ -1,0 +1,19 @@
+[Unit]
+Description=Canon PIXMA G2010 Secure SSH Tunnel (Client)
+Documentation=https://github.com/Vim-01/pixma-g2010-rs
+After=network.target
+
+[Service]
+Type=simple
+# Replace 'laptop' with your ARM laptop SSH alias or user@hostname
+ExecStart=/usr/bin/ssh -N -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -L 8631:127.0.0.1:8631 -L 8080:127.0.0.1:8080 %u@laptop
+Restart=always
+RestartSec=5s
+
+# Security sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

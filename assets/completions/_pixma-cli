@@ -1,0 +1,319 @@
+#compdef pixma-cli
+
+autoload -U is-at-least
+
+_pixma-cli() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_pixma-cli_commands" \
+"*::: :->pixma-cli" \
+&& ret=0
+    case $state in
+    (pixma-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:pixma-cli-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(clean)
+_arguments "${_arguments_options[@]}" : \
+'--kind=[Cleaning intensity]:KIND:(regular deep flush)' \
+'--target=[Cleaning target ink group]:TARGET:(all black color)' \
+'--confirm=[Mandatory confirmation token for Ink Flush ('\''YES-DRAIN-INK'\'')]:CONFIRM:_default' \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--override-cooldown-dangerously[Bypass mandatory cooldown timers]' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(roller-clean)
+_arguments "${_arguments_options[@]}" : \
+'--target=[Mechanical target]:TARGET:(roller platen)' \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(nozzle-check)
+_arguments "${_arguments_options[@]}" : \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(align)
+_arguments "${_arguments_options[@]}" : \
+'--action=[Alignment action]:ACTION:(print-manual half-auto check apply)' \
+'--values=[14 comma-separated integer offsets (-5..=5) for columns A..N]:VALUES:_default' \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(scan)
+_arguments "${_arguments_options[@]}" : \
+'--dpi=[Scanning resolution (75, 100, 150, 200, 300, 400, 600, 1200)]:DPI:_default' \
+'--mode=[Color mode]:MODE:(color gray lineart)' \
+'--output=[Output destination file path (.pdf, .png, .jpg, .tiff)]:OUTPUT:_files' \
+'--width=[Scan region width in pixels]:WIDTH:_default' \
+'--height=[Scan region height in pixels]:HEIGHT:_default' \
+'--gamma=[Midtone gamma adjustment]:GAMMA:_default' \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--auto-crop[Enable automatic multi-photo crop]' \
+'--deskew[Enable automatic document deskew]' \
+'--descreen[Enable 2D-FFT halftone descreening]' \
+'--unsharp[Enable Gaussian unsharp masking edge sharpening]' \
+'--remove-dust[Enable dust and scratch removal]' \
+'--gutter-shadow[Enable gutter shadow compensation]' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(print)
+_arguments "${_arguments_options[@]}" : \
+'--input=[Input image or PWG Raster file path]:INPUT:_files' \
+'--media=[Paper media type]:MEDIA:(plain glossygold proplat luster semigloss glossy matte highres envelope hagaki cardstock)' \
+'--paper=[Paper size]:PAPER:(a4 a5 b5 letter legal 4x6 5x7 8x10 l square5x5 businesscard env10 envdl hagaki)' \
+'--quality=[Print quality level (1 = Finest, 5 = Draft)]:QUALITY:_default' \
+'--borderless=[Borderless overscan mode]:BORDERLESS:(off 0 1 2 3)' \
+'--layout=[Page layout mode]:LAYOUT:(normal fit scaled nup2 nup4 nup6 nup9 nup16 poster2x2 poster3x3 booklet)' \
+'--cyan=[Cyan color balance adjustment (-50..50)]:CYAN:_default' \
+'--magenta=[Magenta color balance adjustment (-50..50)]:MAGENTA:_default' \
+'--yellow=[Yellow color balance adjustment (-50..50)]:YELLOW:_default' \
+'--brightness=[Brightness adjustment (-50..50)]:BRIGHTNESS:_default' \
+'--contrast=[Contrast adjustment (-50..50)]:CONTRAST:_default' \
+'--drying=[Ink drying wait time]:DRYING:(short normal long extralong)' \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'(--input)--test-page[Print diagnostic test page]' \
+'--grayscale[Convert printout to grayscale]' \
+'--wide-gap[Prevent paper abrasion (wide platen gap)]' \
+'--quiet[Enable acoustic quiet mode]' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+'--socket=[Path to pixmad Unix domain socket]:SOCKET:_files' \
+'--mock[Use in-memory virtual G2010 hardware emulator]' \
+'--json[Emit output in machine-readable JSON format]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Target shell:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_pixma-cli__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:pixma-cli-help-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clean)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(roller-clean)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(nozzle-check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(align)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(scan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(print)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_pixma-cli_commands] )) ||
+_pixma-cli_commands() {
+    local commands; commands=(
+'status:Query real-time hardware status, ink levels, and diagnostic error codes' \
+'clean:Execute print head cleaning routine' \
+'roller-clean:Clean mechanical paper feed rollers or platen bottom plate ribs' \
+'nozzle-check:Print diagnostic nozzle check calibration grid' \
+'align:Print head alignment routines and adjustment offsets' \
+'scan:Acquire image from the flatbed scanner platen' \
+'print:Print an image, PWG Raster document, or internal test page' \
+'completions:Generate shell autocompletion scripts (bash, zsh, fish, powershell, elvish)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'pixma-cli commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__align_commands] )) ||
+_pixma-cli__subcmd__align_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli align commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__clean_commands] )) ||
+_pixma-cli__subcmd__clean_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli clean commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__completions_commands] )) ||
+_pixma-cli__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli completions commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help_commands] )) ||
+_pixma-cli__subcmd__help_commands() {
+    local commands; commands=(
+'status:Query real-time hardware status, ink levels, and diagnostic error codes' \
+'clean:Execute print head cleaning routine' \
+'roller-clean:Clean mechanical paper feed rollers or platen bottom plate ribs' \
+'nozzle-check:Print diagnostic nozzle check calibration grid' \
+'align:Print head alignment routines and adjustment offsets' \
+'scan:Acquire image from the flatbed scanner platen' \
+'print:Print an image, PWG Raster document, or internal test page' \
+'completions:Generate shell autocompletion scripts (bash, zsh, fish, powershell, elvish)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'pixma-cli help commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__align_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__align_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help align commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__clean_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__clean_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help clean commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__completions_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help completions commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__help_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help help commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__nozzle-check_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__nozzle-check_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help nozzle-check commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__print_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__print_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help print commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__roller-clean_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__roller-clean_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help roller-clean commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__scan_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__scan_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help scan commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__help__subcmd__status_commands] )) ||
+_pixma-cli__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli help status commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__nozzle-check_commands] )) ||
+_pixma-cli__subcmd__nozzle-check_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli nozzle-check commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__print_commands] )) ||
+_pixma-cli__subcmd__print_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli print commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__roller-clean_commands] )) ||
+_pixma-cli__subcmd__roller-clean_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli roller-clean commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__scan_commands] )) ||
+_pixma-cli__subcmd__scan_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli scan commands' commands "$@"
+}
+(( $+functions[_pixma-cli__subcmd__status_commands] )) ||
+_pixma-cli__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'pixma-cli status commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_pixma-cli" ]; then
+    _pixma-cli "$@"
+else
+    compdef _pixma-cli pixma-cli
+fi

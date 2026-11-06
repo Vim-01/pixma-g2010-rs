@@ -1,6 +1,6 @@
 //! Entry point for `pixma-cli`.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use pixma_cli::args::{Cli, Commands};
 use pixma_cli::commands::{align, clean, print, roller_clean, scan};
 use pixma_cli::connect_client;
@@ -14,6 +14,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Commands::Completions { shell } = cli.command {
+        let mut cmd = Cli::command();
+        clap_complete::generate(shell, &mut cmd, "pixma-cli", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let mut client = connect_client(cli.socket.as_deref(), cli.mock).await?;
 
     match cli.command {
@@ -131,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::Completions { .. } => unreachable!(),
     }
 
     Ok(())
