@@ -202,8 +202,13 @@ pub fn descreen_moire_2d_fft(img: &RgbImage) -> RgbImage {
             // Butterworth smooth low-pass roll-off for print halftone carrier region
             let butterworth = 1.0 / (1.0 + (r / 0.65).powi(4));
 
-            // Peak notch attenuation if this frequency exceeds the carrier spike threshold
-            let notch = if mag > carrier_threshold && carrier_threshold > 0.0 {
+            // Protect cardinal axes (kx < 0.06 or ky < 0.06) from carrier spike notching
+            // so horizontal and vertical step edges in documents do not produce ghost echoes.
+            let notch = if kx >= 0.06
+                && ky >= 0.06
+                && mag > carrier_threshold
+                && carrier_threshold > 0.0
+            {
                 (carrier_threshold / mag).max(0.10)
             } else {
                 1.0

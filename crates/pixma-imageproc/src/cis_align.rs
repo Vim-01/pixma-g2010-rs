@@ -169,9 +169,9 @@ impl LineStaggerBuffer {
         let mut aligned = ImageBuffer::new(width, height);
 
         if blue_offset == 0 {
-            // At <= 400 DPI, the CIS LED bar strobes R at y + 0.0, G at y + 1/3, and B at y + 2/3
-            // during continuous stepper motion. Compensate the 1/3 and 2/3 sub-line phase shift
-            // to eliminate orange/blue chromatic fringes on horizontal black edges.
+            // Pass 1: At <= 400 DPI, the CIS LED bar strobes R at y + 0.0, G at y + 1/3, and B at y + 2/3
+            // during continuous stepper motion. Compensate the 1/3 and 2/3 sub-line phase shift.
+            let mut stage1 = ImageBuffer::new(width, height);
             for y in 0..height {
                 let y_prev = y.saturating_sub(1);
                 for x in 0..width {
@@ -180,7 +180,133 @@ impl LineStaggerBuffer {
                     let r = cur[0];
                     let g = ((2 * cur[1] as u16 + prev[1] as u16 + 1) / 3) as u8;
                     let b = ((cur[2] as u16 + 2 * prev[2] as u16 + 1) / 3) as u8;
-                    aligned.put_pixel(x, y, Rgb([r, g, b]));
+                    stage1.put_pixel(x, y, Rgb([r, g, b]));
+                }
+            }
+
+            if width < 16 || height < 16 {
+                return stage1;
+            }
+
+            // Pass 2 & 3: Vertical 3-tap chroma median + CIS halftone strobe chroma demodulator.
+            // Because sequential R/G/B LED strobes sample 600-DPI halftones at phase offsets
+            // (0, 2pi/3, 4pi/3), neutral halftones alias into false rainbow chroma while their
+            // local high-frequency chroma jitter `hf_chroma` exceeds `chroma_mag`.
+            let w = width as usize;
+            let h = height as usize;
+            let stride = w + 1;
+            let table_len = (h + 1) * stride;
+            let mut sum_rg = vec![0i64; table_len];
+            let mut sum_bg = vec![0i64; table_len];
+            let mut sum_rb = vec![0i64; table_len];
+            let mut sum_hf = vec![0i64; table_len];
+
+            for y in 0..h {
+                let y_up = y.saturating_sub(1);
+                let mut row_rg = 0i64;
+                let mut row_bg = 0i64;
+                let mut row_rb = 0i64;
+                let mut row_hf = 0i64;
+
+                for x in 0..w {
+                    let x_lt = x.saturating_sub(1);
+                    let p = img.get_pixel(x as u32, y as u32);
+                    let p_up = img.get_pixel(x as u32, y_up as u32);
+                    let p_lt = img.get_pixel(x_lt as u32, y as u32);
+
+                    let rg = p[0] as i64 - p[1] as i64;
+                    let bg = p[2] as i64 - p[1] as i64;
+                    let rb = p[0] as i64 - p[2] as i64;
+
+                    let rg_up = p_up[0] as i64 - p_up[1] as i64;
+                    let bg_up = p_up[2] as i64 - p_up[1] as i64;
+                    let rg_lt = p_lt[0] as i64 - p_lt[1] as i64;
+                    let bg_lt = p_lt[2] as i64 - p_lt[1] as i64;
+
+                    let hf = (rg - rg_up).abs()
+                        + (bg - bg_up).abs()
+                        + (rg - rg_lt).abs()
+                        + (bg - bg_lt).abs();
+
+                    row_rg += rg;
+                    row_bg += bg;
+                    row_rb += rb;
+                    row_hf += hf;
+
+                    let idx = (y + 1) * stride + (x + 1);
+                    let up_idx = y * stride + (x + 1);
+                    sum_rg[idx] = sum_rg[up_idx] + row_rg;
+                    sum_bg[idx] = sum_bg[up_idx] + row_bg;
+                    sum_rb[idx] = sum_rb[up_idx] + row_rb;
+                    sum_hf[idx] = sum_hf[up_idx] + row_hf;
+                }
+            }
+
+            let box_sum = |tbl: &[i64], x0: usize, y0: usize, x1: usize, y1: usize| -> f32 {
+                (tbl[y1 * stride + x1] - tbl[y0 * stride + x1] - tbl[y1 * stride + x0]
+                    + tbl[y0 * stride + x0]) as f32
+            };
+
+            let median3 = |a: f32, b: f32, c: f32| -> f32 { a.max(b).min(a.min(b).max(c)) };
+
+            let rad = 8usize;
+            for y in 0..h {
+                let y_prev = y.saturating_sub(1);
+                let y_next = (y + 1).min(h - 1);
+                let by0 = y.saturating_sub(rad);
+                let by1 = (y + rad + 1).min(h);
+
+                for x in 0..w {
+                    let bx0 = x.saturating_sub(rad);
+                    let bx1 = (x + rad + 1).min(w);
+                    let area = ((bx1 - bx0) * (by1 - by0)) as f32;
+
+                    let m_rg = box_sum(&sum_rg, bx0, by0, bx1, by1) / area;
+                    let m_bg = box_sum(&sum_bg, bx0, by0, bx1, by1) / area;
+                    let m_rb = box_sum(&sum_rb, bx0, by0, bx1, by1) / area;
+                    let m_hf = box_sum(&sum_hf, bx0, by0, bx1, by1) / area;
+
+                    let cmag = m_rg.hypot(m_bg);
+                    let ratio = m_hf / (cmag + 1.0);
+
+                    let retain = if m_rb.abs() < 12.0 && m_hf > 48.0 {
+                        0.0
+                    } else if ratio <= 1.15 {
+                        1.0
+                    } else if ratio >= 1.55 {
+                        0.0
+                    } else {
+                        1.0 - (ratio - 1.15) / 0.40
+                    };
+
+                    let p_prev = stage1.get_pixel(x as u32, y_prev as u32);
+                    let p_cur = stage1.get_pixel(x as u32, y as u32);
+                    let p_next = stage1.get_pixel(x as u32, y_next as u32);
+
+                    let lum_prev = (p_prev[0] as f32 + p_prev[1] as f32 + p_prev[2] as f32) / 3.0;
+                    let lum_cur = (p_cur[0] as f32 + p_cur[1] as f32 + p_cur[2] as f32) / 3.0;
+                    let lum_next = (p_next[0] as f32 + p_next[1] as f32 + p_next[2] as f32) / 3.0;
+
+                    let cr = median3(
+                        p_prev[0] as f32 - lum_prev,
+                        p_cur[0] as f32 - lum_cur,
+                        p_next[0] as f32 - lum_next,
+                    );
+                    let cg = median3(
+                        p_prev[1] as f32 - lum_prev,
+                        p_cur[1] as f32 - lum_cur,
+                        p_next[1] as f32 - lum_next,
+                    );
+                    let cb = median3(
+                        p_prev[2] as f32 - lum_prev,
+                        p_cur[2] as f32 - lum_cur,
+                        p_next[2] as f32 - lum_next,
+                    );
+
+                    let r_out = (lum_cur + retain * cr).clamp(0.0, 255.0).round() as u8;
+                    let g_out = (lum_cur + retain * cg).clamp(0.0, 255.0).round() as u8;
+                    let b_out = (lum_cur + retain * cb).clamp(0.0, 255.0).round() as u8;
+                    aligned.put_pixel(x as u32, y as u32, Rgb([r_out, g_out, b_out]));
                 }
             }
             return aligned;
@@ -336,5 +462,42 @@ mod tests {
         buf.reset();
         assert!(buf.ring.is_empty());
         assert_eq!(buf.lines_pushed, 0);
+    }
+
+    #[test]
+    fn align_image_suppresses_cis_halftone_rainbow_while_preserving_true_color() {
+        let width = 32;
+        let height = 32;
+        let mut mono_halftone = RgbImage::new(width, height);
+
+        // Simulate 150-DPI CIS scan of an 8x8 Bayer halftone where G is depressed on even rows
+        // and oscillates vertically at the Nyquist frequency while R and B stay near 215.
+        for y in 0..height {
+            for x in 0..width {
+                let checker = if (x + y) % 2 == 0 { 12i32 } else { -12i32 };
+                let r = (216 + checker) as u8;
+                let b = (212 - checker) as u8;
+                let g = if y % 2 == 0 { 174 } else { 204 };
+                mono_halftone.put_pixel(x, y, Rgb([r, g, b]));
+            }
+        }
+
+        let aligned_mono = LineStaggerBuffer::align_image(&mono_halftone, ScanResolution::Dpi150);
+        let p_center = aligned_mono.get_pixel(16, 16);
+        let spread = p_center[0]
+            .max(p_center[1])
+            .max(p_center[2])
+            .saturating_sub(p_center[0].min(p_center[1]).min(p_center[2]));
+        assert!(
+            spread <= 2,
+            "Expected neutral gray after CIS halftone demodulation, got {:?} (spread={})",
+            p_center,
+            spread
+        );
+
+        // Verify a genuine Magenta color patch (R=235, G=120, B=160) is preserved
+        let color_patch = RgbImage::from_pixel(width, height, Rgb([235, 120, 160]));
+        let aligned_color = LineStaggerBuffer::align_image(&color_patch, ScanResolution::Dpi150);
+        assert_eq!(aligned_color.get_pixel(16, 16), &Rgb([235, 120, 160]));
     }
 }
