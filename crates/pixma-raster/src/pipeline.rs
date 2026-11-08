@@ -6,7 +6,9 @@
 
 use crate::cups_reader::RasterPageInput;
 use crate::errors::RasterError;
-use crate::halftone::{BlueNoiseDitherer, DitherAlgorithm, ErrorDiffusionDitherer};
+use crate::halftone::{
+    get_blue_noise_matrix_64x64, BlueNoiseDitherer, DitherAlgorithm, ErrorDiffusionDitherer,
+};
 use crate::layout::{apply_borderless_extension, apply_page_layout};
 use pixma_color::{rgb_to_sgray_fixed_point, ColorPipeline, InkSeparator};
 use pixma_core::print_params::PrintJobConfig;
@@ -317,17 +319,7 @@ impl PrintRasterPipeline {
         let dot_w = printable_w_600 as usize;
         let bytes_1bpp = dot_w.div_ceil(8);
         let bytes_2bpp = dot_w.div_ceil(4);
-
-        const BAYER_8X8: [[u8; 8]; 8] = [
-            [2, 130, 34, 162, 10, 138, 42, 170],
-            [194, 66, 226, 98, 202, 74, 234, 106],
-            [50, 178, 18, 146, 58, 186, 26, 154],
-            [242, 114, 210, 82, 250, 122, 218, 90],
-            [14, 142, 46, 174, 6, 134, 38, 166],
-            [206, 78, 238, 110, 198, 70, 230, 102],
-            [62, 190, 30, 158, 54, 182, 22, 150],
-            [254, 126, 222, 94, 246, 118, 214, 86],
-        ];
+        let blue_noise = get_blue_noise_matrix_64x64();
 
         // 3. Per-page BJR520 prologue, 8-line ESC ( F bands, and epilogue
         for (page_idx, page_lines) in rendered_pages.iter().enumerate() {
@@ -381,7 +373,8 @@ impl PrintRasterPipeline {
                         continue;
                     }
 
-                    let bayer_row = &BAYER_8X8[y_600 & 7];
+                    let bn_row_start = (y_600 & 63) * 64;
+                    let bn_row = &blue_noise[bn_row_start..bn_row_start + 64];
                     let src_w = line.dot_width() as usize;
 
                     if line.bytes_per_pixel() == 1 || page_grayscale {
@@ -398,7 +391,7 @@ impl PrintRasterPipeline {
                             };
                             if g < 255 {
                                 let k = if g < 16 { 255 } else { 255 - g };
-                                let thr = bayer_row[px & 7];
+                                let thr = bn_row[px & 63];
                                 if k > thr {
                                     k_band[row][px >> 3] |= 1 << (7 - (px & 7));
                                 }
@@ -421,7 +414,7 @@ impl PrintRasterPipeline {
                             }
 
                             let cmyk = separator.separate_pixel(r, g, b);
-                            let thr = bayer_row[px & 7];
+                            let thr = bn_row[px & 63];
                             let thr_lo = thr >> 1;
                             let thr_hi = 128 + thr_lo;
                             let shift_2bpp = (3 - (px & 3)) * 2;
