@@ -2,9 +2,9 @@
 //! and JSON REST management APIs for the Canon PIXMA G2010.
 
 use crate::ipp::{
-    IppRequest, IppResponse, OP_GET_JOBS, OP_GET_PRINTER_ATTRIBUTES, OP_PRINT_JOB, OP_VALIDATE_JOB,
-    STATUS_CLIENT_ERROR_BAD_REQUEST, STATUS_SERVER_ERROR_INTERNAL,
-    STATUS_SERVER_ERROR_NOT_SUPPORTED,
+    IppRequest, IppResponse, OP_CANCEL_JOB, OP_GET_JOBS, OP_GET_JOB_ATTRIBUTES,
+    OP_GET_PRINTER_ATTRIBUTES, OP_PRINT_JOB, OP_VALIDATE_JOB, STATUS_CLIENT_ERROR_BAD_REQUEST,
+    STATUS_SERVER_ERROR_INTERNAL, STATUS_SERVER_ERROR_NOT_SUPPORTED,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -16,7 +16,7 @@ use pixma_core::maintenance::MaintenanceAction;
 use pixma_core::models::DeviceStatus;
 use pixma_core::print_params::PrintJobConfig;
 use pixma_daemon::DaemonClient;
-use pixma_raster::cups_reader::{parse_image_from_memory, parse_pwg_raster, RasterPageInput};
+use pixma_raster::cups_reader::{parse_document_from_memory, RasterPageInput};
 use pixma_raster::pipeline::PrintRasterPipeline;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,14 +28,21 @@ use tokio::sync::Mutex;
 /// and monotonically increasing job identifier counter.
 #[derive(Clone)]
 pub struct AppState {
-    pub client: Arc<Mutex<DaemonClient>>,
+    pub client: Arc<Mutex<Option<DaemonClient>>>,
     pub job_counter: Arc<AtomicU32>,
 }
 
 impl AppState {
     pub fn new(client: DaemonClient) -> Self {
         Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(Some(client))),
+            job_counter: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    pub fn new_on_demand() -> Self {
+        Self {
+            client: Arc::new(Mutex::new(None)),
             job_counter: Arc::new(AtomicU32::new(1)),
         }
     }
@@ -91,12 +98,13 @@ async fn handle_ipp_request(
 
     let resp_bytes = match req.operation_id {
         OP_GET_PRINTER_ATTRIBUTES => {
-            let mut client = state.client.lock().await;
-            let status = match client.get_status().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to query status from device: {e}");
-                    DeviceStatus::default()
+            let mut guard = state.client.lock().await;
+            let status = if let Some(client) = guard.as_mut() {
+                client.get_status().await.unwrap_or_default()
+            } else {
+                match DaemonClient::connect_or_fallback(None, None).await {
+                    Ok(mut temp_client) => temp_client.get_status().await.unwrap_or_default(),
+                    Err(_) => DeviceStatus::default(),
                 }
             };
             let resp = IppResponse::build_printer_attributes(
@@ -131,12 +139,9 @@ async fn handle_ipp_request(
 
             let job_id = state.job_counter.fetch_add(1, Ordering::SeqCst) as i32;
 
-            // Ingest raster or image
-            let pages: Result<Vec<RasterPageInput>, _> = if req.data.starts_with(b"RaS2") {
-                parse_pwg_raster(&req.data)
-            } else {
-                parse_image_from_memory(&req.data, Some(300)).map(|p| vec![p])
-            };
+            // Ingest PWG raster, multi-page PDF, or standard image at 600 DPI
+            let pages: Result<Vec<RasterPageInput>, _> =
+                parse_document_from_memory(&req.data, Some(600));
 
             let pages = match pages {
                 Ok(p) if !p.is_empty() => p,
@@ -161,30 +166,52 @@ async fn handle_ipp_request(
                 }
             };
 
-            let config = PrintJobConfig {
+            let mut config = PrintJobConfig {
                 job_id: job_id as u32,
                 ..Default::default()
             };
+            // Honor IPP print-color-mode="monochrome" if requested
+            if let Some(attr) = req
+                .job_attributes
+                .iter()
+                .chain(req.operation_attributes.iter())
+                .find(|a| a.name().eq_ignore_ascii_case("print-color-mode"))
+            {
+                if let Some(val) = attr.first_value().and_then(|v| v.as_str()) {
+                    if val.contains("monochrome") || val.contains("gray") {
+                        config.color.grayscale = true;
+                    }
+                }
+            }
 
             let timestamp = format_timestamp_now();
-            let job_stream =
-                match PrintRasterPipeline::compile_ivec_pwg_job(&pages, &config, &timestamp) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to compile IVEC print stream: {e}");
-                        let resp = IppResponse::new(
-                            req.version_major,
-                            req.version_minor,
-                            STATUS_SERVER_ERROR_INTERNAL,
-                            req.request_id,
-                        );
-                        return Ok(ipp_binary_response(resp.to_bytes()));
-                    }
-                };
+            let job_stream = match PrintRasterPipeline::compile_ivec_bjraster3_job(
+                &pages, &config, &timestamp,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to compile IVEC BJRaster3 print stream: {e}");
+                    let resp = IppResponse::new(
+                        req.version_major,
+                        req.version_minor,
+                        STATUS_SERVER_ERROR_INTERNAL,
+                        req.request_id,
+                    );
+                    return Ok(ipp_binary_response(resp.to_bytes()));
+                }
+            };
 
-            // Stream to device via client
-            let mut client = state.client.lock().await;
-            if let Err(e) = client.print_raw_stream(&job_stream).await {
+            // Stream to device via client (or on-demand USB/daemon connection)
+            let mut guard = state.client.lock().await;
+            let print_res = if let Some(client) = guard.as_mut() {
+                client.print_raw_stream(&job_stream).await
+            } else {
+                match DaemonClient::connect_or_fallback(None, None).await {
+                    Ok(mut temp_client) => temp_client.print_raw_stream(&job_stream).await,
+                    Err(e) => Err(e),
+                }
+            };
+            if let Err(e) = print_res {
                 tracing::error!("Failed to stream print job to device: {e}");
                 let resp = IppResponse::new(
                     req.version_major,
@@ -204,7 +231,17 @@ async fn handle_ipp_request(
             resp.to_bytes()
         }
 
-        OP_GET_JOBS => {
+        OP_GET_JOB_ATTRIBUTES => {
+            let resp = IppResponse::build_print_job_response(
+                req.version_major,
+                req.version_minor,
+                req.request_id,
+                1,
+            );
+            resp.to_bytes()
+        }
+
+        OP_CANCEL_JOB | OP_GET_JOBS => {
             let resp = IppResponse::new(
                 req.version_major,
                 req.version_minor,
@@ -242,8 +279,16 @@ fn ipp_binary_response(body: Vec<u8>) -> Response {
 async fn handle_get_status(
     State(state): State<AppState>,
 ) -> Result<Json<DeviceStatus>, (StatusCode, Json<ErrorResponse>)> {
-    let mut client = state.client.lock().await;
-    match client.get_status().await {
+    let mut guard = state.client.lock().await;
+    let res = if let Some(client) = guard.as_mut() {
+        client.get_status().await
+    } else {
+        match DaemonClient::connect_or_fallback(None, None).await {
+            Ok(mut temp_client) => temp_client.get_status().await,
+            Err(e) => Err(e),
+        }
+    };
+    match res {
         Ok(status) => Ok(Json(status)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -259,15 +304,30 @@ async fn handle_post_maintenance(
     State(state): State<AppState>,
     Json(payload): Json<MaintenanceApiRequest>,
 ) -> Result<Json<DeviceStatus>, (StatusCode, Json<ErrorResponse>)> {
-    let mut client = state.client.lock().await;
-    match client
-        .execute_maintenance(
-            payload.action,
-            payload.confirmation_token.as_deref(),
-            payload.override_cooldown,
-        )
-        .await
-    {
+    let mut guard = state.client.lock().await;
+    let res = if let Some(client) = guard.as_mut() {
+        client
+            .execute_maintenance(
+                payload.action,
+                payload.confirmation_token.as_deref(),
+                payload.override_cooldown,
+            )
+            .await
+    } else {
+        match DaemonClient::connect_or_fallback(None, None).await {
+            Ok(mut temp_client) => {
+                temp_client
+                    .execute_maintenance(
+                        payload.action,
+                        payload.confirmation_token.as_deref(),
+                        payload.override_cooldown,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match res {
         Ok(status) => Ok(Json(status)),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,

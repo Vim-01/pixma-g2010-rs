@@ -514,7 +514,7 @@ impl StudioViewModel {
         let timestamp = Self::current_timestamp_14();
 
         let wire_data =
-            PrintRasterPipeline::compile_ivec_pwg_job(&[page], &self.print_config, &timestamp)
+            PrintRasterPipeline::compile_ivec_bjraster3_job(&[page], &self.print_config, &timestamp)
                 .map_err(|e| e.to_string())?;
 
         client

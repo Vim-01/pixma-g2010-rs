@@ -10,7 +10,7 @@ pkgname=(
   'pixma-g2010-gui'
   'pixma-g2010-meta'
 )
-pkgver=0.1.0.beta.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Modern memory-safe Rust software suite for Canon PIXMA G2010 on Arch Linux"
 arch=('x86_64' 'aarch64')

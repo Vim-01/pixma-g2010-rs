@@ -12,6 +12,8 @@ use thiserror::Error;
 // Operation IDs
 pub const OP_PRINT_JOB: u16 = 0x0002;
 pub const OP_VALIDATE_JOB: u16 = 0x0004;
+pub const OP_CANCEL_JOB: u16 = 0x0008;
+pub const OP_GET_JOB_ATTRIBUTES: u16 = 0x0009;
 pub const OP_GET_JOBS: u16 = 0x000A;
 pub const OP_GET_PRINTER_ATTRIBUTES: u16 = 0x000B;
 
@@ -380,14 +382,20 @@ impl IppResponse {
             IppValue::text(TAG_KEYWORD, state_reason),
         ));
 
-        // 4. document-format-supported: image/pwg-raster, image/png, image/jpeg
+        // 4. document-format-supported: application/pdf, image/pwg-raster, image/png, image/jpeg, application/octet-stream
         resp.add_printer_attribute(IppAttribute::new_set(
             "document-format-supported",
             vec![
+                IppValue::text(TAG_MIME_MEDIA_TYPE, "application/pdf"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/pwg-raster"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/png"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/jpeg"),
+                IppValue::text(TAG_MIME_MEDIA_TYPE, "application/octet-stream"),
             ],
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "document-format-default",
+            IppValue::text(TAG_MIME_MEDIA_TYPE, "application/pdf"),
         ));
 
         // 5. marker-names
@@ -447,6 +455,8 @@ impl IppResponse {
             vec![
                 IppValue::enumeration(OP_PRINT_JOB as i32),
                 IppValue::enumeration(OP_VALIDATE_JOB as i32),
+                IppValue::enumeration(OP_CANCEL_JOB as i32),
+                IppValue::enumeration(OP_GET_JOB_ATTRIBUTES as i32),
                 IppValue::enumeration(OP_GET_JOBS as i32),
                 IppValue::enumeration(OP_GET_PRINTER_ATTRIBUTES as i32),
             ],

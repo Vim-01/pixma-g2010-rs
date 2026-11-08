@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish GitHub Release (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (GTK4, Libadwaita, CUPS, SANE)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-4-dev libadwaita-1-dev libcups2-dev libsane-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release workspace
+        run: cargo build --release --workspace
+
+      - name: Run workspace test suite
+        run: cargo test --workspace
+
+      - name: Package release archive & assets
+        run: |
+          TAG="${GITHUB_REF_NAME:-v0.2.0}"
+          PKG_DIR="pixma-g2010-rs-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${PKG_DIR}/bin" "dist/${PKG_DIR}/lib" "dist/${PKG_DIR}/assets"
+          cp target/release/pixma-cli \
+             target/release/pixma-studio \
+             target/release/pixmad \
+             target/release/pixma-printer-app \
+             target/release/pixma-escl-server \
+             target/release/rastertopixma-g2010 \
+             target/release/cmdtopixma-g2010 \
+             target/release/cnusb-g2010 \
+             "dist/${PKG_DIR}/bin/"
+          cp target/release/libsane_pixma_g2010.so "dist/${PKG_DIR}/lib/"
+          cp -r assets/* scripts README.md README.ru.md LICENSE CHANGELOG.md "dist/${PKG_DIR}/"
+          tar -C dist -czf "dist/${PKG_DIR}.tar.gz" "${PKG_DIR}"
+          cp assets/ppd/pixma-g2010.ppd "dist/pixma-g2010.ppd"
+          cp assets/udev/70-pixma-g2010.rules "dist/70-pixma-g2010.rules"
+          cd dist && sha256sum "${PKG_DIR}.tar.gz" pixma-g2010.ppd 70-pixma-g2010.rules > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body_path: CHANGELOG.md
+          files: |
+            dist/*.tar.gz
+            dist/pixma-g2010.ppd
+            dist/70-pixma-g2010.rules
+            dist/SHA256SUMS.txt

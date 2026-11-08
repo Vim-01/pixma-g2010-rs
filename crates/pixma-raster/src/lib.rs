@@ -21,7 +21,8 @@ pub mod layout;
 pub mod pipeline;
 
 pub use cups_reader::{
-    generate_test_print_page, parse_image_from_memory, parse_pwg_raster, RasterPageInput,
+    generate_test_print_page, parse_document_from_memory, parse_image_from_memory,
+    parse_pwg_raster, RasterPageInput,
 };
 pub use errors::RasterError;
 pub use halftone::{

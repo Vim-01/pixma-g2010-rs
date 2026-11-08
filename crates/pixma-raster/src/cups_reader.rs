@@ -283,6 +283,125 @@ pub fn parse_image_from_memory(
     RasterPageInput::new(width, height, dpi, rgb.into_raw())
 }
 
+/// Decodes a document buffer (`RaS2` PWG/CUPS Raster, multi-page `%PDF` document, or
+/// PNG/JPEG/TIFF/WebP image) into one or more [`RasterPageInput`] pages.
+pub fn parse_document_from_memory(
+    data: &[u8],
+    default_dpi: Option<u32>,
+) -> Result<Vec<RasterPageInput>, RasterError> {
+    let dpi = default_dpi.unwrap_or(600).max(75);
+    if data.starts_with(&PWG_RASTER_MAGIC) {
+        return parse_pwg_raster(data);
+    }
+    if data.starts_with(b"%PDF") || data.iter().take(64).copied().collect::<Vec<u8>>().windows(5).any(|w| w == b"%PDF-") {
+        return rasterize_pdf_from_memory(data, dpi);
+    }
+    let page = parse_image_from_memory(data, Some(dpi))?;
+    Ok(vec![page])
+}
+
+/// Rasterizes a multi-page PDF buffer into [`RasterPageInput`] pages at `dpi` using
+/// system `pdftoppm` (or `gs` fallback).
+fn rasterize_pdf_from_memory(
+    pdf_bytes: &[u8],
+    dpi: u32,
+) -> Result<Vec<RasterPageInput>, RasterError> {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let work_dir = std::env::temp_dir().join(format!("pixma_pdf_{pid}_{nanos}"));
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| RasterError::StreamParse(format!("Failed to create temp PDF dir: {e}")))?;
+
+    let pdf_path = work_dir.join("input.pdf");
+    let out_prefix = work_dir.join("page");
+    if let Err(e) = std::fs::write(&pdf_path, pdf_bytes) {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(RasterError::StreamParse(format!(
+            "Failed to write temp PDF file: {e}"
+        )));
+    }
+
+    let dpi_str = dpi.to_string();
+    let pdftoppm_ok = Command::new("pdftoppm")
+        .args([
+            "-png",
+            "-r",
+            &dpi_str,
+            pdf_path.to_str().unwrap_or_default(),
+            out_prefix.to_str().unwrap_or_default(),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !pdftoppm_ok {
+        let gs_out = format!("{}-%04d.png", out_prefix.display());
+        let gs_dpi = format!("-r{dpi}");
+        let gs_ok = Command::new("gs")
+            .args([
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-sDEVICE=png16m",
+                &gs_dpi,
+                &format!("-sOutputFile={gs_out}"),
+                pdf_path.to_str().unwrap_or_default(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !gs_ok {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(RasterError::StreamParse(
+                "Neither pdftoppm nor gs succeeded in rasterizing PDF input".to_string(),
+            ));
+        }
+    }
+
+    let mut png_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&work_dir)
+        .map_err(|e| RasterError::StreamParse(format!("Failed to read temp PDF dir: {e}")))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
+        .collect();
+    png_paths.sort();
+
+    let mut pages = Vec::with_capacity(png_paths.len());
+    for png_path in &png_paths {
+        match std::fs::read(png_path) {
+            Ok(bytes) => match parse_image_from_memory(&bytes, Some(dpi)) {
+                Ok(page) => pages.push(page),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&work_dir);
+                    return Err(e);
+                }
+            },
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return Err(RasterError::StreamParse(format!(
+                    "Failed to read rasterized PDF page: {e}"
+                )));
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    if pages.is_empty() {
+        return Err(RasterError::StreamParse(
+            "PDF rasterization produced 0 pages".to_string(),
+        ));
+    }
+
+    Ok(pages)
+}
+
 /// Generates a diagnostic test print and nozzle check calibration page at the given DPI.
 pub fn generate_test_print_page(dpi: u32) -> RasterPageInput {
     let dpi = if dpi == 0 { 300 } else { dpi };

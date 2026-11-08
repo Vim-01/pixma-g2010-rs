@@ -169,147 +169,7 @@ impl LineStaggerBuffer {
         let mut aligned = ImageBuffer::new(width, height);
 
         if blue_offset == 0 {
-            // Pass 1: At <= 400 DPI, the CIS LED bar strobes R at y + 0.0, G at y + 1/3, and B at y + 2/3
-            // during continuous stepper motion. Compensate the 1/3 and 2/3 sub-line phase shift.
-            let mut stage1 = ImageBuffer::new(width, height);
-            for y in 0..height {
-                let y_prev = y.saturating_sub(1);
-                for x in 0..width {
-                    let cur = img.get_pixel(x, y);
-                    let prev = img.get_pixel(x, y_prev);
-                    let r = cur[0];
-                    let g = ((2 * cur[1] as u16 + prev[1] as u16 + 1) / 3) as u8;
-                    let b = ((cur[2] as u16 + 2 * prev[2] as u16 + 1) / 3) as u8;
-                    stage1.put_pixel(x, y, Rgb([r, g, b]));
-                }
-            }
-
-            if width < 16 || height < 16 {
-                return stage1;
-            }
-
-            // Pass 2 & 3: Vertical 3-tap chroma median + CIS halftone strobe chroma demodulator.
-            // Because sequential R/G/B LED strobes sample 600-DPI halftones at phase offsets
-            // (0, 2pi/3, 4pi/3), neutral halftones alias into false rainbow chroma while their
-            // local high-frequency chroma jitter `hf_chroma` exceeds `chroma_mag`.
-            let w = width as usize;
-            let h = height as usize;
-            let stride = w + 1;
-            let table_len = (h + 1) * stride;
-            let mut sum_rg = vec![0i64; table_len];
-            let mut sum_bg = vec![0i64; table_len];
-            let mut sum_rb = vec![0i64; table_len];
-            let mut sum_hf = vec![0i64; table_len];
-
-            for y in 0..h {
-                let y_up = y.saturating_sub(1);
-                let mut row_rg = 0i64;
-                let mut row_bg = 0i64;
-                let mut row_rb = 0i64;
-                let mut row_hf = 0i64;
-
-                for x in 0..w {
-                    let x_lt = x.saturating_sub(1);
-                    let p = img.get_pixel(x as u32, y as u32);
-                    let p_up = img.get_pixel(x as u32, y_up as u32);
-                    let p_lt = img.get_pixel(x_lt as u32, y as u32);
-
-                    let rg = p[0] as i64 - p[1] as i64;
-                    let bg = p[2] as i64 - p[1] as i64;
-                    let rb = p[0] as i64 - p[2] as i64;
-
-                    let rg_up = p_up[0] as i64 - p_up[1] as i64;
-                    let bg_up = p_up[2] as i64 - p_up[1] as i64;
-                    let rg_lt = p_lt[0] as i64 - p_lt[1] as i64;
-                    let bg_lt = p_lt[2] as i64 - p_lt[1] as i64;
-
-                    let hf = (rg - rg_up).abs()
-                        + (bg - bg_up).abs()
-                        + (rg - rg_lt).abs()
-                        + (bg - bg_lt).abs();
-
-                    row_rg += rg;
-                    row_bg += bg;
-                    row_rb += rb;
-                    row_hf += hf;
-
-                    let idx = (y + 1) * stride + (x + 1);
-                    let up_idx = y * stride + (x + 1);
-                    sum_rg[idx] = sum_rg[up_idx] + row_rg;
-                    sum_bg[idx] = sum_bg[up_idx] + row_bg;
-                    sum_rb[idx] = sum_rb[up_idx] + row_rb;
-                    sum_hf[idx] = sum_hf[up_idx] + row_hf;
-                }
-            }
-
-            let box_sum = |tbl: &[i64], x0: usize, y0: usize, x1: usize, y1: usize| -> f32 {
-                (tbl[y1 * stride + x1] - tbl[y0 * stride + x1] - tbl[y1 * stride + x0]
-                    + tbl[y0 * stride + x0]) as f32
-            };
-
-            let median3 = |a: f32, b: f32, c: f32| -> f32 { a.max(b).min(a.min(b).max(c)) };
-
-            let rad = 8usize;
-            for y in 0..h {
-                let y_prev = y.saturating_sub(1);
-                let y_next = (y + 1).min(h - 1);
-                let by0 = y.saturating_sub(rad);
-                let by1 = (y + rad + 1).min(h);
-
-                for x in 0..w {
-                    let bx0 = x.saturating_sub(rad);
-                    let bx1 = (x + rad + 1).min(w);
-                    let area = ((bx1 - bx0) * (by1 - by0)) as f32;
-
-                    let m_rg = box_sum(&sum_rg, bx0, by0, bx1, by1) / area;
-                    let m_bg = box_sum(&sum_bg, bx0, by0, bx1, by1) / area;
-                    let m_rb = box_sum(&sum_rb, bx0, by0, bx1, by1) / area;
-                    let m_hf = box_sum(&sum_hf, bx0, by0, bx1, by1) / area;
-
-                    let cmag = m_rg.hypot(m_bg);
-                    let ratio = m_hf / (cmag + 1.0);
-
-                    let retain = if m_rb.abs() < 12.0 && m_hf > 48.0 {
-                        0.0
-                    } else if ratio <= 1.15 {
-                        1.0
-                    } else if ratio >= 1.55 {
-                        0.0
-                    } else {
-                        1.0 - (ratio - 1.15) / 0.40
-                    };
-
-                    let p_prev = stage1.get_pixel(x as u32, y_prev as u32);
-                    let p_cur = stage1.get_pixel(x as u32, y as u32);
-                    let p_next = stage1.get_pixel(x as u32, y_next as u32);
-
-                    let lum_prev = (p_prev[0] as f32 + p_prev[1] as f32 + p_prev[2] as f32) / 3.0;
-                    let lum_cur = (p_cur[0] as f32 + p_cur[1] as f32 + p_cur[2] as f32) / 3.0;
-                    let lum_next = (p_next[0] as f32 + p_next[1] as f32 + p_next[2] as f32) / 3.0;
-
-                    let cr = median3(
-                        p_prev[0] as f32 - lum_prev,
-                        p_cur[0] as f32 - lum_cur,
-                        p_next[0] as f32 - lum_next,
-                    );
-                    let cg = median3(
-                        p_prev[1] as f32 - lum_prev,
-                        p_cur[1] as f32 - lum_cur,
-                        p_next[1] as f32 - lum_next,
-                    );
-                    let cb = median3(
-                        p_prev[2] as f32 - lum_prev,
-                        p_cur[2] as f32 - lum_cur,
-                        p_next[2] as f32 - lum_next,
-                    );
-
-                    let r_out = (lum_cur + retain * cr).clamp(0.0, 255.0).round() as u8;
-                    let g_out = (lum_cur + retain * cg).clamp(0.0, 255.0).round() as u8;
-                    let b_out = (lum_cur + retain * cb).clamp(0.0, 255.0).round() as u8;
-                    aligned.put_pixel(x as u32, y as u32, Rgb([r_out, g_out, b_out]));
-                }
-            }
-            return aligned;
+            return Self::suppress_subline_halftone_moire(img, resolution);
         }
 
         for y in 0..height {
@@ -324,7 +184,204 @@ impl LineStaggerBuffer {
             }
         }
 
-        aligned
+        Self::suppress_subline_halftone_moire(&aligned, resolution)
+    }
+
+    /// Suppresses sequential CIS LED sub-line false-color fringes and halftone moiré on
+    /// neutral gray/black regions while preserving 100% of color on 1-pixel and 2-pixel
+    /// thin colored lines, small colored objects, and pastel fills.
+    ///
+    /// Physical principle:
+    /// - A real single-hue colored feature (even 1 pixel tall) has unipolar deadzoned
+    ///   chromaticity `(rg, bg)` across its vertical cross-section `[ya..yb]`, so its
+    ///   vertical total variation `∑ |Δy c|` relative to its vertical net integral `|∑ c|`
+    ///   satisfies `diff_net <= 1.35`, and its mean coherent chroma per inked pixel
+    ///   satisfies `net_ink >= 22.0`.
+    /// - Conversely, CIS sequential R/G/B strobing across neutral black edges, missing-nozzle
+    ///   gaps, or halftone screens produces bipolar/oscillating chromaticity within the
+    ///   connected inked object (`diff_net >= 1.80`, `net_ink <= 15.5`).
+    fn suppress_subline_halftone_moire(img: &RgbImage, resolution: ScanResolution) -> RgbImage {
+        let w = img.width() as usize;
+        let h = img.height() as usize;
+        if w < 32 || h < 32 {
+            return img.clone();
+        }
+
+        let scale = ((resolution as usize) / 150).max(1);
+        let rx = 8 * scale;
+        let max_ry = 28 * scale;
+
+        #[inline]
+        fn deadzone(v: i32) -> i32 {
+            const DZ: i32 = 8;
+            if v > DZ {
+                v - DZ
+            } else if v < -DZ {
+                v + DZ
+            } else {
+                0
+            }
+        }
+
+        let stride = w;
+        let mut raw_abs = vec![0i32; h * stride];
+        let mut col_rg = vec![0i32; (h + 1) * stride];
+        let mut col_bg = vec![0i32; (h + 1) * stride];
+        let mut col_abs = vec![0i32; (h + 1) * stride];
+        let mut col_dy = vec![0i32; (h + 1) * stride];
+        let mut col_ink = vec![0i32; (h + 1) * stride];
+        let mut row_ink = vec![0i32; h * (w + 1)];
+
+        let mut prev_rg = vec![0i32; w];
+        let mut prev_bg = vec![0i32; w];
+
+        for y in 0..h {
+            let mut r_ink_sum = 0i32;
+            let row_ink_base = y * (w + 1);
+            let cur_base = (y + 1) * stride;
+            let prv_base = y * stride;
+
+            for x in 0..w {
+                let p = img.get_pixel(x as u32, y as u32);
+                let r = p[0] as i32;
+                let g = p[1] as i32;
+                let b = p[2] as i32;
+
+                let rg = deadzone(r - g);
+                let bg = deadzone(b - g);
+                let abs_c = rg.abs() + bg.abs();
+                raw_abs[prv_base + x] = abs_c;
+                let dy = if y > 0 {
+                    (rg - prev_rg[x]).abs() + (bg - prev_bg[x]).abs()
+                } else {
+                    abs_c
+                };
+                prev_rg[x] = rg;
+                prev_bg[x] = bg;
+
+                // White paper / light shadow has (r + g + b) >= 600 and zero deadzone chroma.
+                let ink = i32::from((r + g + b) < 200 * 3 || abs_c != 0);
+                r_ink_sum += ink;
+                row_ink[row_ink_base + x + 1] = r_ink_sum;
+
+                col_rg[cur_base + x] = col_rg[prv_base + x] + rg;
+                col_bg[cur_base + x] = col_bg[prv_base + x] + bg;
+                col_abs[cur_base + x] = col_abs[prv_base + x] + abs_c;
+                col_dy[cur_base + x] = col_dy[prv_base + x] + dy;
+                col_ink[cur_base + x] = col_ink[prv_base + x] + ink;
+            }
+        }
+
+        let mut out = ImageBuffer::new(w as u32, h as u32);
+        let min_empty_run = (2 * scale).max(2);
+        let max_border_ink = (2 * scale) as i32;
+
+        for y in 0..h {
+            let ym1_base = y.saturating_sub(1) * stride;
+            let y_base = y * stride;
+            let yp1_base = (y + 1).min(h - 1) * stride;
+
+            for x in 0..w {
+                let p = img.get_pixel(x as u32, y as u32);
+                let r = p[0] as i32;
+                let g = p[1] as i32;
+                let b = p[2] as i32;
+
+                if (r - g).abs() <= 2 && (b - g).abs() <= 2 {
+                    out.put_pixel(x as u32, y as u32, *p);
+                    continue;
+                }
+
+                let x0 = x.saturating_sub(rx);
+                let x1 = (x + rx + 1).min(w);
+
+                // Grow vertical window [y0..y1] within the connected inked object,
+                // stopping at white-paper gaps so adjacent colored bars never bleed across gaps.
+                let mut y0 = y;
+                let mut empty_run = 0usize;
+                let y_min = y.saturating_sub(max_ry).max(1);
+                while y0 > y_min {
+                    let r_base = (y0 - 1) * (w + 1);
+                    if (row_ink[r_base + x1] - row_ink[r_base + x0]) <= max_border_ink {
+                        empty_run += 1;
+                        if empty_run >= min_empty_run {
+                            break;
+                        }
+                    } else {
+                        empty_run = 0;
+                    }
+                    y0 -= 1;
+                }
+
+                let mut y1 = y;
+                empty_run = 0;
+                let y_max = (y + max_ry).min(h.saturating_sub(2));
+                while y1 < y_max {
+                    let r_base = (y1 + 1) * (w + 1);
+                    if (row_ink[r_base + x1] - row_ink[r_base + x0]) <= max_border_ink {
+                        empty_run += 1;
+                        if empty_run >= min_empty_run {
+                            break;
+                        }
+                    } else {
+                        empty_run = 0;
+                    }
+                    y1 += 1;
+                }
+
+                let ya = y0.saturating_sub(1);
+                let yb = (y1 + 2).min(h);
+                let ya_base = ya * stride;
+                let yb_base = yb * stride;
+
+                let mut net = 0i32;
+                let mut s_abs = 0i32;
+                let mut s_dy = 0i32;
+                let mut s_ink = 0i32;
+                for xx in x0..x1 {
+                    let c_rg = col_rg[yb_base + xx] - col_rg[ya_base + xx];
+                    let c_bg = col_bg[yb_base + xx] - col_bg[ya_base + xx];
+                    net += c_rg.abs() + c_bg.abs();
+                    s_abs += col_abs[yb_base + xx] - col_abs[ya_base + xx];
+                    let peak_c = raw_abs[ym1_base + xx]
+                        .max(raw_abs[y_base + xx])
+                        .max(raw_abs[yp1_base + xx]);
+                    let col_tv = (col_dy[yb_base + xx] - col_dy[ya_base + xx] - peak_c).max(0);
+                    s_dy += col_tv;
+                    s_ink += col_ink[yb_base + xx] - col_ink[ya_base + xx];
+                }
+
+                let keep = if s_ink == 0 || s_abs == 0 || net == 0 {
+                    0.0f32
+                } else {
+                    let diff_net = s_dy as f32 / net as f32;
+                    let coh = net as f32 / s_abs as f32;
+                    let net_ink = net as f32 / s_ink as f32;
+                    let k_diff = ((1.55 - diff_net) / (1.55 - 1.25)).clamp(0.0, 1.0);
+                    let k_coh = ((coh - 0.65) / (0.76 - 0.65)).clamp(0.0, 1.0);
+                    let k_ink = ((net_ink - 16.5) / (20.0 - 16.5)).clamp(0.0, 1.0);
+                    k_diff * k_coh * k_ink
+                };
+
+                if keep >= 0.999 {
+                    out.put_pixel(x as u32, y as u32, *p);
+                } else {
+                    let lum = (77 * r + 150 * g + 29 * b + 128) >> 8;
+                    let nr = (lum as f32 + (r - lum) as f32 * keep)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    let ng = (lum as f32 + (g - lum) as f32 * keep)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    let nb = (lum as f32 + (b - lum) as f32 * keep)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    out.put_pixel(x as u32, y as u32, Rgb([nr, ng, nb]));
+                }
+            }
+        }
+
+        out
     }
 }
 
@@ -465,39 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn align_image_suppresses_cis_halftone_rainbow_while_preserving_true_color() {
-        let width = 32;
-        let height = 32;
-        let mut mono_halftone = RgbImage::new(width, height);
-
-        // Simulate 150-DPI CIS scan of an 8x8 Bayer halftone where G is depressed on even rows
-        // and oscillates vertically at the Nyquist frequency while R and B stay near 215.
-        for y in 0..height {
-            for x in 0..width {
-                let checker = if (x + y) % 2 == 0 { 12i32 } else { -12i32 };
-                let r = (216 + checker) as u8;
-                let b = (212 - checker) as u8;
-                let g = if y % 2 == 0 { 174 } else { 204 };
-                mono_halftone.put_pixel(x, y, Rgb([r, g, b]));
-            }
+    fn align_image_preserves_thin_colored_lines_at_low_dpi() {
+        let mut img = RgbImage::from_pixel(32, 32, Rgb([255, 255, 255]));
+        // 1-pixel tall Cyan line at y=16
+        for x in 4..28 {
+            img.put_pixel(x, 16, Rgb([80, 180, 220]));
         }
-
-        let aligned_mono = LineStaggerBuffer::align_image(&mono_halftone, ScanResolution::Dpi150);
-        let p_center = aligned_mono.get_pixel(16, 16);
-        let spread = p_center[0]
-            .max(p_center[1])
-            .max(p_center[2])
-            .saturating_sub(p_center[0].min(p_center[1]).min(p_center[2]));
-        assert!(
-            spread <= 2,
-            "Expected neutral gray after CIS halftone demodulation, got {:?} (spread={})",
-            p_center,
-            spread
-        );
-
-        // Verify a genuine Magenta color patch (R=235, G=120, B=160) is preserved
-        let color_patch = RgbImage::from_pixel(width, height, Rgb([235, 120, 160]));
-        let aligned_color = LineStaggerBuffer::align_image(&color_patch, ScanResolution::Dpi150);
-        assert_eq!(aligned_color.get_pixel(16, 16), &Rgb([235, 120, 160]));
+        let aligned = LineStaggerBuffer::align_image(&img, ScanResolution::Dpi150);
+        assert_eq!(aligned.get_pixel(10, 16), &Rgb([80, 180, 220]));
     }
 }

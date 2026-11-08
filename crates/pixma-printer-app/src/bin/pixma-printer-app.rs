@@ -61,9 +61,13 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid bind address '{bind_str}': {e}"))?;
 
-    tracing::info!("Connecting to pixmad daemon or local USB transport...");
-    let client = DaemonClient::connect_or_fallback(None, None).await?;
-    let state = AppState::new(client);
+    let state = if force_mock {
+        let client = DaemonClient::connect_or_fallback(None, None).await?;
+        AppState::new(client)
+    } else {
+        tracing::info!("Configured on-demand USB/daemon connection mode (releases USB when idle)");
+        AppState::new_on_demand()
+    };
     let app = build_router(state);
 
     tracing::info!("Canon PIXMA G2010 IPP Printer App listening on http://{bind_addr}");

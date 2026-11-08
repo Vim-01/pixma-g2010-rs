@@ -4,7 +4,7 @@
 //! IVEC XML + PWG Raster wire streams conforming to Canon MegaTank firmware protocol.
 
 use pixma_cups::options::parse_cups_options;
-use pixma_raster::cups_reader::{parse_image_from_memory, parse_pwg_raster, RasterPageInput};
+use pixma_raster::cups_reader::{parse_document_from_memory, RasterPageInput};
 use pixma_raster::pipeline::PrintRasterPipeline;
 use std::env;
 use std::fs::File;
@@ -60,24 +60,15 @@ fn main() -> ExitCode {
     let mut config = parse_cups_options(options_str, copies);
     config.job_id = job_id;
 
-    // Parse input into raster pages
-    let pages: Vec<RasterPageInput> = if input_data.starts_with(b"RaS2") {
-        match parse_pwg_raster(&input_data) {
+    // Parse input into raster pages (supports PWG/CUPS Raster, multi-page PDF, or standard images)
+    let pages: Vec<RasterPageInput> =
+        match parse_document_from_memory(&input_data, Some(config.quality.base_raster_dpi())) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ERROR: Failed to parse PWG/CUPS raster stream: {e}");
+                eprintln!("ERROR: Failed to parse document input: {e}");
                 return ExitCode::FAILURE;
             }
-        }
-    } else {
-        match parse_image_from_memory(&input_data, Some(config.quality.base_raster_dpi())) {
-            Ok(page) => vec![page],
-            Err(e) => {
-                eprintln!("ERROR: Input is neither valid PWG raster nor recognized image: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    };
+        };
 
     if pages.is_empty() {
         eprintln!("ERROR: No printable pages extracted from input");

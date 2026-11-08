@@ -7,8 +7,7 @@ use pixma_core::print_params::{
 use pixma_daemon::DaemonClient;
 use pixma_protocol::pwg_raster::PWG_RASTER_MAGIC;
 use pixma_raster::{
-    generate_test_print_page, parse_image_from_memory, parse_pwg_raster, PrintRasterPipeline,
-    RasterPageInput,
+    generate_test_print_page, parse_document_from_memory, PrintRasterPipeline, RasterPageInput,
 };
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -131,20 +130,20 @@ pub async fn execute_print(
         let file_bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("Failed to read input file {}: {e}", path.display()))?;
 
-        if file_bytes.starts_with(&PWG_RASTER_MAGIC) {
-            if !json {
+        if !json {
+            if file_bytes.starts_with(&PWG_RASTER_MAGIC) {
                 println!("Parsing input PWG Raster stream (RaS2)...");
-            }
-            parse_pwg_raster(&file_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to parse PWG Raster: {e}"))?
-        } else {
-            if !json {
+            } else if file_bytes.starts_with(b"%PDF") {
+                println!(
+                    "Rasterizing input PDF document at {} DPI...",
+                    quality.base_raster_dpi()
+                );
+            } else {
                 println!("Decoding input image format...");
             }
-            let page = parse_image_from_memory(&file_bytes, Some(quality.base_raster_dpi()))
-                .map_err(|e| anyhow::anyhow!("Failed to decode image file: {e}"))?;
-            vec![page]
         }
+        parse_document_from_memory(&file_bytes, Some(quality.base_raster_dpi()))
+            .map_err(|e| anyhow::anyhow!("Failed to decode document file: {e}"))?
     } else {
         return Err(anyhow::anyhow!(
             "Either `--input <PATH>` or `--test-page` must be specified for print."
