@@ -125,7 +125,8 @@ fn test_full_pipeline_plain_vs_glossy() {
 
 #[test]
 fn test_fixed_point_luminance_macro_match() {
-    // Testing ((0x84e * R + 0x1bf0 * G + 0x2d2 * B) >> 13)
+    // Testing normalized 13-bit BT.709 fixed-point luminance:
+    // ((1742 * R + 5859 * G + 591 * B + 4096) >> 13)
     let test_triplets = [
         (0, 0, 0),
         (255, 255, 255),
@@ -139,7 +140,8 @@ fn test_fixed_point_luminance_macro_match() {
 
     for (r, g, b) in test_triplets {
         let expected =
-            ((0x84e * (r as u32) + 0x1bf0 * (g as u32) + 0x2d2 * (b as u32)) >> 13).min(255) as u8;
+            ((1742 * (r as u32) + 5859 * (g as u32) + 591 * (b as u32) + 4096) >> 13).min(255)
+                as u8;
         let actual = rgb_to_sgray_fixed_point(r, g, b);
         assert_eq!(
             actual, expected,

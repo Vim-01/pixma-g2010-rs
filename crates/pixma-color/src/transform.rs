@@ -9,19 +9,19 @@ use pixma_core::ColorAdjustment;
 use qcms::{DataType, Intent, Profile, Transform};
 use rayon::prelude::*;
 
-/// Exact fixed-point luminance conversion: `((0x84e * R + 0x1bf0 * G + 0x2d2 * B) >> 13)`.
+/// Exact fixed-point luminance conversion: `((1742 * R + 5859 * G + 591 * B + 4096) >> 13)`.
 ///
 /// Uses the ITU-R BT.709 fixed-point luminance coefficients (0.2126 R + 0.7152 G + 0.0722 B)
-/// scaled to integer precision:
-/// - `0x84e` = 2126
-/// - `0x1bf0` = 7152
-/// - `0x2d2` = 722
+/// scaled to 13-bit integer precision (`1 << 13 = 8192`):
+/// - `1742` = `round(0.2126 * 8192)`
+/// - `5859` = `round(0.7152 * 8192)`
+/// - `591`  = `round(0.0722 * 8192)`
 ///
-/// The sum of weights is 10000. Shifting by 13 divides by 8192.
-/// The result is saturated to `255` to prevent byte overflow on bright white pixels.
+/// The sum of weights is exactly `8192`, so shifting right by 13 preserves neutral gray
+/// (`rgb_to_sgray_fixed_point(v, v, v) == v` for all `v in 0..=255`).
 #[inline]
 pub fn rgb_to_sgray_fixed_point(r: u8, g: u8, b: u8) -> u8 {
-    let raw = (0x84e * u32::from(r) + 0x1bf0 * u32::from(g) + 0x2d2 * u32::from(b)) >> 13;
+    let raw = (1742 * u32::from(r) + 5859 * u32::from(g) + 591 * u32::from(b) + 4096) >> 13;
     raw.min(255) as u8
 }
 
@@ -294,6 +294,13 @@ mod tests {
     fn test_rgb_to_sgray_fixed_point_bounds() {
         assert_eq!(rgb_to_sgray_fixed_point(0, 0, 0), 0);
         assert_eq!(rgb_to_sgray_fixed_point(255, 255, 255), 255);
+        for v in 0..=255u8 {
+            assert_eq!(
+                rgb_to_sgray_fixed_point(v, v, v),
+                v,
+                "Neutral gray {v} must map to {v}"
+            );
+        }
 
         // ITU-R BT.709 weights check: Green > Red > Blue
         let green_lum = rgb_to_sgray_fixed_point(0, 200, 0);

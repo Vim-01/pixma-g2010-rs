@@ -10,7 +10,7 @@ use crate::halftone::{
     get_blue_noise_matrix_64x64, BlueNoiseDitherer, DitherAlgorithm, ErrorDiffusionDitherer,
 };
 use crate::layout::{apply_borderless_extension, apply_page_layout};
-use pixma_color::{rgb_to_sgray_fixed_point, ColorPipeline, InkSeparator};
+use pixma_color::{ColorPipeline, InkSeparator};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_core::safety::{MechanicalBounds, ValidatedRasterLine};
 use pixma_protocol::bjraster3::BjRaster3Encoder;
@@ -92,14 +92,10 @@ impl PrintRasterPipeline {
 
                     color_pipe.transform_scanline(&mut rgb_line);
 
+                    // `color_pipe.transform_scanline` in grayscale mode already converts
+                    // each pixel to `(gray, gray, gray)` via `rgb_to_sgray_fixed_point` + LUT.
                     let gray_bytes: Vec<u8> = (0..width as usize)
-                        .map(|i| {
-                            rgb_to_sgray_fixed_point(
-                                rgb_line[i * 3],
-                                rgb_line[i * 3 + 1],
-                                rgb_line[i * 3 + 2],
-                            )
-                        })
+                        .map(|i| rgb_line[i * 3])
                         .collect();
 
                     let validated_line = ValidatedRasterLine::try_new(gray_bytes, width, dpi, 1)?;
