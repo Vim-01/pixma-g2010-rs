@@ -30,13 +30,17 @@ pub async fn execute_scan(
         .map_err(|e| anyhow::anyhow!("Unsupported scanning resolution: {e}"))?;
     let color_mode: ScanColorMode = mode_arg.into();
     let full = ScanGeometry::full_platen(resolution);
-    let width = width_opt.unwrap_or(full.width).min(full.width).max(1);
+    let a4 = ScanGeometry::a4(resolution);
+    let target_width = width_opt.unwrap_or(a4.width).min(full.width).max(1);
     let height = height_opt.unwrap_or(full.height).min(full.height).max(1);
 
+    // Hardware CIS sensor acquires full 32-pixel aligned platen scanlines;
+    // we then crop horizontally to `target_width` (exact 210.0 mm A4 by default,
+    // excluding the 6 mm right-hand scanner lid overhang unless `--width` was set).
     let geometry = ScanGeometry {
         x_offset: 0,
         y_offset: 0,
-        width,
+        width: full.width,
         height,
     };
 
@@ -58,7 +62,7 @@ pub async fn execute_scan(
             "Scanning flatbed at {} DPI ({:?}, {}x{})...",
             resolution.as_dpi(),
             color_mode,
-            geometry.width,
+            target_width,
             geometry.height
         );
     }
@@ -69,7 +73,7 @@ pub async fn execute_scan(
     let height = geometry.height;
 
     // 2. Decode raw scan payload into RGB image
-    let raw_img = match color_mode {
+    let full_img = match color_mode {
         ScanColorMode::Color24Bit => {
             let expected_len = (width as usize) * (height as usize) * 3;
             let mut data = raw_bytes;
@@ -97,6 +101,18 @@ pub async fn execute_scan(
                 anyhow::anyhow!("Failed to construct grayscale RGB image from scan buffer")
             })?
         }
+    };
+
+    let raw_img = if target_width < full_img.width() {
+        let mut cropped = RgbImage::new(target_width, height);
+        for y in 0..height {
+            for x in 0..target_width {
+                cropped.put_pixel(x, y, *full_img.get_pixel(x, y));
+            }
+        }
+        cropped
+    } else {
+        full_img
     };
 
     // 3. Execute ScanGear Pro post-processing pipeline

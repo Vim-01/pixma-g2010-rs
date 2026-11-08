@@ -58,6 +58,16 @@ impl ScanResolution {
         let max_h = (dpi * 877) / 75;
         (max_w, max_h)
     }
+
+    /// Exact ISO A4 flatbed scan dimensions `(width_px, height_px)` at this resolution
+    /// (210.0 mm x 297.0 mm = 620 x 877 pixels at 75 DPI), excluding the 6 mm right-hand
+    /// Letter platen overhang (scanner lid bezel).
+    pub const fn a4_flatbed_pixels(self) -> (u32, u32) {
+        let dpi = self.as_dpi() as u32;
+        let a4_w = (dpi * 620) / 75;
+        let a4_h = (dpi * 877) / 75;
+        (a4_w, a4_h)
+    }
 }
 
 /// Scanner color acquisition modes.
@@ -114,6 +124,16 @@ pub struct ScanGeometry {
 impl ScanGeometry {
     pub fn full_platen(resolution: ScanResolution) -> Self {
         let (width, height) = resolution.max_flatbed_pixels();
+        Self {
+            x_offset: 0,
+            y_offset: 0,
+            width,
+            height,
+        }
+    }
+
+    pub fn a4(resolution: ScanResolution) -> Self {
+        let (width, height) = resolution.a4_flatbed_pixels();
         Self {
             x_offset: 0,
             y_offset: 0,

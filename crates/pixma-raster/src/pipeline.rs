@@ -334,8 +334,19 @@ impl PrintRasterPipeline {
             let page_no = (page_idx + 1) as u8;
             let is_last_page = page_idx + 1 == rendered_pages.len();
 
+            // Smart Print per-page auto-monochrome detection:
+            // On plain/uncoated media, if every pixel on this page is neutral (black/gray/white),
+            // switch the hardware page prologue to Monochrome (`ESC ( c = 0x31`, `ESC ( L = "K"`)
+            // so only the Pigment Black (`BH-4` / `PGBK`) printhead is engaged for this page.
+            let page_grayscale = config.color.grayscale
+                || (!config.media_type.requires_composite_cmy_black()
+                    && is_page_neutral_monochrome(page_lines));
+
+            let mut page_config = config.clone();
+            page_config.color.grayscale = page_grayscale;
+
             stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_prologue(
-                config,
+                &page_config,
                 page_no,
                 printable_w_600,
                 printable_h_600,
@@ -373,14 +384,20 @@ impl PrintRasterPipeline {
                     let bayer_row = &BAYER_8X8[y_600 & 7];
                     let src_w = line.dot_width() as usize;
 
-                    if line.bytes_per_pixel() == 1 || config.color.grayscale {
+                    if line.bytes_per_pixel() == 1 || page_grayscale {
                         k_band[row].resize(bytes_1bpp, 0);
                         let bpp = line.bytes_per_pixel() as usize;
                         for px in 0..dot_w {
                             let sx = (px / scale).min(src_w.saturating_sub(1));
-                            let g = raw[sx * bpp];
+                            let g = if bpp == 3 {
+                                let base = sx * 3;
+                                ((raw[base] as u16 + raw[base + 1] as u16 + raw[base + 2] as u16 + 1)
+                                    / 3) as u8
+                            } else {
+                                raw[sx * bpp]
+                            };
                             if g < 255 {
-                                let k = 255 - g;
+                                let k = if g < 16 { 255 } else { 255 - g };
                                 let thr = bayer_row[px & 7];
                                 if k > thr {
                                     k_band[row][px >> 3] |= 1 << (7 - (px & 7));
@@ -428,7 +445,7 @@ impl PrintRasterPipeline {
                     }
                 }
 
-                if config.color.grayscale {
+                if page_grayscale {
                     let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
                     stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs));
                 } else {
@@ -451,6 +468,23 @@ impl PrintRasterPipeline {
 
         Ok(stream)
     }
+}
+
+fn is_page_neutral_monochrome(page_lines: &[ValidatedRasterLine]) -> bool {
+    for line in page_lines {
+        if line.bytes_per_pixel() == 1 {
+            continue;
+        }
+        for px in line.as_bytes().chunks_exact(3) {
+            let r = px[0];
+            let g = px[1];
+            let b = px[2];
+            if r.abs_diff(g) > 4 || g.abs_diff(b) > 4 || r.abs_diff(b) > 4 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn apply_page_ordering(
@@ -566,6 +600,39 @@ mod tests {
         assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b'c']));
         assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b't']));
         assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b'F']));
+    }
+
+    #[test]
+    fn test_smart_print_multipage_auto_monochrome_and_color() {
+        // Page 1: only black and neutral gray pixels -> must auto-select ESC ( L = "K"
+        let mut p1 = make_test_page(32, 32);
+        p1.set_pixel(5, 5, [0, 0, 0]);
+        p1.set_pixel(10, 10, [128, 128, 128]);
+
+        // Page 2: contains colored pixels -> must select ESC ( L = "CMYK"
+        let mut p2 = make_test_page(32, 32);
+        p2.set_pixel(5, 5, [0, 0, 0]);
+        p2.set_pixel(10, 10, [255, 0, 0]);
+
+        let config = PrintJobConfig {
+            job_id: 77,
+            paper_size: PaperSize::Photo4x6,
+            media_type: MediaType::Plain,
+            quality: PrintQuality::Level3Standard,
+            ..Default::default()
+        };
+
+        let stream =
+            PrintRasterPipeline::compile_ivec_bjraster3_job(&[p1, p2], &config, "20261108200000")
+                .unwrap();
+
+        // Both monochrome ESC ( L "K" (page 1) and color ESC ( L "CMYK" (page 2) must appear
+        assert!(stream
+            .windows(6)
+            .any(|w| w == [0x1b, b'(', b'L', 0x01, 0x00, b'K']));
+        assert!(stream
+            .windows(9)
+            .any(|w| w == [0x1b, b'(', b'L', 0x04, 0x00, b'C', b'M', b'Y', b'K']));
     }
 
     #[test]

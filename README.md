@@ -33,14 +33,29 @@ To protect the printheads, carriage mechanics, and mainboard:
 2. **Thermal Duty-Cycle Throttling & Fast Abort**:
    - `DutyCycleMonitor` tracks consecutive high-density (>85% coverage) scanlines and injects $200\ \text{ms}$ inter-swath cooling pauses to prevent resistor thermal runaway.
    - Any hardware support code indicating head or thermal faults (`1401`, `1403`, `1470`, `1471`, `1472`, `5200` / `P08`) triggers an immediate `CancelJob` and paper eject.
-3. **MegaTank Ink Separation (`pixma-color`)**:
-   - **Plain Paper**: Uses Under Color Removal (UCR) and Gray Component Replacement (GCR) routing pure black text (`#000000`) to 100% Pigment Black (`GI-790 PGBK`).
-   - **Glossy / Luster / Platinum Photo Paper**: Pigment Black particles cannot penetrate microporous silica coatings and will flake off. The separator forces `PGBK = 0%` on all glossy media and synthesizes deep blacks from composite dye `C + M + Y`.
+3. **Two-Level Smart Print & MegaTank Ink Separation (`pixma-color` + `pixma-raster`)**:
+   - **Level 1 — Per-Page Auto-Monochrome (`ESC ( L = "K"`)**: In multi-page print jobs on plain paper, any page containing only black text and neutral grays (`|R-G| <= 4, |G-B| <= 4`) automatically switches its `BJR520` page prologue to hardware Monochrome mode (`ESC ( c = 0x31`, `ESC ( L = "K"`), engaging only the 320-nozzle **BH-4** Pigment Black printhead and cutting USB payload size in half.
+   - **Level 2 — Per-Pixel Smart Separation on Mixed Color Pages (`ESC ( L = "CMYK"`)**: On pages that mix black text/tables with color graphics on plain paper, every neutral black or gray pixel separates to **100% Pigment Black (`GI-790 PGBK`) and 0% Color (`C = 0, M = 0, Y = 0`)**, while colored pixels use the **CH-41** dye nozzles (`C, M, Y`) with dynamic GCR/UCR.
+   - **Glossy / Luster / Platinum Photo Paper Interlock**: Pigment Black particles cannot penetrate microporous silica coatings and will flake off. The separator unconditionally forces `PGBK = 0%` on all glossy media and synthesizes deep blacks from composite dye `C + M + Y`.
 4. **Waste Ink Absorber (`5B00` / `P07`) & Ink Flush Protection**:
    - A single System Ink Flush (`choke`) drains **~45 ml of ink** and advances the internal waste pad counter (`D-Counter`) by **~20%**.
    - `MaintenanceSupervisor` enforces a persistent **24-hour cooldown** on Ink Flush, blocks execution if `D-Counter >= 80%`, and requires explicit confirmation (`YES-DRAIN-INK` in CLI or a timed confirmation dialog in the GUI).
 5. **No Raw EEPROM Factory Writes**:
    - All operations use documented `<ivec:operation>` XML envelopes and standard raster streams. Raw `@BJL` factory EEPROM write vectors (which can trigger permanent `Error 006` mainboard lockouts) are excluded from the driver.
+
+---
+
+## Supported Devices & Compatibility Matrix
+
+| Device Model | USB ID | Wire Protocol (`CID`) | Print Engine | Scanner (`MP2`) | Support Tier |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Canon PIXMA G2010** | `04a9:183a` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | 75–1200 DPI (A4/Letter) | **Tier 1: Hardware-Verified** (Tested on live physical unit `0051B0`, FW `1.020`) |
+| **Canon PIXMA G1010 / G1000** | `04a9:183c` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | N/A (Single-function) | **Tier 2: Protocol-Identical** (Same `BJR520` table & `BH-4`/`CH-41` heads; community testing) |
+| **Canon PIXMA G2000** | `04a9:1795` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | 75–1200 DPI | **Tier 2: Protocol-Identical** (Same `BJR520` + `MP2` architecture; community testing) |
+| **Canon PIXMA G3010 / G3000** | `04a9:183b` / `04a9:1794` | `CA_IVEC1TYPE4_IJP` | `PWGRaster` (`RaS2`) + `IVEC` | 75–1200 DPI | **Tier 3: Protocol-Supported** (`compile_ivec_pwg_job` implemented; community testing) |
+| **Canon PIXMA G4010 / G2020** | `04a9:183d` / `04a9:1892` | `CA_IVEC1TYPE4_IJP` | `PWGRaster` (`RaS2`) + `IVEC` | 75–1200 DPI | **Tier 3: Experimental / Community** (Untested on physical hardware; PRs welcome) |
+
+> **Policy on Other Canon Models**: Only the **Canon PIXMA G2010 (`04a9:183a`)** is certified as **Tier 1 (Hardware-Verified)** because we test every commit against physical G2010 hardware. Other Canon MegaTank models with known `BJRxxx` / `IVEC` tables can be added via modular protocol descriptors, and community verification reports with real hardware logs are welcome via GitHub Issues/PRs.
 
 ---
 

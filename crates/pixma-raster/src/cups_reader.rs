@@ -298,9 +298,9 @@ pub fn generate_test_print_page(dpi: u32) -> RasterPageInput {
 
     let mut page = RasterPageInput::new_blank(width, height, dpi);
 
-    // 1. Draw top banner
+    // 1. Draw top banner (pure Pigment Black on plain paper)
     let banner_h = (height / 25).max(20);
-    fill_rect(&mut page, 0, 0, width, banner_h, [16, 44, 87]);
+    fill_rect(&mut page, 0, 0, width, banner_h, [0, 0, 0]);
 
     // 2. Draw border alignment frame
     let margin = (width / 50).max(10);
@@ -370,6 +370,97 @@ pub fn generate_test_print_page(dpi: u32) -> RasterPageInput {
         cy + cross_len,
         [0, 0, 0],
     );
+
+    // 6. Millimeter-accurate 100.0 mm x 100.0 mm and 50.0 mm x 50.0 mm calibration squares
+    //    with 5 mm / 10 mm ruler tick marks in the lower half of the sheet
+    let mm_to_dots = |mm: f32| -> u32 { ((mm / 25.4) * (dpi as f32)).round() as u32 };
+    let box_100mm = mm_to_dots(100.0);
+    let box_50mm = mm_to_dots(50.0);
+    let ruler_top = cy + cross_len + mm_to_dots(8.0);
+
+    if box_100mm > 20 && box_100mm + 4 * margin <= width && ruler_top + box_100mm + 2 * margin <= height {
+        let rx = cx.saturating_sub(box_100mm / 2);
+        let ry = ruler_top;
+        let thick = (dpi / 300).max(1);
+
+        // Outer 100.0 mm x 100.0 mm square (pure PGBK [0,0,0])
+        draw_rect_outline(&mut page, rx, ry, box_100mm, box_100mm, [0, 0, 0], thick);
+
+        // Inner 50.0 mm x 50.0 mm square
+        let in_x = cx.saturating_sub(box_50mm / 2);
+        let in_y = ry + (box_100mm - box_50mm) / 2;
+        draw_rect_outline(&mut page, in_x, in_y, box_50mm, box_50mm, [0, 0, 0], thick);
+
+        // 5 mm and 10 mm tick marks along top, bottom, left, and right edges of 100 mm box
+        let tick_10mm = mm_to_dots(3.0).max(4);
+        let tick_5mm = mm_to_dots(1.5).max(2);
+        for mm in (5..=95).step_by(5) {
+            let offset = mm_to_dots(mm as f32);
+            let tick_len = if mm % 10 == 0 { tick_10mm } else { tick_5mm };
+            // Top & bottom ticks
+            fill_rect(&mut page, rx + offset, ry, thick, tick_len, [0, 0, 0]);
+            fill_rect(
+                &mut page,
+                rx + offset,
+                ry + box_100mm.saturating_sub(tick_len),
+                thick,
+                tick_len,
+                [0, 0, 0],
+            );
+            // Left & right ticks
+            fill_rect(&mut page, rx, ry + offset, tick_len, thick, [0, 0, 0]);
+            fill_rect(
+                &mut page,
+                rx + box_100mm.saturating_sub(tick_len),
+                ry + offset,
+                tick_len,
+                thick,
+                [0, 0, 0],
+            );
+        }
+
+        // Pure neutral PGBK gray step ramp + RGB primary swatches inside the 50 mm square
+        let pad_in = mm_to_dots(5.0);
+        let bar_w = (box_50mm.saturating_sub(2 * pad_in)) / 6;
+        let bar_h = mm_to_dots(12.0);
+        let gray_levels: [[u8; 3]; 6] = [
+            [0, 0, 0],
+            [51, 51, 51],
+            [102, 102, 102],
+            [153, 153, 153],
+            [204, 204, 204],
+            [230, 230, 230],
+        ];
+        for (i, &g_rgb) in gray_levels.iter().enumerate() {
+            fill_rect(
+                &mut page,
+                in_x + pad_in + (i as u32) * bar_w,
+                in_y + pad_in,
+                bar_w.saturating_sub(2),
+                bar_h,
+                g_rgb,
+            );
+        }
+
+        let rgb_primaries: [[u8; 3]; 6] = [
+            [255, 0, 0],
+            [0, 180, 0],
+            [0, 0, 255],
+            [0, 255, 255],
+            [255, 0, 255],
+            [255, 255, 0],
+        ];
+        for (i, &c_rgb) in rgb_primaries.iter().enumerate() {
+            fill_rect(
+                &mut page,
+                in_x + pad_in + (i as u32) * bar_w,
+                in_y + box_50mm.saturating_sub(pad_in + bar_h),
+                bar_w.saturating_sub(2),
+                bar_h,
+                c_rgb,
+            );
+        }
+    }
 
     page
 }

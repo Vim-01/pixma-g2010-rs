@@ -392,7 +392,8 @@ impl<T: UsbTransport> G2010Controller<T> {
             self.transport.write_printer(chunk).await?;
         }
 
-        let is_mock = self.transport.serial_number().starts_with("MOCK");
+        let is_mock = self.transport.serial_number() == "UNKNOWN"
+            || self.transport.serial_number().starts_with("MOCK");
         if !is_mock {
             let mut saw_printing = false;
             let mut buf = vec![0u8; 4096];

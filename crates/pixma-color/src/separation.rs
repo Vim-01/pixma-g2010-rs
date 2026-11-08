@@ -165,6 +165,20 @@ impl InkSeparator {
                 };
             }
 
+            // Smart Print rule on plain/uncoated media:
+            // Any neutral gray pixel (|R-G| <= 4, |G-B| <= 4, |R-B| <= 4) under standard GCR
+            // uses 100% Pigment Black (k_pgbk) and 0% CMY dye ink, preventing color ink waste
+            // and eliminating chromatic tint in gray text, tables, and halftones.
+            if is_neutral && self.gcr_factor >= DEFAULT_PLAIN_GCR_FACTOR {
+                let avg_rgb = ((r as u16 + g as u16 + b as u16 + 1) / 3) as u8;
+                return CmykPixel {
+                    c: 0,
+                    m: 0,
+                    y: 0,
+                    k_pgbk: 255 - avg_rgb,
+                };
+            }
+
             // General colors: Dynamic GCR / UCR
             let c_raw = 255 - r;
             let m_raw = 255 - g;

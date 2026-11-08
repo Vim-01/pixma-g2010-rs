@@ -73,13 +73,26 @@ pub fn auto_multi_crop(
     } else {
         0
     };
+    // On the 216 mm (638 px @ 75 DPI) flatbed platen, an ISO A4 sheet (210 mm = 620 px @ 75 DPI)
+    // ends at width * 620 / 638, casting a vertical paper-edge shadow seam just inside 620/638
+    // followed by 6 mm of the white scanner lid. Exclude that right-hand lid overhang in auto mode.
+    let a4_limit_x = if background_threshold == 0 && is_bright_background {
+        ((width * 620) / 638).max(1)
+    } else {
+        width
+    };
+    let max_fg_x = if background_threshold == 0 && is_bright_background {
+        ((width * 615) / 638).min(width.saturating_sub(rim_x))
+    } else {
+        width.saturating_sub(rim_x)
+    };
 
     let mut mask = vec![false; (grid_w * grid_h) as usize];
     for gy in 0..grid_h {
         for gx in 0..grid_w {
             let src_x = (gx * scale).min(width - 1);
             let src_y = (gy * scale).min(height - 1);
-            if src_x < rim_x || src_y < rim_y || src_x + rim_x >= width || src_y + rim_y >= height {
+            if src_x < rim_x || src_y < rim_y || src_x >= max_fg_x || src_y + rim_y >= height {
                 continue;
             }
             let in_border_band = src_x < border_band_x
@@ -161,7 +174,7 @@ pub fn auto_multi_crop(
             let pad = 4 * scale;
             let orig_min_x = (min_x * scale).saturating_sub(pad);
             let orig_min_y = (min_y * scale).saturating_sub(pad);
-            let orig_max_x = ((max_x + 1) * scale + pad).min(width);
+            let orig_max_x = ((max_x + 1) * scale + pad).min(a4_limit_x);
             let orig_max_y = ((max_y + 1) * scale + pad).min(height);
 
             let box_w = orig_max_x.saturating_sub(orig_min_x);
@@ -187,14 +200,21 @@ pub fn auto_multi_crop(
     let merged_boxes = merge_overlapping_boxes(&bboxes);
 
     if merged_boxes.is_empty() {
-        // Fallback: return whole image if no distinct components were segmented
+        // Fallback: return A4-trimmed image (excluding 6mm right lid overhang when applicable)
+        let out_w = a4_limit_x.min(width);
+        let mut sub = ImageBuffer::new(out_w, height);
+        for cy in 0..height {
+            for cx in 0..out_w {
+                sub.put_pixel(cx, cy, *img.get_pixel(cx, cy));
+            }
+        }
         let geom = ScanGeometry {
             x_offset: 0,
             y_offset: 0,
-            width,
+            width: out_w,
             height,
         };
-        return vec![(geom, img.clone())];
+        return vec![(geom, sub)];
     }
 
     // Crop sub-images
