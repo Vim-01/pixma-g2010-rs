@@ -157,20 +157,35 @@ impl LineStaggerBuffer {
     }
 
     /// Realigns an entire acquired `RgbImage` in-place according to the sensor's
-    /// optical line stagger offsets.
+    /// optical line stagger offsets and sub-line R/G/B LED sequential strobe phase.
     pub fn align_image(img: &RgbImage, resolution: ScanResolution) -> RgbImage {
-        let (green_offset, blue_offset) = resolution.cis_line_stagger_offsets();
-        if blue_offset == 0 {
-            return img.clone();
-        }
-
         let width = img.width();
         let height = img.height();
         if width == 0 || height == 0 {
             return img.clone();
         }
 
+        let (green_offset, blue_offset) = resolution.cis_line_stagger_offsets();
         let mut aligned = ImageBuffer::new(width, height);
+
+        if blue_offset == 0 {
+            // At <= 400 DPI, the CIS LED bar strobes R at y + 0.0, G at y + 1/3, and B at y + 2/3
+            // during continuous stepper motion. Compensate the 1/3 and 2/3 sub-line phase shift
+            // to eliminate orange/blue chromatic fringes on horizontal black edges.
+            for y in 0..height {
+                let y_prev = y.saturating_sub(1);
+                for x in 0..width {
+                    let cur = img.get_pixel(x, y);
+                    let prev = img.get_pixel(x, y_prev);
+                    let r = cur[0];
+                    let g = ((2 * cur[1] as u16 + prev[1] as u16 + 1) / 3) as u8;
+                    let b = ((cur[2] as u16 + 2 * prev[2] as u16 + 1) / 3) as u8;
+                    aligned.put_pixel(x, y, Rgb([r, g, b]));
+                }
+            }
+            return aligned;
+        }
+
         for y in 0..height {
             let y_g = (y + green_offset as u32).min(height - 1);
             let y_b = (y + blue_offset as u32).min(height - 1);
