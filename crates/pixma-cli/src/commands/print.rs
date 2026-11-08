@@ -162,7 +162,7 @@ pub async fn execute_print(
     }
 
     let timestamp = current_timestamp_14();
-    let job_stream = PrintRasterPipeline::compile_ivec_pwg_job(&pages, &config, &timestamp)
+    let job_stream = PrintRasterPipeline::compile_ivec_bjraster3_job(&pages, &config, &timestamp)
         .map_err(|e| anyhow::anyhow!("Raster pipeline compilation failed: {e}"))?;
 
     if !json {

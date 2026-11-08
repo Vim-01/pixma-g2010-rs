@@ -167,6 +167,160 @@ impl BjRaster3Encoder {
         buf.push(FORM_FEED);
         Ok(buf)
     }
+
+    // -----------------------------------------------------------------------
+    // Canon BJR520 (`CA_BJR520_IJP` — G1000/G1010/G2000/G2010) Hardware Encoder
+    // -----------------------------------------------------------------------
+
+    /// Generates the hardware-verified BJR520 page prologue (`ESC [ K` .. `ESC ( L`)
+    /// accepted by physical Canon PIXMA G2010 (`CID:CA_BJR520_IJP`) firmware.
+    pub fn encode_bjr520_prologue(
+        config: &PrintJobConfig,
+        page_no: u8,
+        printable_width_600: u32,
+        printable_height_600: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(180);
+
+        if page_no <= 1 {
+            // ESC [ K (len=2): 00 0f — Enter BJRaster3 command mode
+            buf.extend_from_slice(&[0x1b, b'[', b'K', 0x02, 0x00, 0x00, 0x0f]);
+            // ESC ( b (len=1): 01 — Enable PackBits RLE compression
+            buf.extend_from_slice(&[0x1b, b'(', b'b', 0x01, 0x00, 0x01]);
+        }
+
+        // ESC ( q (len=1): page ID
+        buf.extend_from_slice(&[0x1b, b'(', b'q', 0x01, 0x00, page_no.max(1)]);
+
+        // ESC ( d (len=4): 02 58 02 58 (600 x 600 DPI in big-endian u16)
+        buf.extend_from_slice(&[0x1b, b'(', b'd', 0x04, 0x00, 0x02, 0x58, 0x02, 0x58]);
+
+        // ESC ( t (len=24): Image bit-depth and level descriptor table
+        // Slot 0 (K): 1-bpp, 2 levels (01 00 02)
+        // Slot 1 (C): 2-bpp, 3 levels (02 00 03)
+        // Slot 2 (M): 2-bpp, 3 levels (02 00 03)
+        // Slot 3 (Y): 1-bpp, 2 levels (01 00 02)
+        buf.extend_from_slice(&[
+            0x1b, b'(', b't', 0x18, 0x00, 0x80, 0x80, 0x01, 0x01, 0x00, 0x02, 0x02, 0x00, 0x03,
+            0x02, 0x00, 0x03, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ]);
+
+        // ESC ( c (len=3): Color/Monochrome + media + quality
+        let color_byte = if config.color.grayscale { 0x31 } else { 0x30 };
+        buf.extend_from_slice(&[0x1b, b'(', b'c', 0x03, 0x00, color_byte, 0x00, 0x02]);
+
+        // ESC ( p (len=46): Extended printable area and physical paper geometry in 1/600 inch
+        let (w_mm, h_mm) = config.paper_size.dimensions_mm();
+        let (phys_w_600, phys_h_600, pw_60, ph_60) = match config.paper_size {
+            PaperSize::A4 => (4961u32, 7016u32, 480u16, 682u16),
+            PaperSize::Letter => (5100u32, 6600u32, 494u16, 640u16),
+            PaperSize::Photo4x6 => (2400u32, 3600u32, 224u16, 340u16),
+            _ => {
+                let pw = ((w_mm / 25.4) * 600.0).round() as u32;
+                let ph = ((h_mm / 25.4) * 600.0).round() as u32;
+                (
+                    pw,
+                    ph,
+                    (printable_width_600 / 10) as u16,
+                    (printable_height_600 / 10) as u16,
+                )
+            }
+        };
+        let left_margin_600: u32 = 83;
+        let top_margin_600: u32 = 75;
+
+        buf.extend_from_slice(&[0x1b, b'(', b'p', 0x2e, 0x00]);
+        buf.extend_from_slice(&ph_60.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&pw_60.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&600u16.to_be_bytes());
+        buf.extend_from_slice(&left_margin_600.to_be_bytes());
+        buf.extend_from_slice(&top_margin_600.to_be_bytes());
+        buf.extend_from_slice(&printable_width_600.to_be_bytes());
+        buf.extend_from_slice(&printable_height_600.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&phys_w_600.to_be_bytes());
+        buf.extend_from_slice(&phys_h_600.to_be_bytes());
+
+        // ESC ( P (len=9): Paper size code and print parameters
+        let paper_code: u8 = match config.paper_size {
+            PaperSize::A4 => 0x03,
+            PaperSize::Letter => 0x0d,
+            PaperSize::Legal => 0x0f,
+            PaperSize::A5 => 0x05,
+            PaperSize::B5 => 0x08,
+            PaperSize::Photo4x6 => 0x00,
+            PaperSize::Photo5x7 => 0x15,
+            _ => 0x03,
+        };
+        buf.extend_from_slice(&[
+            0x1b, b'(', b'P', 0x09, 0x00, 0x00, paper_code, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0xff,
+        ]);
+
+        // ESC ( l (len=3): Rear paper tray selection (0x34)
+        buf.extend_from_slice(&[0x1b, b'(', b'l', 0x03, 0x00, 0x34, 0x00, 0x00]);
+
+        // ESC ( v (len=1): 00
+        buf.extend_from_slice(&[0x1b, b'(', b'v', 0x01, 0x00, 0x00]);
+
+        // ESC ( I (len=1): 01 — Multi-scanline block mode
+        buf.extend_from_slice(&[0x1b, b'(', b'I', 0x01, 0x00, 0x01]);
+
+        // ESC ( J (len=1): 08 — 8 scanlines per ESC ( F block
+        buf.extend_from_slice(&[0x1b, b'(', b'J', 0x01, 0x00, 0x08]);
+
+        // ESC ( L: Plane order ("K" for monochrome, "CMYK" for color)
+        if config.color.grayscale {
+            buf.extend_from_slice(&[0x1b, b'(', b'L', 0x01, 0x00, b'K']);
+        } else {
+            buf.extend_from_slice(&[0x1b, b'(', b'L', 0x04, 0x00, b'C', b'M', b'Y', b'K']);
+        }
+
+        buf
+    }
+
+    /// Encodes up to 8 packed bitplane scanlines into a single `ESC ( F` multi-scanline block,
+    /// where each scanline is PackBits-compressed (`0x00..=0x7f` literal, `0x81..=0xff` repeat)
+    /// and terminated by the `0x80` end-of-scanline marker.
+    pub fn encode_bjr520_band_esc_f(lines: &[&[u8]]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(64);
+        for row in 0..8 {
+            if let Some(line) = lines.get(row) {
+                if !line.iter().all(|&b| b == 0) {
+                    packbits_compress_into(line, &mut payload);
+                }
+            }
+            // 0x80 marks the end of each of the 8 scanlines inside ESC ( F
+            payload.push(0x80);
+        }
+
+        let len = payload.len() as u16;
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.extend_from_slice(&[0x1b, b'(', b'F']);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Generates the BJR520 page/job epilogue (`FF`, and on the final page `ESC ( b 0` + `ESC @`).
+    pub fn encode_bjr520_epilogue(is_last_page: bool) -> Vec<u8> {
+        let mut buf = vec![FORM_FEED];
+        if is_last_page {
+            buf.extend_from_slice(&[0x1b, b'(', b'b', 0x01, 0x00, 0x00]);
+            buf.extend_from_slice(&[0x1b, b'@']);
+        }
+        buf
+    }
+}
+
+/// Appends PackBits-compressed bytes of `data` into `out` (guaranteeing `0x80` is never emitted).
+fn packbits_compress_into(data: &[u8], out: &mut Vec<u8>) {
+    out.extend(packbits_compress(data));
 }
 
 /// Standard TIFF / ESC/P PackBits byte compression.

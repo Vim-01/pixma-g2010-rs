@@ -86,10 +86,10 @@ fn main() -> ExitCode {
 
     let timestamp = format_timestamp_now();
     let compiled_stream =
-        match PrintRasterPipeline::compile_ivec_pwg_job(&pages, &config, &timestamp) {
+        match PrintRasterPipeline::compile_ivec_bjraster3_job(&pages, &config, &timestamp) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ERROR: Failed to compile IVEC PWG job stream: {e}");
+                eprintln!("ERROR: Failed to compile IVEC BJRaster3 job stream: {e}");
                 return ExitCode::FAILURE;
             }
         };

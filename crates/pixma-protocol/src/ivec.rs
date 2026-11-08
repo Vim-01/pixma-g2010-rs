@@ -44,6 +44,20 @@ pub fn build_start_job(service_type: &str, job_id: u32) -> String {
     }
 }
 
+/// Generates the `StartJob` IVEC XML command for BJR520 (`BJRaster3`) print jobs (`CA_BJR520_IJP`).
+pub fn build_bjraster_start_job(job_id: u32) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>StartJob</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:bidi>0</ivec:bidi></ivec:param_set></ivec:contents></cmd>"#
+    )
+}
+
+/// Generates the `ModeShift` IVEC XML command for BJR520 (`BJRaster3`) print jobs (`CA_BJR520_IJP`).
+pub fn build_bjraster_mode_shift(job_id: u32) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>VendorCmd</ivec:operation><ivec:param_set servicetype="print"><vcn:ijoperation>ModeShift</vcn:ijoperation><vcn:ijmode>1</vcn:ijmode><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#
+    )
+}
+
 /// Generates the `SetJobConfiguration` IVEC XML command for a maintenance session.
 pub fn build_set_maintenance_job_configuration(job_id: u32, datetime: &str) -> String {
     format!(

@@ -13,8 +13,9 @@ use pixma_core::print_params::PrintJobConfig;
 use pixma_core::safety::{MechanicalBounds, ValidatedRasterLine};
 use pixma_protocol::bjraster3::BjRaster3Encoder;
 use pixma_protocol::ivec::{
-    build_end_job, build_mode_shift, build_send_data_header, build_set_job_configuration,
-    build_set_page_configuration, build_set_print_configuration, build_start_job,
+    build_bjraster_mode_shift, build_bjraster_start_job, build_end_job, build_send_data_header,
+    build_set_job_configuration, build_set_page_configuration, build_set_print_configuration,
+    build_start_job,
 };
 use pixma_protocol::pwg_raster::{encode_pwg_page, PwgRasterHeader};
 
@@ -287,39 +288,165 @@ impl PrintRasterPipeline {
         Ok(stream)
     }
 
-    /// Compiles a complete wire-ready IVEC XML + ModeShift + BJRaster3 (`ESC (`) print job stream.
+    /// Compiles a complete wire-ready IVEC XML + ModeShift + BJR520 (`BJRaster3` `ESC (`) print job stream
+    /// verified against physical Canon PIXMA G2010 (`CID:CA_BJR520_IJP`) hardware.
     pub fn compile_ivec_bjraster3_job(
         pages: &[RasterPageInput],
         config: &PrintJobConfig,
-        timestamp: &str,
+        _timestamp: &str,
     ) -> Result<Vec<u8>, RasterError> {
         let rendered_pages = Self::render_pages_to_validated_lines(pages, config)?;
+        let separator = InkSeparator::new(config.media_type);
         let mut stream = Vec::new();
 
-        // 1. StartJob (must precede all job configuration in Canon IVEC protocol)
-        stream.extend_from_slice(build_start_job("print", config.job_id).as_bytes());
+        // 1. StartJob (<ivec:bidi>0</ivec:bidi>)
+        stream.extend_from_slice(build_bjraster_start_job(config.job_id).as_bytes());
 
-        // 2. SetJobConfiguration
-        stream.extend_from_slice(
-            build_set_job_configuration(config.job_id, Some(timestamp)).as_bytes(),
-        );
+        // 2. VendorCmd ModeShift (ijmode=1 -> binary BJRaster3 stream)
+        stream.extend_from_slice(build_bjraster_mode_shift(config.job_id).as_bytes());
 
-        // 3. SetConfiguration (papersize, papertype, borderless, colormode, duplex)
-        stream.extend_from_slice(build_set_print_configuration(config).as_bytes());
+        // Determine hardware 600 DPI printable grid geometry
+        let (raw_w_600, raw_h_600) = config.paper_size.printable_area_dots(600, false);
+        let (printable_w_600, printable_h_600) = match config.paper_size {
+            pixma_core::print_params::PaperSize::A4 => (4791u32, 6816u32),
+            pixma_core::print_params::PaperSize::Letter => (4933u32, 6400u32),
+            pixma_core::print_params::PaperSize::Photo4x6 => (2233u32, 3400u32),
+            _ => (raw_w_600.min(4791), (raw_h_600 / 8) * 8),
+        };
+        let total_bands = (printable_h_600 as usize / 8).max(1);
+        let dot_w = printable_w_600 as usize;
+        let bytes_1bpp = dot_w.div_ceil(8);
+        let bytes_2bpp = dot_w.div_ceil(4);
 
-        // 4. SetPageConfiguration
-        stream.extend_from_slice(build_set_page_configuration(config, true).as_bytes());
+        const BAYER_8X8: [[u8; 8]; 8] = [
+            [2, 130, 34, 162, 10, 138, 42, 170],
+            [194, 66, 226, 98, 202, 74, 234, 106],
+            [50, 178, 18, 146, 58, 186, 26, 154],
+            [242, 114, 210, 82, 250, 122, 218, 90],
+            [14, 142, 46, 174, 6, 134, 38, 166],
+            [206, 78, 238, 110, 198, 70, 230, 102],
+            [62, 190, 30, 158, 54, 182, 22, 150],
+            [254, 126, 222, 94, 246, 118, 214, 86],
+        ];
 
-        // 5. ModeShift to binary BJRaster3 mode
-        stream.extend_from_slice(build_mode_shift("print", config.job_id, 1).as_bytes());
+        // 3. Per-page BJR520 prologue, 8-line ESC ( F bands, and epilogue
+        for (page_idx, page_lines) in rendered_pages.iter().enumerate() {
+            let page_no = (page_idx + 1) as u8;
+            let is_last_page = page_idx + 1 == rendered_pages.len();
 
-        // 6. BJRaster3 command prologue & page data
-        for page_lines in &rendered_pages {
-            let bjraster3_page = BjRaster3Encoder::encode_page(config, page_lines)?;
-            stream.extend_from_slice(&bjraster3_page);
+            stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_prologue(
+                config,
+                page_no,
+                printable_w_600,
+                printable_h_600,
+            ));
+
+            let scale = if !page_lines.is_empty() && page_lines[0].dpi() == 300 {
+                2usize
+            } else {
+                1usize
+            };
+
+            let mut c_band = vec![Vec::new(); 8];
+            let mut m_band = vec![Vec::new(); 8];
+            let mut y_band = vec![Vec::new(); 8];
+            let mut k_band = vec![Vec::new(); 8];
+
+            for band_idx in 0..total_bands {
+                for row in 0..8 {
+                    c_band[row].clear();
+                    m_band[row].clear();
+                    y_band[row].clear();
+                    k_band[row].clear();
+
+                    let y_600 = band_idx * 8 + row;
+                    let src_y = y_600 / scale;
+                    let Some(line) = page_lines.get(src_y) else {
+                        continue;
+                    };
+                    let raw = line.as_bytes();
+                    // Fast path: completely white scanline needs 0 ink droplets
+                    if raw.iter().all(|&b| b == 0xFF) {
+                        continue;
+                    }
+
+                    let bayer_row = &BAYER_8X8[y_600 & 7];
+                    let src_w = line.dot_width() as usize;
+
+                    if line.bytes_per_pixel() == 1 || config.color.grayscale {
+                        k_band[row].resize(bytes_1bpp, 0);
+                        let bpp = line.bytes_per_pixel() as usize;
+                        for px in 0..dot_w {
+                            let sx = (px / scale).min(src_w.saturating_sub(1));
+                            let g = raw[sx * bpp];
+                            if g < 255 {
+                                let k = 255 - g;
+                                let thr = bayer_row[px & 7];
+                                if k > thr {
+                                    k_band[row][px >> 3] |= 1 << (7 - (px & 7));
+                                }
+                            }
+                        }
+                    } else {
+                        c_band[row].resize(bytes_2bpp, 0);
+                        m_band[row].resize(bytes_2bpp, 0);
+                        y_band[row].resize(bytes_1bpp, 0);
+                        k_band[row].resize(bytes_1bpp, 0);
+
+                        for px in 0..dot_w {
+                            let sx = (px / scale).min(src_w.saturating_sub(1));
+                            let base = sx * 3;
+                            let r = raw[base];
+                            let g = raw[base + 1];
+                            let b = raw[base + 2];
+                            if (r & g & b) == 0xFF {
+                                continue;
+                            }
+
+                            let cmyk = separator.separate_pixel(r, g, b);
+                            let thr = bayer_row[px & 7];
+                            let thr_lo = thr >> 1;
+                            let thr_hi = 128 + thr_lo;
+                            let shift_2bpp = (3 - (px & 3)) * 2;
+                            let bit_1bpp = 1u8 << (7 - (px & 7));
+
+                            if cmyk.c > thr_lo {
+                                let lvl: u8 = if cmyk.c > thr_hi { 2 } else { 1 };
+                                c_band[row][px >> 2] |= lvl << shift_2bpp;
+                            }
+                            if cmyk.m > thr_lo {
+                                let lvl: u8 = if cmyk.m > thr_hi { 2 } else { 1 };
+                                m_band[row][px >> 2] |= lvl << shift_2bpp;
+                            }
+                            if cmyk.y > thr {
+                                y_band[row][px >> 3] |= bit_1bpp;
+                            }
+                            if cmyk.k_pgbk > thr {
+                                k_band[row][px >> 3] |= bit_1bpp;
+                            }
+                        }
+                    }
+                }
+
+                if config.color.grayscale {
+                    let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
+                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs));
+                } else {
+                    let c_refs: [&[u8]; 8] = std::array::from_fn(|r| c_band[r].as_slice());
+                    let m_refs: [&[u8]; 8] = std::array::from_fn(|r| m_band[r].as_slice());
+                    let y_refs: [&[u8]; 8] = std::array::from_fn(|r| y_band[r].as_slice());
+                    let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
+                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&c_refs));
+                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&m_refs));
+                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&y_refs));
+                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs));
+                }
+            }
+
+            stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_epilogue(is_last_page));
         }
 
-        // 7. EndJob
+        // 4. EndJob
         stream.extend_from_slice(build_end_job("print", config.job_id).as_bytes());
 
         Ok(stream)
@@ -430,14 +557,15 @@ mod tests {
                 .unwrap();
 
         let text = String::from_utf8_lossy(&stream);
-        assert!(text.contains("SetJobConfiguration"));
         assert!(text.contains("StartJob"));
         assert!(text.contains("ModeShift"));
         assert!(text.contains("EndJob"));
 
-        // Must contain BJRaster3 ESC ( commands
+        // Must contain BJR520 ESC [ K and ESC ( commands
+        assert!(stream.windows(3).any(|w| w == [0x1b, b'[', b'K']));
         assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b'c']));
         assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b't']));
+        assert!(stream.windows(3).any(|w| w == [0x1b, b'(', b'F']));
     }
 
     #[test]

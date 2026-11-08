@@ -385,56 +385,41 @@ impl<T: UsbTransport> G2010Controller<T> {
     }
 
     /// Streams raw bytes directly to the printer interface bulk OUT pipe,
-    /// synchronizing EndJob delivery with physical motor execution.
+    /// then monitors the bulk IN status pipe until physical page execution and ejection complete.
     pub async fn print_raw_stream(&mut self, data: &[u8]) -> Result<(), DriverError> {
-        let endjob_marker = b"<ivec:operation>EndJob</ivec:operation>";
-        let (body, endjob) = if let Some(pos) = data
-            .windows(endjob_marker.len())
-            .position(|w| w == endjob_marker)
-        {
-            if let Some(xml_pos) = data[..pos].windows(5).rposition(|w| w == b"<?xml") {
-                (&data[..xml_pos], &data[xml_pos..])
-            } else {
-                (data, &[][..])
-            }
-        } else {
-            (data, &[][..])
-        };
-
-        const CHUNK_SIZE: usize = 64 * 1024;
-        for chunk in body.chunks(CHUNK_SIZE) {
+        const CHUNK_SIZE: usize = 16 * 1024;
+        for chunk in data.chunks(CHUNK_SIZE) {
             self.transport.write_printer(chunk).await?;
         }
 
-        if !endjob.is_empty() {
-            let is_mock = self.transport.serial_number().starts_with("MOCK");
-            if !is_mock {
-                let mut saw_printing = false;
-                for attempt in 0..120 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Ok(st) = self.query_status().await {
+        let is_mock = self.transport.serial_number().starts_with("MOCK");
+        if !is_mock {
+            let mut saw_printing = false;
+            let mut buf = vec![0u8; 4096];
+            for attempt in 0..180 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Ok(bytes_read) = self.transport.read_printer(&mut buf).await {
+                    if bytes_read == 0 {
+                        continue;
+                    }
+                    let xml = String::from_utf8_lossy(&buf[..bytes_read]);
+                    if let Ok(st) = parse_status_response(&xml) {
                         match st.state {
                             pixma_core::models::OperationalState::Printing
                             | pixma_core::models::OperationalState::Testing => {
                                 saw_printing = true;
                             }
                             pixma_core::models::OperationalState::Idle => {
-                                if saw_printing {
-                                    // Mechanical feed and swath printing finished; page ejected!
-                                    break;
-                                } else if attempt >= 20 {
-                                    // 10s elapsed with no printing engagement
+                                if saw_printing || attempt >= 10 {
                                     break;
                                 }
                             }
                             pixma_core::models::OperationalState::PaperOut => {
-                                let _ = self.transport.write_printer(endjob).await;
                                 return Err(DriverError::Protocol(
                                     "Printer reported Paper Out (Support Code 1000/1003). Load paper in rear feeder.".to_string(),
                                 ));
                             }
                             pixma_core::models::OperationalState::PaperJam => {
-                                let _ = self.transport.write_printer(endjob).await;
                                 return Err(DriverError::Protocol(
                                     "Printer reported Paper Jam (Support Code 1300). Clear paper jam.".to_string(),
                                 ));
@@ -444,8 +429,6 @@ impl<T: UsbTransport> G2010Controller<T> {
                     }
                 }
             }
-
-            self.transport.write_printer(endjob).await?;
         }
 
         Ok(())
