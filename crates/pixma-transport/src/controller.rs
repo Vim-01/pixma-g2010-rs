@@ -12,12 +12,11 @@ use pixma_core::models::{DeviceStatus, PrinterModel};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_core::safety::{PrintJobTypestate, ValidatedRasterLine};
 use pixma_core::scan_params::ScanParameters;
-use pixma_protocol::bjl::BjlBuilder;
 use pixma_protocol::ivec::{
-    build_bjl_set_time_send_data, build_cancel_job, build_cleaning_cmd, build_end_job,
-    build_get_status_cmd, build_manual_alignment_values_cmd, build_mode_shift,
-    build_roller_cleaning_cmd, build_send_data_header, build_set_job_configuration,
-    build_set_maintenance_job_configuration, build_set_page_configuration, build_start_job,
+    build_cancel_job, build_cleaning_cmd, build_end_job, build_get_status_cmd,
+    build_manual_alignment_values_cmd, build_mode_shift, build_roller_cleaning_cmd,
+    build_send_data_header, build_set_job_configuration, build_set_maintenance_job_configuration,
+    build_set_page_configuration, build_set_print_configuration, build_start_job,
     build_test_print_cmd, parse_status_response,
 };
 use pixma_protocol::mp2_scanner::{
@@ -32,6 +31,13 @@ use pixma_protocol::pwg_raster::{encode_pwg_page, PwgRasterHeader};
 pub enum AnyTransport {
     Usb(NusbTransport),
     Mock(Box<MockG2010Transport>),
+}
+
+impl AnyTransport {
+    /// Returns true if this transport wraps simulated virtual hardware.
+    pub fn is_mock(&self) -> bool {
+        matches!(self, Self::Mock(_))
+    }
 }
 
 impl UsbTransport for AnyTransport {
@@ -276,23 +282,19 @@ impl<T: UsbTransport> G2010Controller<T> {
             }
         }
 
-        // 2. SetJobConfiguration
-        let set_job = build_set_job_configuration(config.job_id, None);
-        self.transport.write_printer(set_job.as_bytes()).await?;
-        let _ = self.transport.read_printer(&mut rx_buf).await;
-
-        // 3. StartJob
+        // 2. StartJob (must precede all job configuration in Canon IVEC protocol)
         let start_job = build_start_job("print", config.job_id);
         self.transport.write_printer(start_job.as_bytes()).await?;
         let _ = self.transport.read_printer(&mut rx_buf).await;
 
-        // 4. BJL Time Synchronization
-        let bjl_send_data = build_bjl_set_time_send_data(config.job_id);
-        self.transport
-            .write_printer(bjl_send_data.as_bytes())
-            .await?;
-        let bjl_payload = BjlBuilder::time_sync_payload(timestamp);
-        self.transport.write_printer(&bjl_payload).await?;
+        // 3. SetJobConfiguration
+        let set_job = build_set_job_configuration(config.job_id, Some(timestamp));
+        self.transport.write_printer(set_job.as_bytes()).await?;
+        let _ = self.transport.read_printer(&mut rx_buf).await;
+
+        // 4. SetConfiguration (papersize, papertype, borderless, colormode, duplex)
+        let set_config = build_set_print_configuration(config);
+        self.transport.write_printer(set_config.as_bytes()).await?;
         let _ = self.transport.read_printer(&mut rx_buf).await;
 
         // 5. Stream Pages
@@ -344,7 +346,8 @@ impl<T: UsbTransport> G2010Controller<T> {
             }
 
             // SetPageConfiguration
-            let page_cfg_xml = build_set_page_configuration(config, page_no);
+            let is_last_page = page_idx + 1 == pages.len();
+            let page_cfg_xml = build_set_page_configuration(config, is_last_page);
             self.transport
                 .write_printer(page_cfg_xml.as_bytes())
                 .await?;
@@ -381,6 +384,73 @@ impl<T: UsbTransport> G2010Controller<T> {
         Ok(())
     }
 
+    /// Streams raw bytes directly to the printer interface bulk OUT pipe,
+    /// synchronizing EndJob delivery with physical motor execution.
+    pub async fn print_raw_stream(&mut self, data: &[u8]) -> Result<(), DriverError> {
+        let endjob_marker = b"<ivec:operation>EndJob</ivec:operation>";
+        let (body, endjob) = if let Some(pos) = data
+            .windows(endjob_marker.len())
+            .position(|w| w == endjob_marker)
+        {
+            if let Some(xml_pos) = data[..pos].windows(5).rposition(|w| w == b"<?xml") {
+                (&data[..xml_pos], &data[xml_pos..])
+            } else {
+                (data, &[][..])
+            }
+        } else {
+            (data, &[][..])
+        };
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        for chunk in body.chunks(CHUNK_SIZE) {
+            self.transport.write_printer(chunk).await?;
+        }
+
+        if !endjob.is_empty() {
+            let is_mock = self.transport.serial_number().starts_with("MOCK");
+            if !is_mock {
+                let mut saw_printing = false;
+                for attempt in 0..120 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Ok(st) = self.query_status().await {
+                        match st.state {
+                            pixma_core::models::OperationalState::Printing
+                            | pixma_core::models::OperationalState::Testing => {
+                                saw_printing = true;
+                            }
+                            pixma_core::models::OperationalState::Idle => {
+                                if saw_printing {
+                                    // Mechanical feed and swath printing finished; page ejected!
+                                    break;
+                                } else if attempt >= 20 {
+                                    // 10s elapsed with no printing engagement
+                                    break;
+                                }
+                            }
+                            pixma_core::models::OperationalState::PaperOut => {
+                                let _ = self.transport.write_printer(endjob).await;
+                                return Err(DriverError::Protocol(
+                                    "Printer reported Paper Out (Support Code 1000/1003). Load paper in rear feeder.".to_string(),
+                                ));
+                            }
+                            pixma_core::models::OperationalState::PaperJam => {
+                                let _ = self.transport.write_printer(endjob).await;
+                                return Err(DriverError::Protocol(
+                                    "Printer reported Paper Jam (Support Code 1300). Clear paper jam.".to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            self.transport.write_printer(endjob).await?;
+        }
+
+        Ok(())
+    }
+
     /// Acquires raw flatbed scanner data conforming to the MP2 scanner binary protocol.
     pub async fn acquire_raw_scan(
         &mut self,
@@ -395,11 +465,15 @@ impl<T: UsbTransport> G2010Controller<T> {
         let mut rx_buf = [0u8; 1024];
 
         // 1. IVEC StartJob (with automatic recovery if a previous scan aborted in MP2 binary mode)
+        tracing::info!("acquire_raw_scan: Step 1 StartJob (job_id={scan_job_id})");
         let start_job = build_start_job("scan", scan_job_id);
         self.transport.write_scanner(start_job.as_bytes()).await?;
         match self.transport.read_scanner(&mut rx_buf).await {
-            Ok(n) if n >= 5 && &rx_buf[..5] == b"<?xml" => {}
-            _ => {
+            Ok(n) if n >= 5 && &rx_buf[..5] == b"<?xml" => {
+                tracing::info!("acquire_raw_scan: StartJob OK, read {n} bytes XML");
+            }
+            res => {
+                tracing::warn!("acquire_raw_scan: StartJob unexpected response: {res:?}; attempting cancel recovery");
                 let cancel = build_cancel_or_finish_scan();
                 let _ = self.transport.write_scanner(&cancel).await;
                 let _ = self.transport.read_scanner(&mut rx_buf).await;
@@ -407,20 +481,28 @@ impl<T: UsbTransport> G2010Controller<T> {
                 let _ = self.transport.write_scanner(end_prev.as_bytes()).await;
                 let _ = self.transport.read_scanner(&mut rx_buf).await;
                 self.transport.write_scanner(start_job.as_bytes()).await?;
-                let _ = self.transport.read_scanner(&mut rx_buf).await?;
+                let n = self.transport.read_scanner(&mut rx_buf).await?;
+                tracing::info!("acquire_raw_scan: Recovered StartJob, read {n} bytes");
             }
         }
 
         // 2. ModeShift to binary MP2 mode
+        tracing::info!("acquire_raw_scan: Step 2 ModeShift");
         let mode_shift = build_mode_shift("scan", scan_job_id, 1);
         self.transport.write_scanner(mode_shift.as_bytes()).await?;
-        let _ = self.transport.read_scanner(&mut rx_buf).await?;
+        let n = self.transport.read_scanner(&mut rx_buf).await?;
+        tracing::info!("acquire_raw_scan: ModeShift returned {n} bytes");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 3. StartSession (0xDB20), recovering if a previous session was left open
+        tracing::info!("acquire_raw_scan: Step 3 StartSession");
         let cmd = build_start_session();
         self.transport.write_scanner(&cmd).await?;
         let n = self.transport.read_scanner(&mut rx_buf).await?;
+        tracing::info!(
+            "acquire_raw_scan: StartSession returned {n} bytes: {:02X?}",
+            &rx_buf[..n.min(16)]
+        );
         if n >= 2 && rx_buf[0] == 0x15 && rx_buf[1] == 0x15 {
             let cancel = build_cancel_or_finish_scan();
             let _ = self.transport.write_scanner(&cancel).await;
@@ -431,6 +513,7 @@ impl<T: UsbTransport> G2010Controller<T> {
         }
 
         // 4. SendGammaTable (0xEE20, 2072 bytes) x 3 channels (R, G, B) using hardware sRGB 2.2 LUT
+        tracing::info!("acquire_raw_scan: Step 4 GammaTable");
         let gamma_cmd = build_gamma_table(2.2);
         for ch in 0..3 {
             self.transport.write_scanner(&gamma_cmd).await?;
@@ -450,10 +533,15 @@ impl<T: UsbTransport> G2010Controller<T> {
         }
 
         // 5. SetScanParameter (0xD820, 72 bytes)
+        tracing::info!("acquire_raw_scan: Step 5 SetScanParameter");
         let cmd =
             build_set_scan_parameter(params).map_err(|e| DriverError::Protocol(e.to_string()))?;
         self.transport.write_scanner(&cmd).await?;
         let n = self.transport.read_scanner(&mut rx_buf).await?;
+        tracing::info!(
+            "acquire_raw_scan: SetScanParameter returned {n} bytes: {:02X?}",
+            &rx_buf[..n.min(16)]
+        );
         if n < 2 || rx_buf[0] != 0x06 || rx_buf[1] != 0x06 {
             let cancel = build_cancel_or_finish_scan();
             let _ = self.transport.write_scanner(&cancel).await;
@@ -468,9 +556,14 @@ impl<T: UsbTransport> G2010Controller<T> {
         }
 
         // 6. StartScan (0xD920)
+        tracing::info!("acquire_raw_scan: Step 6 StartScan");
         let cmd = build_start_scan();
         self.transport.write_scanner(&cmd).await?;
         let n = self.transport.read_scanner(&mut rx_buf).await?;
+        tracing::info!(
+            "acquire_raw_scan: StartScan returned {n} bytes: {:02X?}",
+            &rx_buf[..n.min(16)]
+        );
         if n < 2 || rx_buf[0] != 0x06 || rx_buf[1] != 0x06 {
             let cancel = build_cancel_or_finish_scan();
             let _ = self.transport.write_scanner(&cancel).await;
@@ -515,7 +608,7 @@ impl<T: UsbTransport> G2010Controller<T> {
         loop {
             let cmd = build_read_scan_chunk_with_req(req_word);
             self.transport.write_scanner(&cmd).await?;
-            let mut total_read = self.transport.read_scanner(&mut chunk_buf[..512]).await?;
+            let mut total_read = self.transport.read_scanner(&mut chunk_buf).await?;
             if total_read == 0 {
                 break;
             }

@@ -74,7 +74,10 @@ pub fn render_ascii_status(status: &DeviceStatus) -> String {
     );
 
     // Ink Tanks
-    out.push_str(" GI-790 MegaTank CISS Ink Levels (Estimated):\n");
+    out.push_str(" GI-790 MegaTank CISS Ink Levels (Estimated by Droplet Counter):\n");
+    out.push_str(
+        "   * Note: MegaTank tanks have no electronic float sensors. Check windows on front.\n",
+    );
     let pgbk = status.ink_levels.pigment_black_percent;
     let cyan = status.ink_levels.cyan_percent;
     let mag = status.ink_levels.magenta_percent;

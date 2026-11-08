@@ -24,44 +24,24 @@ pub const VCN_CANON_NS: &str = "http://www.canon.com/ns/cmd/2008/07/canon/";
 // ---------------------------------------------------------------------------
 
 /// Generates the `SetJobConfiguration` IVEC XML command for a print job.
-pub fn build_set_job_configuration(job_id: u32, document_title: Option<&str>) -> String {
-    let doc = document_title.unwrap_or("document");
+pub fn build_set_job_configuration(job_id: u32, datetime: Option<&str>) -> String {
+    let dt = datetime.unwrap_or("20261108000000");
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}">
-  <ivec:contents>
-    <ivec:operation>VendorCmd</ivec:operation>
-    <ivec:param_set servicetype="print">
-      <vcn:ijoperation>SetJobConfiguration</vcn:ijoperation>
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <vcn:hostenvironment>Linux</vcn:hostenvironment>
-      <vcn:remotedriver>0</vcn:remotedriver>
-      <vcn:driverinfo>
-        <vcn:infoversion>1</vcn:infoversion>
-        <vcn:os>Linux</vcn:os>
-        <vcn:driverversion>5.00.1</vcn:driverversion>
-        <vcn:language>en-US</vcn:language>
-        <vcn:deviceid>1</vcn:deviceid>
-        <vcn:deviceport>USB</vcn:deviceport>
-      </vcn:driverinfo>
-      <vcn:printstart>1</vcn:printstart>
-      <vcn:user>user</vcn:user>
-      <vcn:computer>host</vcn:computer>
-      <vcn:document>{doc}</vcn:document>
-      <vcn:duplexprint>OFF</vcn:duplexprint>
-      <vcn:jobtype>normal</vcn:jobtype>
-      <vcn:externalid>{job_id:08}</vcn:externalid>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8"?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>SetJobConfiguration</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:mismatch_mode>none</ivec:mismatch_mode><ivec:datetime>{dt}</ivec:datetime></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
 /// Generates the `StartJob` IVEC XML command for a print, scan, or maintenance session.
 pub fn build_start_job(service_type: &str, job_id: u32) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>StartJob</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:bidi>0</ivec:bidi><ivec:jobname/><ivec:username/><ivec:computername/><ivec:job_description><![CDATA[1]]></ivec:job_description><vcn:host_environment>linux</vcn:host_environment></ivec:param_set></ivec:contents></cmd>"#
-    )
+    if service_type == "print" {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>StartJob</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:bidi>0</ivec:bidi><vcn:forcepmdetection>OFF</vcn:forcepmdetection><ivec:jobname/><ivec:username/><ivec:computername/><ivec:job_description><![CDATA[{job_id}]]></ivec:job_description><vcn:host_environment>linux</vcn:host_environment></ivec:param_set></ivec:contents></cmd>"#
+        )
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>StartJob</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:bidi>1</ivec:bidi></ivec:param_set></ivec:contents></cmd>"#
+        )
+    }
 }
 
 /// Generates the `SetJobConfiguration` IVEC XML command for a maintenance session.
@@ -101,94 +81,20 @@ pub fn build_set_print_configuration(config: &PrintJobConfig) -> String {
 /// Format is `RAW` with exact data size `62` bytes.
 pub fn build_bjl_set_time_send_data(job_id: u32) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>SendData</ivec:operation>
-    <ivec:param_set servicetype="print">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:format>RAW</ivec:format>
-      <ivec:datasize>62</ivec:datasize>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>SendData</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><ivec:format>RAW</ivec:format><ivec:datasize>62</ivec:datasize></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
 /// Generates the per-page `SetPageConfiguration` IVEC XML command from a `PrintJobConfig`.
-pub fn build_set_page_configuration(config: &PrintJobConfig, page_no: u32) -> String {
-    let (paper_w_mm, paper_h_mm) = config.paper_size.dimensions_mm();
-    let borderless_str = if config.borderless.is_borderless() {
-        "ON"
+pub fn build_set_page_configuration(config: &PrintJobConfig, is_last_page: bool) -> String {
+    let nextpage_tag = if is_last_page {
+        "<vcn:nextpage>OFF</vcn:nextpage>"
     } else {
-        "OFF"
+        "<vcn:nextpage>ON</vcn:nextpage>"
     };
-    let colormode_str = if config.color.grayscale {
-        "monochrome"
-    } else {
-        "color"
-    };
-    let collate_str = if config.collate { "ON" } else { "OFF" };
-    let pageorder_str = if config.reverse_order {
-        "Descending"
-    } else {
-        "Ascending"
-    };
-
-    let (duplex_print, duplex_type) = match config.duplex {
-        DuplexMode::Off => ("OFF", "NONE"),
-        DuplexMode::LongEdge => ("ON", "LONGEDGE"),
-        DuplexMode::ShortEdge => ("ON", "SHORTEDGE"),
-    };
-
-    let (top_margin, bottom_margin, left_margin, right_margin, enable_margin) =
-        if config.borderless.is_borderless() {
-            (0.0, 0.0, 0.0, 0.0, "OFF")
-        } else {
-            (3.0, 5.0, 3.4, 3.4, "ON")
-        };
-
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}">
-  <ivec:contents>
-    <ivec:operation>VendorCmd</ivec:operation>
-    <ivec:param_set servicetype="print">
-      <vcn:ijoperation>SetPageConfiguration</vcn:ijoperation>
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-      <ivec:mediatype>{mediatype}</ivec:mediatype>
-      <ivec:papersize>{papersize}</ivec:papersize>
-      <ivec:printquality>{printquality}</ivec:printquality>
-      <ivec:borderlessprint>{borderless_str}</ivec:borderlessprint>
-      <ivec:colormode>{colormode_str}</ivec:colormode>
-      <ivec:inputbin>auto</ivec:inputbin>
-      <ivec:copies>{copies}</ivec:copies>
-      <vcn:totalpages>0</vcn:totalpages>
-      <vcn:currentpage>{page_no}</vcn:currentpage>
-      <vcn:Collate>{collate_str}</vcn:Collate>
-      <vcn:Pageorder>{pageorder_str}</vcn:Pageorder>
-      <ivec:duplexprint>{duplex_print}</ivec:duplexprint>
-      <ivec:duplextype>{duplex_type}</ivec:duplextype>
-      <vcn:SpecifyMargin Type="millimeter">
-        <vcn:PhysicalPaperWidth>{paper_w_mm:.1}</vcn:PhysicalPaperWidth>
-        <vcn:PhysicalPaperLength>{paper_h_mm:.1}</vcn:PhysicalPaperLength>
-        <vcn:TopMargin>{top_margin:.1}</vcn:TopMargin>
-        <vcn:BottomMargin>{bottom_margin:.1}</vcn:BottomMargin>
-        <vcn:LeftMargin>{left_margin:.1}</vcn:LeftMargin>
-        <vcn:RightMargin>{right_margin:.1}</vcn:RightMargin>
-      </vcn:SpecifyMargin>
-      <vcn:EnableMargin>{enable_margin}</vcn:EnableMargin>
-      <vcn:papergap>{papergap}</vcn:papergap>
-      <vcn:orientation>0</vcn:orientation>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#,
-        job_id = config.job_id,
-        mediatype = config.media_type.ivec_xml_value(),
-        papersize = config.paper_size.ivec_xml_value(),
-        printquality = config.quality.ivec_xml_value(),
-        copies = config.copies,
-        papergap = config.paper_gap.ivec_xml_value(),
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}" xmlns:vcn="{VCN_CANON_NS}"><ivec:contents><ivec:operation>VendorCmd</ivec:operation><ivec:param_set servicetype="print"><ivec:jobID>{job_id:08}</ivec:jobID><vcn:ijoperation>SetPageConfiguration</vcn:ijoperation>{nextpage_tag}</ivec:param_set></ivec:contents></cmd>"#,
+        job_id = config.job_id
     )
 }
 
@@ -210,30 +116,14 @@ pub fn build_mode_shift(service_type: &str, job_id: u32, mode: u8) -> String {
 /// Generates the `EndJob` IVEC XML command terminating an active job.
 pub fn build_end_job(service_type: &str, job_id: u32) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>EndJob</ivec:operation>
-    <ivec:param_set servicetype="{service_type}">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>EndJob</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
 /// Generates the `CancelJob` IVEC XML command aborting an active job immediately.
 pub fn build_cancel_job(service_type: &str, job_id: u32) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8" ?>
-<cmd xmlns:ivec="{IVEC_COMMON_NS}">
-  <ivec:contents>
-    <ivec:operation>CancelJob</ivec:operation>
-    <ivec:param_set servicetype="{service_type}">
-      <ivec:jobID>{job_id:08}</ivec:jobID>
-    </ivec:param_set>
-  </ivec:contents>
-</cmd>"#
+        r#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="{IVEC_COMMON_NS}"><ivec:contents><ivec:operation>CancelJob</ivec:operation><ivec:param_set servicetype="{service_type}"><ivec:jobID>{job_id:08}</ivec:jobID></ivec:param_set></ivec:contents></cmd>"#
     )
 }
 
@@ -536,12 +426,11 @@ mod tests {
 
     #[test]
     fn builds_set_job_configuration_xml() {
-        let xml = build_set_job_configuration(1, Some("test_print.pdf"));
-        assert!(xml.contains("<vcn:ijoperation>SetJobConfiguration</vcn:ijoperation>"));
+        let xml = build_set_job_configuration(1, Some("20261108203500"));
+        assert!(xml.contains("<ivec:operation>SetJobConfiguration</ivec:operation>"));
         assert!(xml.contains("<ivec:jobID>00000001</ivec:jobID>"));
-        assert!(xml.contains("<vcn:document>test_print.pdf</vcn:document>"));
-        assert!(xml.contains(IVEC_COMMON_NS));
-        assert!(xml.contains(VCN_CANON_NS));
+        assert!(xml.contains("<ivec:datetime>20261108203500</ivec:datetime>"));
+        assert!(xml.contains("<ivec:mismatch_mode>none</ivec:mismatch_mode>"));
     }
 
     #[test]
@@ -563,13 +452,13 @@ mod tests {
     #[test]
     fn builds_set_page_configuration_xml() {
         let config = PrintJobConfig::default();
-        let xml = build_set_page_configuration(&config, 1);
-        assert!(xml.contains("<vcn:ijoperation>SetPageConfiguration</vcn:ijoperation>"));
-        assert!(xml.contains("<ivec:mediatype>stationery</ivec:mediatype>"));
-        assert!(xml.contains("<ivec:papersize>iso_a4_210x297mm</ivec:papersize>"));
-        assert!(xml.contains("<vcn:PhysicalPaperWidth>210.0</vcn:PhysicalPaperWidth>"));
-        assert!(xml.contains("<vcn:PhysicalPaperLength>297.0</vcn:PhysicalPaperLength>"));
-        assert!(xml.contains("<vcn:currentpage>1</vcn:currentpage>"));
+        let xml1 = build_set_page_configuration(&config, false);
+        assert!(xml1.contains("<vcn:ijoperation>SetPageConfiguration</vcn:ijoperation>"));
+        assert!(xml1.contains("<vcn:nextpage>ON</vcn:nextpage>"));
+
+        let xml2 = build_set_page_configuration(&config, true);
+        assert!(xml2.contains("<vcn:ijoperation>SetPageConfiguration</vcn:ijoperation>"));
+        assert!(xml2.contains("<vcn:nextpage>OFF</vcn:nextpage>"));
     }
 
     #[test]

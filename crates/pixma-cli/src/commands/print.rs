@@ -87,8 +87,15 @@ pub async fn execute_print(
         grayscale,
     };
 
+    let job_id = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 1_000_000
+        + 1) as u32;
+
     let config = PrintJobConfig {
-        job_id: 1,
+        job_id,
         media_type,
         paper_size,
         quality,
@@ -178,7 +185,7 @@ pub async fn execute_print(
         });
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!("Print job successfully submitted to printer.");
+        println!("Print job successfully completed! Page ejected.");
     }
 
     Ok(())

@@ -9,7 +9,6 @@ use pixma_core::scan_params::ScanParameters;
 use pixma_transport::controller::{AnyTransport, G2010Controller};
 use pixma_transport::mock_device::MockG2010Transport;
 use pixma_transport::nusb_transport::{discover_canon_devices, NusbTransport};
-use pixma_transport::UsbTransport;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixStream;
@@ -108,6 +107,17 @@ impl DaemonClient {
         Ok(Self::direct(controller))
     }
 
+    /// Returns true if the client is connected directly to simulated virtual hardware.
+    pub async fn is_mock(&self) -> bool {
+        match &self.inner {
+            ClientInner::Direct(ctrl) => {
+                let guard = ctrl.lock().await;
+                guard.transport().is_mock()
+            }
+            ClientInner::Socket(_) => false,
+        }
+    }
+
     /// Pings the daemon or local controller.
     pub async fn ping(&mut self) -> Result<(), DriverError> {
         match &mut self.inner {
@@ -201,11 +211,7 @@ impl DaemonClient {
             }
             ClientInner::Direct(ctrl) => {
                 let mut guard = ctrl.lock().await;
-                const CHUNK_SIZE: usize = 256 * 1024;
-                for chunk in data.chunks(CHUNK_SIZE) {
-                    guard.transport_mut().write_printer(chunk).await?;
-                }
-                Ok(())
+                guard.print_raw_stream(data).await
             }
         }
     }

@@ -23,7 +23,7 @@ fn test_cups_options_and_pipeline_compilation() {
 
     let text = String::from_utf8_lossy(&job_bytes);
     assert!(text.contains("<ivec:operation>StartJob</ivec:operation>"));
-    assert!(text.contains("<ivec:mediatype>custom-media-type-canon-6</ivec:mediatype>"));
+    assert!(text.contains("<ivec:papertype>custom-media-type-canon-6</ivec:papertype>"));
     assert!(text.contains("<ivec:borderlessprint>ON</ivec:borderlessprint>"));
     assert!(text.contains("<ivec:operation>EndJob</ivec:operation>"));
 }

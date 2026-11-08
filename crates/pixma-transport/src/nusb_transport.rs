@@ -374,7 +374,7 @@ impl UsbTransport for NusbTransport {
         let aligned_len = buf.len().max(512).div_ceil(512) * 512;
         let req = RequestBuffer::new(aligned_len);
         let res = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(35),
             iface.bulk_in(self.scanner_ep_in, req),
         )
         .await

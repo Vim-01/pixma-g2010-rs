@@ -81,6 +81,14 @@ impl BjlBuilder {
         buf
     }
 
+    /// Generates the time synchronization sequence with LF endings prepended with the 7-byte entry prefix.
+    pub fn time_sync_lf_with_prefix(timestamp: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(7 + 58);
+        buf.extend_from_slice(&BJL_ENTRY_PREFIX);
+        buf.extend_from_slice(&Self::time_sync_payload_lf(timestamp));
+        buf
+    }
+
     /// Builds a framed BJL command envelope from a slice of command strings.
     pub fn build_envelope(commands: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();

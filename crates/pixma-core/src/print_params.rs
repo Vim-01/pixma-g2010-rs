@@ -191,6 +191,63 @@ impl PaperSize {
             Self::Custom { .. } => "iso_a4_210x297mm",
         }
     }
+
+    /// Returns the exact printable dot dimensions `(width_dots, height_dots)`
+    /// specified by Canon firmware GetCapabilityResponse for the given DPI and borderless mode.
+    pub const fn printable_area_dots(self, dpi: u32, borderless: bool) -> (u32, u32) {
+        let (w_600, h_600) = match (self, borderless) {
+            (Self::A4, false) => (4800, 6826),
+            (Self::A4, true) => (5092, 7181),
+            (Self::Letter, false) => (4800, 6411),
+            (Self::Letter, true) => (5232, 6765),
+            (Self::Photo4x6, false) => (2239, 3411),
+            (Self::Photo4x6, true) => (2532, 3765),
+            (Self::Photo5x7, false) => (2839, 4011),
+            (Self::Photo5x7, true) => (3132, 4365),
+            (Self::A5, _) => (3335, 4771),
+            (Self::B5, _) => (4138, 5881),
+            (Self::Legal, _) => (4800, 8211),
+            (Self::Hagaki, false) => (2201, 3307),
+            (Self::Hagaki, true) => (2494, 3661),
+            _ => {
+                let (w_mm, h_mm) = self.dimensions_mm();
+                let printable_w_mm = if borderless {
+                    w_mm
+                } else {
+                    let w = w_mm - 6.8;
+                    if w < 10.0 {
+                        10.0
+                    } else {
+                        w
+                    }
+                };
+                let printable_h_mm = if borderless {
+                    h_mm
+                } else {
+                    let h = h_mm - 8.0;
+                    if h < 10.0 {
+                        10.0
+                    } else {
+                        h
+                    }
+                };
+                (
+                    ((printable_w_mm * 600.0) / 25.4 + 0.5) as u32,
+                    ((printable_h_mm * 600.0) / 25.4 + 0.5) as u32,
+                )
+            }
+        };
+
+        if dpi == 600 {
+            (w_600, h_600)
+        } else {
+            let scale = dpi as f32 / 600.0;
+            (
+                (w_600 as f32 * scale + 0.5) as u32,
+                (h_600 as f32 * scale + 0.5) as u32,
+            )
+        }
+    }
 }
 
 /// Borderless printing mode and extension amount (0 = none to 3 = maximum overscan).
@@ -353,7 +410,7 @@ pub struct PrintJobConfig {
 impl Default for PrintJobConfig {
     fn default() -> Self {
         Self {
-            job_id: 1,
+            job_id: 2,
             media_type: MediaType::Plain,
             paper_size: PaperSize::A4,
             quality: PrintQuality::Level3Standard,

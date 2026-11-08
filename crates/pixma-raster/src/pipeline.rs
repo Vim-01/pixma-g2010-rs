@@ -11,11 +11,10 @@ use crate::layout::{apply_borderless_extension, apply_page_layout};
 use pixma_color::{rgb_to_sgray_fixed_point, ColorPipeline, InkSeparator};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_core::safety::{MechanicalBounds, ValidatedRasterLine};
-use pixma_protocol::bjl::BjlBuilder;
 use pixma_protocol::bjraster3::BjRaster3Encoder;
 use pixma_protocol::ivec::{
-    build_bjl_set_time_send_data, build_end_job, build_mode_shift, build_send_data_header,
-    build_set_job_configuration, build_set_page_configuration, build_start_job,
+    build_end_job, build_mode_shift, build_send_data_header, build_set_job_configuration,
+    build_set_page_configuration, build_set_print_configuration, build_start_job,
 };
 use pixma_protocol::pwg_raster::{encode_pwg_page, PwgRasterHeader};
 
@@ -45,13 +44,13 @@ impl PrintRasterPipeline {
         let max_carriage_dots = MechanicalBounds::max_carriage_dots_for_dpi(dpi)?;
         let max_page_length_dots = MechanicalBounds::max_page_height_dots_for_dpi(dpi)?;
 
-        // Compute target dimensions in dots from paper size in millimeters
-        let (paper_w_mm, paper_h_mm) = config.paper_size.dimensions_mm();
-        let raw_target_w = ((paper_w_mm * dpi as f32) / 25.4 + 0.5) as u32;
-        let raw_target_h = ((paper_h_mm * dpi as f32) / 25.4 + 0.5) as u32;
+        // Compute destination printable area dots from paper size and borderless mode
+        let (printable_w, printable_h) = config
+            .paper_size
+            .printable_area_dots(dpi, config.borderless.is_borderless());
 
-        let target_w = raw_target_w.clamp(1, max_carriage_dots);
-        let target_h = raw_target_h.clamp(1, max_page_length_dots);
+        let target_w = printable_w.clamp(1, max_carriage_dots);
+        let target_h = printable_h.clamp(1, max_page_length_dots);
 
         // 1. Layout imposition
         let laid_out_pages = apply_page_layout(pages, config.layout, target_w, target_h)?;
@@ -242,24 +241,24 @@ impl PrintRasterPipeline {
         let rendered_pages = Self::render_pages_to_validated_lines(pages, config)?;
         let mut stream = Vec::new();
 
-        // 1. SetJobConfiguration
-        stream.extend_from_slice(
-            build_set_job_configuration(config.job_id, Some("document")).as_bytes(),
-        );
-
-        // 2. StartJob
+        // 1. StartJob (must precede all job configuration in Canon IVEC protocol)
         stream.extend_from_slice(build_start_job("print", config.job_id).as_bytes());
 
-        // 3. BJL Time Synchronization (62 bytes payload)
-        stream.extend_from_slice(build_bjl_set_time_send_data(config.job_id).as_bytes());
-        stream.extend_from_slice(&BjlBuilder::time_sync_payload(timestamp));
+        // 2. SetJobConfiguration
+        stream.extend_from_slice(
+            build_set_job_configuration(config.job_id, Some(timestamp)).as_bytes(),
+        );
+
+        // 3. SetConfiguration (papersize, papertype, borderless, colormode, duplex)
+        stream.extend_from_slice(build_set_print_configuration(config).as_bytes());
 
         // 4. Per-page configurations and PWG raster payloads
         for (idx, page_lines) in rendered_pages.iter().enumerate() {
             let page_no = (idx + 1) as u32;
+            let is_last_page = idx + 1 == rendered_pages.len();
 
             // SetPageConfiguration
-            stream.extend_from_slice(build_set_page_configuration(config, page_no).as_bytes());
+            stream.extend_from_slice(build_set_page_configuration(config, is_last_page).as_bytes());
 
             // PWG header & encoded page
             let width = page_lines[0].dot_width();
@@ -297,28 +296,30 @@ impl PrintRasterPipeline {
         let rendered_pages = Self::render_pages_to_validated_lines(pages, config)?;
         let mut stream = Vec::new();
 
-        // 1. SetJobConfiguration
-        stream.extend_from_slice(
-            build_set_job_configuration(config.job_id, Some("document")).as_bytes(),
-        );
-
-        // 2. StartJob
+        // 1. StartJob (must precede all job configuration in Canon IVEC protocol)
         stream.extend_from_slice(build_start_job("print", config.job_id).as_bytes());
 
-        // 3. BJL Time Synchronization
-        stream.extend_from_slice(build_bjl_set_time_send_data(config.job_id).as_bytes());
-        stream.extend_from_slice(&BjlBuilder::time_sync_payload(timestamp));
+        // 2. SetJobConfiguration
+        stream.extend_from_slice(
+            build_set_job_configuration(config.job_id, Some(timestamp)).as_bytes(),
+        );
 
-        // 4. ModeShift to binary BJRaster3 mode
+        // 3. SetConfiguration (papersize, papertype, borderless, colormode, duplex)
+        stream.extend_from_slice(build_set_print_configuration(config).as_bytes());
+
+        // 4. SetPageConfiguration
+        stream.extend_from_slice(build_set_page_configuration(config, true).as_bytes());
+
+        // 5. ModeShift to binary BJRaster3 mode
         stream.extend_from_slice(build_mode_shift("print", config.job_id, 1).as_bytes());
 
-        // 5. BJRaster3 command prologue & page data
+        // 6. BJRaster3 command prologue & page data
         for page_lines in &rendered_pages {
             let bjraster3_page = BjRaster3Encoder::encode_page(config, page_lines)?;
             stream.extend_from_slice(&bjraster3_page);
         }
 
-        // 6. EndJob
+        // 7. EndJob
         stream.extend_from_slice(build_end_job("print", config.job_id).as_bytes());
 
         Ok(stream)
@@ -403,10 +404,11 @@ mod tests {
         let stream =
             PrintRasterPipeline::compile_ivec_pwg_job(&pages, &config, "20261106175000").unwrap();
 
-        // Stream must contain IVEC envelope, BJL, and PWG RaS2 magic
+        // Stream must contain IVEC envelope and PWG RaS2 magic
         let text = String::from_utf8_lossy(&stream);
-        assert!(text.contains("SetJobConfiguration"));
         assert!(text.contains("StartJob"));
+        assert!(text.contains("SetJobConfiguration"));
+        assert!(text.contains("SetConfiguration"));
         assert!(text.contains("SetPageConfiguration"));
         assert!(text.contains("EndJob"));
         assert!(stream.windows(4).any(|w| w == b"RaS2"));

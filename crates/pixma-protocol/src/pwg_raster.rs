@@ -21,8 +21,13 @@ pub const CNCL_IPC_MAGIC: u32 = 0x12340001;
 /// Standard PWG Raster per-page header (1796 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PwgRasterHeader {
+    pub media_class: String,
+    pub media_type: String,
     pub dpi_x: u32,
     pub dpi_y: u32,
+    pub imaging_bbox: (u32, u32, u32, u32),
+    pub num_copies: u32,
+    pub page_size_pts: (u32, u32),
     pub width_px: u32,
     pub height_px: u32,
     pub bits_per_color: u32,
@@ -31,15 +36,31 @@ pub struct PwgRasterHeader {
     pub color_space: u32,
     pub num_colors: u32,
     pub total_pages: u32,
+    pub cups_integer: [u32; 16],
+    pub rendering_intent: String,
+    pub page_size_name: String,
 }
 
 impl PwgRasterHeader {
     /// Creates a 24-bit sRGB page header.
     pub fn new_srgb(width_px: u32, height_px: u32, dpi: u32) -> Self {
         let bytes_per_line = width_px * 3;
+        let mut cups_integer = [0u32; 16];
+        cups_integer[0] = 1; // TotalPageCount
+        cups_integer[3] = 5782; // ImageBoxLeft
+        cups_integer[4] = 8622; // ImageBoxTop
+        cups_integer[5] = 351552; // ImageBoxRight
+        cups_integer[6] = 500031; // ImageBoxBottom
+        cups_integer[7] = 16777215; // AlternatePrimary
+
         Self {
+            media_class: "PwgRaster".to_string(),
+            media_type: "plain".to_string(),
             dpi_x: dpi,
             dpi_y: dpi,
+            imaging_bbox: (10, 14, 586, 833),
+            num_copies: 1,
+            page_size_pts: (595, 842),
             width_px,
             height_px,
             bits_per_color: 8,
@@ -48,15 +69,31 @@ impl PwgRasterHeader {
             color_space: 19, // sRGB
             num_colors: 3,
             total_pages: 1,
+            cups_integer,
+            rendering_intent: "auto".to_string(),
+            page_size_name: "A4".to_string(),
         }
     }
 
     /// Creates an 8-bit SGray (monochrome) page header.
     pub fn new_sgray(width_px: u32, height_px: u32, dpi: u32) -> Self {
         let bytes_per_line = width_px;
+        let mut cups_integer = [0u32; 16];
+        cups_integer[0] = 1;
+        cups_integer[3] = 5782;
+        cups_integer[4] = 8622;
+        cups_integer[5] = 351552;
+        cups_integer[6] = 500031;
+        cups_integer[7] = 16777215;
+
         Self {
+            media_class: "PwgRaster".to_string(),
+            media_type: "plain".to_string(),
             dpi_x: dpi,
             dpi_y: dpi,
+            imaging_bbox: (10, 14, 586, 833),
+            num_copies: 1,
+            page_size_pts: (595, 842),
             width_px,
             height_px,
             bits_per_color: 8,
@@ -65,20 +102,59 @@ impl PwgRasterHeader {
             color_space: 18, // SGray
             num_colors: 1,
             total_pages: 1,
+            cups_integer,
+            rendering_intent: "auto".to_string(),
+            page_size_name: "A4".to_string(),
         }
+    }
+
+    /// Configures page geometry and media attributes matching Canon PPD definitions.
+    pub fn with_media_config(
+        mut self,
+        media_type: &str,
+        page_size_name: &str,
+        page_size_pts: (u32, u32),
+        imaging_bbox: (u32, u32, u32, u32),
+        cups_integer: [u32; 16],
+    ) -> Self {
+        self.media_type = media_type.to_string();
+        self.page_size_name = page_size_name.to_string();
+        self.page_size_pts = page_size_pts;
+        self.imaging_bbox = imaging_bbox;
+        self.cups_integer = cups_integer;
+        self
     }
 
     /// Serializes this header into the standard 1796-byte PWG Raster page header.
     pub fn to_bytes(&self) -> [u8; PWG_HEADER_SIZE] {
         let mut buf = [0u8; PWG_HEADER_SIZE];
 
-        // "PwgRaster\0" prefix (64 bytes null-padded)
-        let magic_prefix = b"PwgRaster";
-        buf[0..magic_prefix.len()].copy_from_slice(magic_prefix);
+        // MediaClass at 0..64
+        let media_class = self.media_class.as_bytes();
+        let class_len = media_class.len().min(63);
+        buf[0..class_len].copy_from_slice(&media_class[..class_len]);
+
+        // MediaType at 128..192
+        let media_type = self.media_type.as_bytes();
+        let type_len = media_type.len().min(63);
+        buf[128..128 + type_len].copy_from_slice(&media_type[..type_len]);
 
         // Resolution at offsets 276..284
         buf[276..280].copy_from_slice(&self.dpi_x.to_be_bytes());
         buf[280..284].copy_from_slice(&self.dpi_y.to_be_bytes());
+
+        // ImagingBoundingBox at 284..300
+        buf[284..288].copy_from_slice(&self.imaging_bbox.0.to_be_bytes());
+        buf[288..292].copy_from_slice(&self.imaging_bbox.1.to_be_bytes());
+        buf[292..296].copy_from_slice(&self.imaging_bbox.2.to_be_bytes());
+        buf[296..300].copy_from_slice(&self.imaging_bbox.3.to_be_bytes());
+
+        // NumCopies at 340..344
+        buf[340..344].copy_from_slice(&self.num_copies.to_be_bytes());
+
+        // PageSize points at 352..360
+        buf[352..356].copy_from_slice(&self.page_size_pts.0.to_be_bytes());
+        buf[356..360].copy_from_slice(&self.page_size_pts.1.to_be_bytes());
 
         // Geometry at offsets 372..380
         buf[372..376].copy_from_slice(&self.width_px.to_be_bytes());
@@ -94,8 +170,23 @@ impl PwgRasterHeader {
         // NumColors at 420..424
         buf[420..424].copy_from_slice(&self.num_colors.to_be_bytes());
 
-        // TotalPageCount at 428..432
+        // TotalPageCount at 428..432 (or cupsInteger[0])
         buf[428..432].copy_from_slice(&self.total_pages.to_be_bytes());
+
+        // cupsInteger[16] at 452..516
+        for i in 0..16 {
+            buf[452 + i * 4..456 + i * 4].copy_from_slice(&self.cups_integer[i].to_be_bytes());
+        }
+
+        // cupsRenderingIntent at 1668..1732
+        let intent = self.rendering_intent.as_bytes();
+        let intent_len = intent.len().min(63);
+        buf[1668..1668 + intent_len].copy_from_slice(&intent[..intent_len]);
+
+        // cupsPageSizeName at 1732..1796
+        let name = self.page_size_name.as_bytes();
+        let name_len = name.len().min(63);
+        buf[1732..1732 + name_len].copy_from_slice(&name[..name_len]);
 
         buf
     }
@@ -109,8 +200,30 @@ impl PwgRasterHeader {
             });
         }
 
+        let media_class = String::from_utf8_lossy(&buf[0..64])
+            .trim_matches('\0')
+            .to_string();
+        let media_type = String::from_utf8_lossy(&buf[128..192])
+            .trim_matches('\0')
+            .to_string();
+
         let dpi_x = u32::from_be_bytes(buf[276..280].try_into().unwrap());
         let dpi_y = u32::from_be_bytes(buf[280..284].try_into().unwrap());
+
+        let imaging_bbox = (
+            u32::from_be_bytes(buf[284..288].try_into().unwrap()),
+            u32::from_be_bytes(buf[288..292].try_into().unwrap()),
+            u32::from_be_bytes(buf[292..296].try_into().unwrap()),
+            u32::from_be_bytes(buf[296..300].try_into().unwrap()),
+        );
+
+        let num_copies = u32::from_be_bytes(buf[340..344].try_into().unwrap());
+
+        let page_size_pts = (
+            u32::from_be_bytes(buf[352..356].try_into().unwrap()),
+            u32::from_be_bytes(buf[356..360].try_into().unwrap()),
+        );
+
         let width_px = u32::from_be_bytes(buf[372..376].try_into().unwrap());
         let height_px = u32::from_be_bytes(buf[376..380].try_into().unwrap());
         let bits_per_color = u32::from_be_bytes(buf[384..388].try_into().unwrap());
@@ -120,9 +233,26 @@ impl PwgRasterHeader {
         let num_colors = u32::from_be_bytes(buf[420..424].try_into().unwrap());
         let total_pages = u32::from_be_bytes(buf[428..432].try_into().unwrap());
 
+        let mut cups_integer = [0u32; 16];
+        for i in 0..16 {
+            cups_integer[i] = u32::from_be_bytes(buf[452 + i * 4..456 + i * 4].try_into().unwrap());
+        }
+
+        let rendering_intent = String::from_utf8_lossy(&buf[1668..1732])
+            .trim_matches('\0')
+            .to_string();
+        let page_size_name = String::from_utf8_lossy(&buf[1732..1796])
+            .trim_matches('\0')
+            .to_string();
+
         Ok(Self {
+            media_class,
+            media_type,
             dpi_x,
             dpi_y,
+            imaging_bbox,
+            num_copies,
+            page_size_pts,
             width_px,
             height_px,
             bits_per_color,
@@ -131,6 +261,9 @@ impl PwgRasterHeader {
             color_space,
             num_colors,
             total_pages,
+            cups_integer,
+            rendering_intent,
+            page_size_name,
         })
     }
 }

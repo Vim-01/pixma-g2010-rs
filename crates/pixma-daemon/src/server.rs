@@ -5,7 +5,6 @@ use crate::ipc::{
 };
 use pixma_core::errors::DriverError;
 use pixma_transport::controller::{AnyTransport, G2010Controller};
-use pixma_transport::UsbTransport;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -117,18 +116,9 @@ impl DaemonServer {
                 DaemonRequest::PrintRawStream { data } => {
                     let _guard = arbitrator.acquire(JobLockKind::Printing).await;
                     let mut ctrl = controller.lock().await;
-                    const CHUNK_SIZE: usize = 256 * 1024;
-                    let mut print_err = None;
-                    for chunk in data.chunks(CHUNK_SIZE) {
-                        if let Err(e) = ctrl.transport_mut().write_printer(chunk).await {
-                            print_err = Some(e.to_string());
-                            break;
-                        }
-                    }
-                    if let Some(err) = print_err {
-                        DaemonResponse::PrintResult(Err(err))
-                    } else {
-                        DaemonResponse::PrintResult(Ok(()))
+                    match ctrl.print_raw_stream(&data).await {
+                        Ok(()) => DaemonResponse::PrintResult(Ok(())),
+                        Err(e) => DaemonResponse::PrintResult(Err(e.to_string())),
                     }
                 }
                 DaemonRequest::AcquireScan { params } => {

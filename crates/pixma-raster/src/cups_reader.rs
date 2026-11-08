@@ -5,6 +5,7 @@
 //! CUPS raster streams (`"RaS2"` magic) and image formats (PNG, JPEG, TIFF, WebP).
 
 use crate::errors::RasterError;
+use pixma_core::print_params::PaperSize;
 use pixma_core::safety::MechanicalBounds;
 use pixma_protocol::pwg_raster::{PwgRasterHeader, PWG_HEADER_SIZE, PWG_RASTER_MAGIC};
 
@@ -286,9 +287,8 @@ pub fn parse_image_from_memory(
 pub fn generate_test_print_page(dpi: u32) -> RasterPageInput {
     let dpi = if dpi == 0 { 300 } else { dpi };
 
-    // Standard A4 dimensions in dots: 210mm x 297mm
-    let base_w = ((210.0f32 * dpi as f32) / 25.4 + 0.5) as u32;
-    let base_h = ((297.0f32 * dpi as f32) / 25.4 + 0.5) as u32;
+    // Standard A4 printable area dimensions in dots
+    let (base_w, base_h) = PaperSize::A4.printable_area_dots(dpi, false);
 
     let max_w = MechanicalBounds::max_carriage_dots_for_dpi(dpi).unwrap_or(base_w);
     let max_h = MechanicalBounds::max_page_height_dots_for_dpi(dpi).unwrap_or(base_h);

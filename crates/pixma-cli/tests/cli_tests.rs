@@ -486,12 +486,7 @@ fn test_cli_parse_completions() {
 
     let mut buf = Vec::new();
     let mut cmd = <Cli as clap::CommandFactory>::command();
-    clap_complete::generate(
-        clap_complete::Shell::Bash,
-        &mut cmd,
-        "pixma-cli",
-        &mut buf,
-    );
+    clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "pixma-cli", &mut buf);
     let out = String::from_utf8(buf).expect("Invalid UTF-8");
     assert!(out.contains("_pixma__cli") || out.contains("pixma-cli"));
     assert!(out.contains("nozzle-check"));
