@@ -56,36 +56,26 @@ pub struct StoredScanJob {
 
 /// Shared application state for the eSCL server.
 pub struct EsclServerState {
-    pub controller: Mutex<G2010Controller<AnyTransport>>,
+    pub is_mock: bool,
+    pub controller: Mutex<Option<G2010Controller<AnyTransport>>>,
     pub jobs: RwLock<HashMap<String, StoredScanJob>>,
 }
 
 impl EsclServerState {
-    /// Creates a new server state, choosing mock or physical USB device.
+    /// Creates a new server state. In non-mock mode, USB is opened on-demand per scan job
+    /// so the USB interface and `/tmp/pixma-g2010.lock` are never held while idle.
     pub fn new(mock: bool) -> Self {
-        let is_mock_forced = mock || std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
-        let transport = if is_mock_forced {
-            AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-        } else if let Ok(devs) = discover_canon_devices() {
-            if !devs.is_empty() {
-                match NusbTransport::open_first() {
-                    Ok(u) => AnyTransport::Usb(u),
-                    Err(e) => {
-                        tracing::warn!("Failed to open physical USB: {e}; using mock");
-                        AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-                    }
-                }
-            } else {
-                AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-            }
+        let is_mock = mock || std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
+        let controller = if is_mock {
+            let transport = AnyTransport::Mock(Box::new(MockG2010Transport::new()));
+            let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+            Some(G2010Controller::new(transport, supervisor))
         } else {
-            AnyTransport::Mock(Box::new(MockG2010Transport::new()))
+            None
         };
 
-        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-        let controller = G2010Controller::new(transport, supervisor);
-
         Self {
+            is_mock,
             controller: Mutex::new(controller),
             jobs: RwLock::new(HashMap::new()),
         }
@@ -177,10 +167,36 @@ async fn handle_create_scan_job(
     };
 
     let raw_bytes = {
-        let mut ctrl = state.controller.lock().await;
-        ctrl.acquire_raw_scan(&params)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        let mut guard = state.controller.lock().await;
+        if let Some(ctrl) = guard.as_mut() {
+            ctrl.acquire_raw_scan(&params)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            let transport = if let Ok(devs) = discover_canon_devices() {
+                if !devs.is_empty() {
+                    match NusbTransport::open_first() {
+                        Ok(u) => AnyTransport::Usb(u),
+                        Err(e) => {
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("Failed to open USB scanner: {e}"),
+                            ));
+                        }
+                    }
+                } else {
+                    AnyTransport::Mock(Box::new(MockG2010Transport::new()))
+                }
+            } else {
+                AnyTransport::Mock(Box::new(MockG2010Transport::new()))
+            };
+            let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+            let mut temp_ctrl = G2010Controller::new(transport, supervisor);
+            temp_ctrl
+                .acquire_raw_scan(&params)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
     };
 
     // Reconstruct RGB image

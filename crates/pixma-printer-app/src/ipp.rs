@@ -12,6 +12,8 @@ use thiserror::Error;
 // Operation IDs
 pub const OP_PRINT_JOB: u16 = 0x0002;
 pub const OP_VALIDATE_JOB: u16 = 0x0004;
+pub const OP_CREATE_JOB: u16 = 0x0005;
+pub const OP_SEND_DOCUMENT: u16 = 0x0006;
 pub const OP_CANCEL_JOB: u16 = 0x0008;
 pub const OP_GET_JOB_ATTRIBUTES: u16 = 0x0009;
 pub const OP_GET_JOBS: u16 = 0x000A;
@@ -382,11 +384,12 @@ impl IppResponse {
             IppValue::text(TAG_KEYWORD, state_reason),
         ));
 
-        // 4. document-format-supported: application/pdf, image/pwg-raster, image/png, image/jpeg, application/octet-stream
+        // 4. document-format-supported: application/pdf, application/vnd.cups-pdf, image/pwg-raster, image/png, image/jpeg, application/octet-stream
         resp.add_printer_attribute(IppAttribute::new_set(
             "document-format-supported",
             vec![
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "application/pdf"),
+                IppValue::text(TAG_MIME_MEDIA_TYPE, "application/vnd.cups-pdf"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/pwg-raster"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/png"),
                 IppValue::text(TAG_MIME_MEDIA_TYPE, "image/jpeg"),
@@ -396,6 +399,38 @@ impl IppResponse {
         resp.add_printer_attribute(IppAttribute::new_single(
             "document-format-default",
             IppValue::text(TAG_MIME_MEDIA_TYPE, "application/pdf"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "printer-uri-supported",
+            IppValue::text(TAG_URI, "ipp://127.0.0.1:8631/ipp/print"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "uri-security-supported",
+            IppValue::text(TAG_KEYWORD, "none"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "uri-authentication-supported",
+            IppValue::text(TAG_KEYWORD, "none"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "charset-configured",
+            IppValue::text(TAG_CHARSET, "utf-8"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "charset-supported",
+            IppValue::text(TAG_CHARSET, "utf-8"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "natural-language-configured",
+            IppValue::text(TAG_NATURAL_LANGUAGE, "en-us"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "generated-natural-language-supported",
+            IppValue::text(TAG_NATURAL_LANGUAGE, "en-us"),
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "pdl-override-supported",
+            IppValue::text(TAG_KEYWORD, "attempted"),
         ));
 
         // 5. marker-names
@@ -455,6 +490,8 @@ impl IppResponse {
             vec![
                 IppValue::enumeration(OP_PRINT_JOB as i32),
                 IppValue::enumeration(OP_VALIDATE_JOB as i32),
+                IppValue::enumeration(OP_CREATE_JOB as i32),
+                IppValue::enumeration(OP_SEND_DOCUMENT as i32),
                 IppValue::enumeration(OP_CANCEL_JOB as i32),
                 IppValue::enumeration(OP_GET_JOB_ATTRIBUTES as i32),
                 IppValue::enumeration(OP_GET_JOBS as i32),
@@ -477,7 +514,44 @@ impl IppResponse {
         resp
     }
 
-    /// Builds a `Print-Job` response with job-id and job-state attributes.
+    /// Builds a `Create-Job` response with job-id, job-uri, and pending/processing job-state.
+    pub fn build_create_job_response(
+        version_major: u8,
+        version_minor: u8,
+        request_id: u32,
+        job_id: i32,
+    ) -> Self {
+        let mut resp = Self::new(
+            version_major,
+            version_minor,
+            STATUS_SUCCESSFUL_OK,
+            request_id,
+        );
+
+        resp.add_job_attribute(IppAttribute::new_single(
+            "job-id",
+            IppValue::integer(job_id),
+        ));
+        resp.add_job_attribute(IppAttribute::new_single(
+            "job-uri",
+            IppValue::text(
+                TAG_URI,
+                &format!("ipp://127.0.0.1:8631/ipp/print/jobs/{job_id}"),
+            ),
+        ));
+        resp.add_job_attribute(IppAttribute::new_single(
+            "job-state",
+            IppValue::enumeration(JOB_STATE_PROCESSING),
+        ));
+        resp.add_job_attribute(IppAttribute::new_single(
+            "job-state-reasons",
+            IppValue::text(TAG_KEYWORD, "job-incoming"),
+        ));
+
+        resp
+    }
+
+    /// Builds a `Print-Job` / `Send-Document` response with job-id, job-uri, and completed job-state.
     pub fn build_print_job_response(
         version_major: u8,
         version_minor: u8,
@@ -494,6 +568,13 @@ impl IppResponse {
         resp.add_job_attribute(IppAttribute::new_single(
             "job-id",
             IppValue::integer(job_id),
+        ));
+        resp.add_job_attribute(IppAttribute::new_single(
+            "job-uri",
+            IppValue::text(
+                TAG_URI,
+                &format!("ipp://127.0.0.1:8631/ipp/print/jobs/{job_id}"),
+            ),
         ));
         resp.add_job_attribute(IppAttribute::new_single(
             "job-state",

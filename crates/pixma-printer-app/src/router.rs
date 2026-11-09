@@ -2,12 +2,13 @@
 //! and JSON REST management APIs for the Canon PIXMA G2010.
 
 use crate::ipp::{
-    IppRequest, IppResponse, OP_CANCEL_JOB, OP_GET_JOBS, OP_GET_JOB_ATTRIBUTES,
-    OP_GET_PRINTER_ATTRIBUTES, OP_PRINT_JOB, OP_VALIDATE_JOB, STATUS_CLIENT_ERROR_BAD_REQUEST,
-    STATUS_SERVER_ERROR_INTERNAL, STATUS_SERVER_ERROR_NOT_SUPPORTED,
+    IppRequest, IppResponse, OP_CANCEL_JOB, OP_CREATE_JOB, OP_GET_JOBS, OP_GET_JOB_ATTRIBUTES,
+    OP_GET_PRINTER_ATTRIBUTES, OP_PRINT_JOB, OP_SEND_DOCUMENT, OP_VALIDATE_JOB,
+    STATUS_CLIENT_ERROR_BAD_REQUEST, STATUS_SERVER_ERROR_INTERNAL,
+    STATUS_SERVER_ERROR_NOT_SUPPORTED,
 };
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -73,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         // REST management endpoints
         .route("/api/status", get(handle_get_status))
         .route("/api/maintenance", post(handle_post_maintenance))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
@@ -91,9 +93,10 @@ async fn handle_ipp_request(
     };
 
     tracing::info!(
-        "Received IPP request: op_id={:#06x}, req_id={}",
+        "Received IPP request: op_id={:#06x}, req_id={}, payload_bytes={}",
         req.operation_id,
-        req.request_id
+        req.request_id,
+        req.data.len()
     );
 
     let resp_bytes = match req.operation_id {
@@ -102,10 +105,9 @@ async fn handle_ipp_request(
             let status = if let Some(client) = guard.as_mut() {
                 client.get_status().await.unwrap_or_default()
             } else {
-                match DaemonClient::connect_or_fallback(None, None).await {
-                    Ok(mut temp_client) => temp_client.get_status().await.unwrap_or_default(),
-                    Err(_) => DeviceStatus::default(),
-                }
+                // In on-demand USB mode, return Idle capabilities immediately without
+                // claiming USB so CUPS pre-job attribute polling is instant and lock-free.
+                DeviceStatus::default()
             };
             let resp = IppResponse::build_printer_attributes(
                 req.version_major,
@@ -126,8 +128,29 @@ async fn handle_ipp_request(
             resp.to_bytes()
         }
 
-        OP_PRINT_JOB => {
+        OP_CREATE_JOB => {
+            let job_id = state.job_counter.fetch_add(1, Ordering::SeqCst) as i32;
+            let resp = IppResponse::build_create_job_response(
+                req.version_major,
+                req.version_minor,
+                req.request_id,
+                job_id,
+            );
+            resp.to_bytes()
+        }
+
+        OP_PRINT_JOB | OP_SEND_DOCUMENT => {
             if req.data.is_empty() {
+                if req.operation_id == OP_SEND_DOCUMENT {
+                    let job_id = state.job_counter.load(Ordering::SeqCst) as i32;
+                    let resp = IppResponse::build_print_job_response(
+                        req.version_major,
+                        req.version_minor,
+                        req.request_id,
+                        job_id,
+                    );
+                    return Ok(ipp_binary_response(resp.to_bytes()));
+                }
                 let resp = IppResponse::new(
                     req.version_major,
                     req.version_minor,
@@ -137,11 +160,16 @@ async fn handle_ipp_request(
                 return Ok(ipp_binary_response(resp.to_bytes()));
             }
 
-            let job_id = state.job_counter.fetch_add(1, Ordering::SeqCst) as i32;
+            let job_id = if req.operation_id == OP_PRINT_JOB {
+                state.job_counter.fetch_add(1, Ordering::SeqCst) as i32
+            } else {
+                state.job_counter.load(Ordering::SeqCst).max(1) as i32
+            };
 
-            // Ingest PWG raster, multi-page PDF, or standard image at 600 DPI
+            // Ingest PWG raster, multi-page PDF, or standard image at 300 DPI
+            // (upscaled on-the-fly to 600x600 DPI hardware BJRaster3 during halftoning)
             let pages: Result<Vec<RasterPageInput>, _> =
-                parse_document_from_memory(&req.data, Some(600));
+                parse_document_from_memory(&req.data, Some(300));
 
             let pages = match pages {
                 Ok(p) if !p.is_empty() => p,
