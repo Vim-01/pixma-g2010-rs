@@ -55,7 +55,16 @@ pub enum AppMsg {
     TriggerTestPrint(TestPrintType),
     TriggerApplyAlignment,
     TriggerScan,
-    ScanCompleted(Result<(usize, Option<std::path::PathBuf>), String>),
+    ScanCompleted(
+        Result<
+            (
+                usize,
+                Option<std::path::PathBuf>,
+                Option<std::path::PathBuf>,
+            ),
+            String,
+        >,
+    ),
     OpenScannedDocument,
 
     // Task completions
@@ -1339,17 +1348,24 @@ impl SimpleComponent for AppModel {
                 let mut vm_clone = self.vm.clone();
                 let s = sender.clone();
                 tokio::spawn(async move {
-                    let res: Result<(usize, Option<std::path::PathBuf>), String> = async {
+                    let res: Result<
+                        (
+                            usize,
+                            Option<std::path::PathBuf>,
+                            Option<std::path::PathBuf>,
+                        ),
+                        String,
+                    > = async {
                         if let Some(arc) = client_arc {
                             let mut guard = arc.lock().await;
                             let pages = vm_clone.dispatch_scan(&mut guard).await?;
-                            Ok((pages.len(), vm_clone.last_scan_path))
+                            Ok((pages.len(), vm_clone.last_scan_path, vm_clone.last_scan_thumb))
                         } else {
                             let mut c = DaemonClient::connect_or_fallback(None, None)
                                 .await
                                 .map_err(|e| e.to_string())?;
                             let pages = vm_clone.dispatch_scan(&mut c).await?;
-                            Ok((pages.len(), vm_clone.last_scan_path))
+                            Ok((pages.len(), vm_clone.last_scan_path, vm_clone.last_scan_thumb))
                         }
                     }
                     .await;
@@ -1361,8 +1377,9 @@ impl SimpleComponent for AppModel {
             AppMsg::ScanCompleted(result) => {
                 self.vm.is_busy = false;
                 match result {
-                    Ok((count, path_opt)) => {
+                    Ok((count, path_opt, thumb_opt)) => {
                         self.vm.last_scan_path = path_opt.clone();
+                        self.vm.last_scan_thumb = thumb_opt;
                         let path_str = path_opt
                             .as_ref()
                             .map(|p| format!("Saved to {}", p.display()))
@@ -1468,9 +1485,14 @@ impl SimpleComponent for AppModel {
         } else {
             widgets.scan_spinner.stop();
         }
-        if let Some(path) = &self.vm.last_scan_path {
+        if let Some(thumb) = &self.vm.last_scan_thumb {
+            widgets.scan_preview_picture.set_filename(Some(thumb));
+            widgets.scan_preview_picture.set_visible(true);
+        } else if let Some(path) = &self.vm.last_scan_path {
             widgets.scan_preview_picture.set_filename(Some(path));
             widgets.scan_preview_picture.set_visible(true);
+        }
+        if let Some(path) = &self.vm.last_scan_path {
             widgets
                 .scan_result_row
                 .set_title("Scan Acquired & Exported Successfully");

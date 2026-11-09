@@ -47,6 +47,8 @@ pub struct StudioViewModel {
     pub is_busy: bool,
     /// Absolute filesystem path to the most recently exported scan image, if any.
     pub last_scan_path: Option<std::path::PathBuf>,
+    /// Lightweight downscaled thumbnail path for non-blocking GTK preview.
+    pub last_scan_thumb: Option<std::path::PathBuf>,
 }
 
 impl Default for StudioViewModel {
@@ -68,6 +70,7 @@ impl Default for StudioViewModel {
             last_error: None,
             is_busy: false,
             last_scan_path: None,
+            last_scan_thumb: None,
         }
     }
 }
@@ -515,9 +518,22 @@ impl StudioViewModel {
             } else {
                 format!("scan_{epoch}_page{}.png", idx + 1)
             };
-            let path = scans_dir.join(filename);
+            let path = scans_dir.join(&filename);
             let _ = img.save(&path);
             self.last_scan_path = Some(path);
+
+            // Also save lightweight downscaled thumbnail for instant GTK preview
+            let thumb_path = scans_dir.join(format!(".thumb_{filename}"));
+            let thumb_w = 512u32;
+            let thumb_h = ((img.height() as f32 / img.width() as f32) * thumb_w as f32).max(1.0) as u32;
+            let thumb = image::imageops::resize(
+                img,
+                thumb_w,
+                thumb_h,
+                image::imageops::FilterType::Nearest,
+            );
+            let _ = thumb.save(&thumb_path);
+            self.last_scan_thumb = Some(thumb_path);
         }
 
         self.is_busy = false;

@@ -511,6 +511,68 @@ impl IppResponse {
             IppValue::boolean(true),
         ));
 
+        // Standard IPP Page Orientation (Portrait, Landscape, Reverse-Landscape, Reverse-Portrait)
+        // Enables application orientation selectors in OnlyOffice, LibreOffice, Chromium, and Qt/KDE
+        resp.add_printer_attribute(IppAttribute::new_set(
+            "orientation-requested-supported",
+            vec![
+                IppValue::enumeration(3), // portrait
+                IppValue::enumeration(4), // landscape
+                IppValue::enumeration(5), // reverse-landscape
+                IppValue::enumeration(6), // reverse-portrait
+            ],
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "orientation-requested-default",
+            IppValue::enumeration(3),
+        ));
+
+        // Supported media paper sizes
+        resp.add_printer_attribute(IppAttribute::new_set(
+            "media-supported",
+            vec![
+                IppValue::text(TAG_KEYWORD, "iso_a4_210x297mm"),
+                IppValue::text(TAG_KEYWORD, "na_letter_8.5x11in"),
+                IppValue::text(TAG_KEYWORD, "na_legal_8.5x14in"),
+                IppValue::text(TAG_KEYWORD, "iso_a5_148x210mm"),
+                IppValue::text(TAG_KEYWORD, "jis_b5_182x257mm"),
+                IppValue::text(TAG_KEYWORD, "na_index-4x6_4x6in"),
+                IppValue::text(TAG_KEYWORD, "na_5x7_5x7in"),
+            ],
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "media-default",
+            IppValue::text(TAG_KEYWORD, "iso_a4_210x297mm"),
+        ));
+
+        // Supported color modes
+        resp.add_printer_attribute(IppAttribute::new_set(
+            "print-color-mode-supported",
+            vec![
+                IppValue::text(TAG_KEYWORD, "color"),
+                IppValue::text(TAG_KEYWORD, "monochrome"),
+            ],
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "print-color-mode-default",
+            IppValue::text(TAG_KEYWORD, "color"),
+        ));
+
+        // Simplex only for Canon G2010 (manual duplex supported host-side)
+        resp.add_printer_attribute(IppAttribute::new_set(
+            "sides-supported",
+            vec![IppValue::text(TAG_KEYWORD, "one-sided")],
+        ));
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "sides-default",
+            IppValue::text(TAG_KEYWORD, "one-sided"),
+        ));
+
+        resp.add_printer_attribute(IppAttribute::new_single(
+            "copies-default",
+            IppValue::integer(1),
+        ));
+
         resp
     }
 

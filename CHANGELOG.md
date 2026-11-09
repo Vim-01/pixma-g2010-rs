@@ -1,5 +1,20 @@
 # Changelog
 
+## [v0.2.3] - 2026-11-09
+
+### BJR520 Firmware Table Restoration, IPP Orientation Support & 1200 DPI Optical Sensor Mapping
+
+#### Fixed
+- **BJR520 Firmware Descriptor Restoration (`ESC ( t`)**:
+  - Reverted modified `ESC ( t` descriptors back to the Canon G2010 firmware-hardcoded 24-byte table (`01 00 02 02 00 03 02 00 03 01 00 02`). Reverse-engineering of `cnm_0520.dll` confirmed that Slot 0 represents the physical Black head (BH-4, 1-bpp), Slot 1/2 represent Cyan/Magenta (2-bpp), and Slot 3 represents Yellow (1-bpp). Restoring this exact byte layout fixes the bug where jobs submitted to the printer were silently dropped without paper feed.
+- **IPP Page Orientation & Capabilities in OnlyOffice / KDE (`orientation-requested-supported`)**:
+  - Added standard IPP 2.0 attributes `orientation-requested-supported: [3, 4, 5, 6]` (Portrait, Landscape, Reverse-Landscape, Reverse-Portrait) and `orientation-requested-default: 3` to `build_printer_attributes`.
+  - Added standard `media-supported`, `print-color-mode-supported`, `sides-supported`, and `copies-default` IPP attributes. This unlocks grayed-out orientation dropdowns in OnlyOffice, LibreOffice, Chromium, and KDE print dialogs.
+- **1200 DPI Scanner Support (Physical 600 DPI CIS Sensor Mapping)**:
+  - Addressed the hardware constraint where Canon G2010 flatbed CIS sensor features 600 optical photodiodes per inch horizontally. When 1200 DPI is requested, `acquire_raw_scan` executes a native 600 DPI optical capture on the hardware and performs 2x subpixel bilinear upscale to deliver exact 1200 DPI output without ASIC command rejection (`0xD820`).
+- **ScanGear Pro Non-Blocking GUI Preview**:
+  - Automatically generates and caches lightweight downscaled preview thumbnails (`.thumb_scan_*.png`) for `gtk::Picture`, preventing GTK main-thread freezes when loading full-resolution 600 DPI (105 MB) and 1200 DPI scans.
+
 ## [v0.2.2] - 2026-11-09
 
 ### Landscape Auto-Orientation, BJRaster3 Cyan Fix & ScanGear Pro GUI Export

@@ -445,6 +445,27 @@ impl<T: UsbTransport> G2010Controller<T> {
             .validate(params.resolution)
             .map_err(DriverError::HardwareConstraint)?;
 
+        // If 1200 DPI is requested, translate to native 600 DPI hardware scan
+        // (Canon PIXMA G2010 CIS flatbed optical resolution is natively 600 DPI horizontal).
+        // The acquired 600 DPI buffer is then 2x interpolated up to 1200 DPI.
+        let is_1200 = params.resolution == pixma_core::scan_params::ScanResolution::Dpi1200;
+        let hw_params = if is_1200 {
+            let mut p = params.clone();
+            p.resolution = pixma_core::scan_params::ScanResolution::Dpi600;
+            p.geometry.x_offset /= 2;
+            p.geometry.y_offset /= 2;
+            p.geometry.width /= 2;
+            p.geometry.height /= 2;
+            p
+        } else {
+            params.clone()
+        };
+
+        hw_params
+            .geometry
+            .validate(hw_params.resolution)
+            .map_err(DriverError::HardwareConstraint)?;
+
         let scan_job_id = self.next_job_id();
         let mut rx_buf = [0u8; 1024];
 
@@ -519,7 +540,7 @@ impl<T: UsbTransport> G2010Controller<T> {
         // 5. SetScanParameter (0xD820, 72 bytes)
         tracing::info!("acquire_raw_scan: Step 5 SetScanParameter");
         let cmd =
-            build_set_scan_parameter(params).map_err(|e| DriverError::Protocol(e.to_string()))?;
+            build_set_scan_parameter(&hw_params).map_err(|e| DriverError::Protocol(e.to_string()))?;
         self.transport.write_scanner(&cmd).await?;
         let n = self.transport.read_scanner(&mut rx_buf).await?;
         tracing::info!(
@@ -577,11 +598,11 @@ impl<T: UsbTransport> G2010Controller<T> {
         }
 
         // 8. Loop ReadScanChunk (0xD420)
-        let raw_width = aligned_scan_width(params) as usize;
-        let target_width = params.geometry.width as usize;
-        let xs = (params.geometry.x_offset & 31) as usize;
-        let bpp = params.color_mode.bytes_per_pixel();
-        let height = params.geometry.height as usize;
+        let raw_width = aligned_scan_width(&hw_params) as usize;
+        let target_width = hw_params.geometry.width as usize;
+        let xs = (hw_params.geometry.x_offset & 31) as usize;
+        let bpp = hw_params.color_mode.bytes_per_pixel();
+        let height = hw_params.geometry.height as usize;
         let target_raw_bytes = raw_width * height * bpp;
 
         let mut accumulated_bytes = Vec::with_capacity(target_raw_bytes);
@@ -682,6 +703,60 @@ impl<T: UsbTransport> G2010Controller<T> {
         let _ = self.transport.write_scanner(end_job.as_bytes()).await;
         let _ = self.transport.read_scanner(&mut rx_buf).await;
 
+        // 12. If 1200 DPI was requested, perform 2x bilinear upscale from 600 DPI hardware scan
+        if is_1200 {
+            accumulated_bytes = upscale_2x_bilinear(
+                &accumulated_bytes,
+                hw_params.geometry.width as usize,
+                hw_params.geometry.height as usize,
+                bpp,
+            );
+        }
+
         Ok(accumulated_bytes)
     }
+}
+
+/// Upscales an interleaved raw pixel buffer (1-bpp grayscale or 3-bpp RGB)
+/// by exactly 2x in width and height using bilinear interpolation.
+pub fn upscale_2x_bilinear(src: &[u8], src_w: usize, src_h: usize, bpp: usize) -> Vec<u8> {
+    let dst_w = src_w * 2;
+    let dst_h = src_h * 2;
+    let mut dst = vec![0u8; dst_w * dst_h * bpp];
+    let src_stride = src_w * bpp;
+    let dst_stride = dst_w * bpp;
+
+    for y in 0..src_h {
+        let y_next = (y + 1).min(src_h.saturating_sub(1));
+        let src_row0 = &src[y * src_stride..(y + 1) * src_stride];
+        let src_row1 = &src[y_next * src_stride..(y_next + 1) * src_stride];
+        let dst_row0_idx = (y * 2) * dst_stride;
+        let dst_row1_idx = (y * 2 + 1) * dst_stride;
+
+        for x in 0..src_w {
+            let x_next = (x + 1).min(src_w.saturating_sub(1));
+            let p00 = x * bpp;
+            let p10 = x_next * bpp;
+
+            let out_x0 = (x * 2) * bpp;
+            let out_x1 = (x * 2 + 1) * bpp;
+
+            for c in 0..bpp {
+                let v00 = src_row0[p00 + c] as u16;
+                let v10 = src_row0[p10 + c] as u16;
+                let v01 = src_row1[p00 + c] as u16;
+                let v11 = src_row1[p10 + c] as u16;
+
+                // (2x, 2y)
+                dst[dst_row0_idx + out_x0 + c] = v00 as u8;
+                // (2x+1, 2y)
+                dst[dst_row0_idx + out_x1 + c] = ((v00 + v10 + 1) / 2) as u8;
+                // (2x, 2y+1)
+                dst[dst_row1_idx + out_x0 + c] = ((v00 + v01 + 1) / 2) as u8;
+                // (2x+1, 2y+1)
+                dst[dst_row1_idx + out_x1 + c] = ((v00 + v10 + v01 + v11 + 2) / 4) as u8;
+            }
+        }
+    }
+    dst
 }
