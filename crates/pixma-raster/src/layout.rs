@@ -71,6 +71,34 @@ pub fn apply_borderless_extension(
     }
 }
 
+/// Rotates a raster page 90 degrees counter-clockwise (converts Landscape to narrow-edge Portrait feed).
+pub fn rotate_page_90_counter_clockwise(page: &RasterPageInput) -> RasterPageInput {
+    let src_w = page.width as usize;
+    let src_h = page.height as usize;
+    let mut out_pixels = vec![0u8; src_w * src_h * 3];
+
+    for y in 0..src_h {
+        let src_row = y * src_w * 3;
+        for x in 0..src_w {
+            let src_idx = src_row + x * 3;
+            // Counter-clockwise: new_x = y, new_y = src_w - 1 - x
+            let dst_x = y;
+            let dst_y = src_w - 1 - x;
+            let dst_idx = (dst_y * src_h + dst_x) * 3;
+            out_pixels[dst_idx] = page.rgb_pixels[src_idx];
+            out_pixels[dst_idx + 1] = page.rgb_pixels[src_idx + 1];
+            out_pixels[dst_idx + 2] = page.rgb_pixels[src_idx + 2];
+        }
+    }
+
+    RasterPageInput {
+        width: page.height,
+        height: page.width,
+        dpi: page.dpi,
+        rgb_pixels: out_pixels,
+    }
+}
+
 /// Applies the requested Canon MP driver page layout to an input document page sequence.
 pub fn apply_page_layout(
     pages: &[RasterPageInput],
@@ -88,19 +116,35 @@ pub fn apply_page_layout(
         });
     }
 
+    // Step A: Auto-orientation alignment
+    // If the page aspect orientation (Landscape vs Portrait) does not match the hardware paper feed,
+    // auto-rotate by 90 degrees counter-clockwise so the content correctly matches the paper.
+    let target_is_landscape = target_width > target_height;
+    let oriented_pages: Vec<RasterPageInput> = pages
+        .iter()
+        .map(|p| {
+            let page_is_landscape = p.width > p.height;
+            if page_is_landscape != target_is_landscape {
+                rotate_page_90_counter_clockwise(p)
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+
     match layout {
-        PageLayout::Normal => layout_normal(pages, target_width, target_height),
-        PageLayout::FitToPage => layout_fit_to_page(pages, target_width, target_height),
+        PageLayout::Normal => layout_normal(&oriented_pages, target_width, target_height),
+        PageLayout::FitToPage => layout_fit_to_page(&oriented_pages, target_width, target_height),
         PageLayout::Scaled { percent } => {
-            layout_scaled(pages, percent, target_width, target_height)
+            layout_scaled(&oriented_pages, percent, target_width, target_height)
         }
         PageLayout::NUp { pages_per_sheet } => {
-            layout_nup(pages, pages_per_sheet, target_width, target_height)
+            layout_nup(&oriented_pages, pages_per_sheet, target_width, target_height)
         }
         PageLayout::Poster { rows, cols } => {
-            layout_poster(pages, rows, cols, target_width, target_height)
+            layout_poster(&oriented_pages, rows, cols, target_width, target_height)
         }
-        PageLayout::Booklet => layout_booklet(pages, target_width, target_height),
+        PageLayout::Booklet => layout_booklet(&oriented_pages, target_width, target_height),
     }
 }
 
@@ -118,11 +162,30 @@ fn layout_normal(
         if page.width == target_w && page.height == target_h {
             out.push(page.clone());
         } else {
-            let mut sheet = RasterPageInput::new_blank(target_w, target_h, page.dpi);
-            let offset_x = (target_w as i32 - page.width as i32) / 2;
-            let offset_y = (target_h as i32 - page.height as i32) / 2;
-            blit_image(&mut sheet, page, offset_x, offset_y);
-            out.push(sheet);
+            // Check if page represents a full document sheet that should fit the printable area:
+            // If the document is larger than printable area, OR if it matches the paper size
+            // within standard page margins (scale between 0.70 and 1.35), scale proportionally
+            // to fit printable area so headers, footers and thin vector lines are never clipped!
+            let scale_w = target_w as f32 / page.width as f32;
+            let scale_h = target_h as f32 / page.height as f32;
+            let scale = scale_w.min(scale_h);
+
+            if scale < 1.0 || (scale - 1.0).abs() < 0.35 {
+                let fit_w = ((page.width as f32 * scale + 0.5) as u32).max(1);
+                let fit_h = ((page.height as f32 * scale + 0.5) as u32).max(1);
+                let resized = resize_bilinear(page, fit_w, fit_h)?;
+                let mut sheet = RasterPageInput::new_blank(target_w, target_h, page.dpi);
+                let offset_x = (target_w as i32 - fit_w as i32) / 2;
+                let offset_y = (target_h as i32 - fit_h as i32) / 2;
+                blit_image(&mut sheet, &resized, offset_x, offset_y);
+                out.push(sheet);
+            } else {
+                let mut sheet = RasterPageInput::new_blank(target_w, target_h, page.dpi);
+                let offset_x = (target_w as i32 - page.width as i32) / 2;
+                let offset_y = (target_h as i32 - page.height as i32) / 2;
+                blit_image(&mut sheet, page, offset_x, offset_y);
+                out.push(sheet);
+            }
         }
     }
     Ok(out)
@@ -738,5 +801,16 @@ mod tests {
             assert_eq!(side.width, 400);
             assert_eq!(side.height, 300);
         }
+    }
+
+    #[test]
+    fn test_layout_auto_orientation_landscape_to_portrait() {
+        // Landscape input: 120 width x 80 height
+        let page = create_test_pattern(120, 80);
+        // Portrait feed: 100 width x 200 height
+        let result = apply_page_layout(&[page], PageLayout::Normal, 100, 200).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].width, 100);
+        assert_eq!(result[0].height, 200);
     }
 }

@@ -196,15 +196,21 @@ impl BjRaster3Encoder {
         buf.extend_from_slice(&[0x1b, b'(', b'd', 0x04, 0x00, 0x02, 0x58, 0x02, 0x58]);
 
         // ESC ( t (len=24): Image bit-depth and level descriptor table
-        // Slot 0 (K): 1-bpp, 2 levels (01 00 02)
-        // Slot 1 (C): 2-bpp, 3 levels (02 00 03)
-        // Slot 2 (M): 2-bpp, 3 levels (02 00 03)
-        // Slot 3 (Y): 1-bpp, 2 levels (01 00 02)
-        buf.extend_from_slice(&[
-            0x1b, b'(', b't', 0x18, 0x00, 0x80, 0x80, 0x01, 0x01, 0x00, 0x02, 0x02, 0x00, 0x03,
-            0x02, 0x00, 0x03, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
-        ]);
+        // Matches plane sequence in ESC ( L ("K" for monochrome, "CMYK" for color)
+        let esc_t_slots: &[u8] = if config.color.grayscale {
+            // Monochrome (1 plane: K = Slot 0, 1-bpp, 2 levels)
+            &[
+                0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        } else {
+            // Color (4 planes: Slot 0 = C (2-bpp), Slot 1 = M (2-bpp), Slot 2 = Y (1-bpp), Slot 3 = K (1-bpp))
+            &[
+                0x02, 0x00, 0x03, 0x02, 0x00, 0x03, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02,
+            ]
+        };
+        buf.extend_from_slice(&[0x1b, b'(', b't', 0x18, 0x00, 0x80, 0x80, 0x01]);
+        buf.extend_from_slice(esc_t_slots);
+        buf.extend_from_slice(&[0x00; 9]);
 
         // ESC ( c (len=3): Color/Monochrome + media + quality
         let color_byte = if config.color.grayscale { 0x31 } else { 0x30 };

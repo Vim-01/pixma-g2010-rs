@@ -166,10 +166,28 @@ async fn handle_ipp_request(
                 state.job_counter.load(Ordering::SeqCst).max(1) as i32
             };
 
-            // Ingest PWG raster, multi-page PDF, or standard image at 300 DPI
-            // (upscaled on-the-fly to 600x600 DPI hardware BJRaster3 during halftoning)
+            let mut config = PrintJobConfig {
+                job_id: job_id as u32,
+                ..Default::default()
+            };
+            // Honor IPP print-color-mode="monochrome" if requested
+            if let Some(attr) = req
+                .job_attributes
+                .iter()
+                .chain(req.operation_attributes.iter())
+                .find(|a| a.name().eq_ignore_ascii_case("print-color-mode"))
+            {
+                if let Some(val) = attr.first_value().and_then(|v| v.as_str()) {
+                    if val.contains("monochrome") || val.contains("gray") {
+                        config.color.grayscale = true;
+                    }
+                }
+            }
+
+            // Ingest PWG raster, multi-page PDF, or standard image at target hardware base DPI
+            let target_dpi = config.quality.base_raster_dpi();
             let pages: Result<Vec<RasterPageInput>, _> =
-                parse_document_from_memory(&req.data, Some(300));
+                parse_document_from_memory(&req.data, Some(target_dpi));
 
             let pages = match pages {
                 Ok(p) if !p.is_empty() => p,
@@ -193,24 +211,6 @@ async fn handle_ipp_request(
                     return Ok(ipp_binary_response(resp.to_bytes()));
                 }
             };
-
-            let mut config = PrintJobConfig {
-                job_id: job_id as u32,
-                ..Default::default()
-            };
-            // Honor IPP print-color-mode="monochrome" if requested
-            if let Some(attr) = req
-                .job_attributes
-                .iter()
-                .chain(req.operation_attributes.iter())
-                .find(|a| a.name().eq_ignore_ascii_case("print-color-mode"))
-            {
-                if let Some(val) = attr.first_value().and_then(|v| v.as_str()) {
-                    if val.contains("monochrome") || val.contains("gray") {
-                        config.color.grayscale = true;
-                    }
-                }
-            }
 
             let timestamp = format_timestamp_now();
             let job_stream = match PrintRasterPipeline::compile_ivec_bjraster3_job(

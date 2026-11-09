@@ -18,9 +18,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let client = pixma_daemon::DaemonClient::connect_or_fallback(None, None)
-        .await
-        .ok();
+    let client = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        pixma_daemon::DaemonClient::connect_or_fallback(None, None),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
 
     let app = RelmApp::new("io.github.vim01.pixma_studio");
     app.run::<AppModel>(client);

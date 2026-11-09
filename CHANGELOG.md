@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.2.2] - 2026-11-09
+
+### Landscape Auto-Orientation, BJRaster3 Cyan Fix & ScanGear Pro GUI Export
+
+#### Fixed
+- **BJRaster3 `ESC ( t` Bit-Depth Descriptor Table Inversion (Cyan / Blue Lines)**:
+  - Corrected plane bit-depth descriptors in `encode_bjr520_prologue` to strictly match `ESC ( L` (`"CMYK"`): Slot 0 (Cyan) is now 2-bpp (`02 00 03`) and Slot 2 (Yellow) is 1-bpp (`01 00 02`). Previously, Cyan was assigned 1-bpp while 2-bpp data was streamed, causing buffer overflow and completely dropping Cyan ink (which erased blue grids, flooded zone hatching, and blue dashed lines).
+- **Auto-Orientation & Full-Page Scaling (Landscape to Portrait Feed)**:
+  - Added automatic 90-degree counter-clockwise orientation alignment in `apply_page_layout`: when document orientation (Landscape, width > height) does not match the printer's narrow-edge physical feed (Portrait, width < height), the page is rotated automatically to fill the entire physical A4 sheet.
+  - Added proportional printable-area scaling in `layout_normal` for full-page documents, fixing the bug where vector documents rendered at a different DPI were shrunk into a half-sized box in the center of the sheet.
+  - Set `pixma-printer-app` to ingest and render PDFs at the printer's native 600 DPI hardware grid (`base_raster_dpi()`), ensuring high-DPI vector precision and crisp rendering of 0.5-pt dashed lines.
+- **ScanGear Pro GUI Export & Preview (`pixma-studio`)**:
+  - Automatically exports acquired scans to `~/Pictures/Scans/scan_<timestamp>.png`.
+  - Added live document preview in the ScanGear Pro tab (`gtk::Picture`) immediately upon scan completion.
+  - Added an "Open in Viewer" button (`xdg-open`) and interactive spinner (`gtk::Spinner`) that disables action buttons while hardware scanning is active.
+  - Made hardware connections in `pixma-studio` non-blocking and on-demand, preventing startup deadlocks on `/tmp/pixma-g2010.lock`.
+
 ## [v0.2.1] - 2026-11-09
 
 ### CUPS IPP 2.0 Printing & USB Lock Concurrency Hotfix

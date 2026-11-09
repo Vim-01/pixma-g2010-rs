@@ -45,6 +45,8 @@ pub struct StudioViewModel {
     pub last_error: Option<String>,
     /// Busy indicator flag during active hardware operations.
     pub is_busy: bool,
+    /// Absolute filesystem path to the most recently exported scan image, if any.
+    pub last_scan_path: Option<std::path::PathBuf>,
 }
 
 impl Default for StudioViewModel {
@@ -65,6 +67,7 @@ impl Default for StudioViewModel {
             status_banner: String::from("Device Ready"),
             last_error: None,
             is_busy: false,
+            last_scan_path: None,
         }
     }
 }
@@ -496,6 +499,26 @@ impl StudioViewModel {
         };
 
         let processed = execute_scan_pipeline(raw_img, &scan_params).map_err(|e| e.to_string())?;
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let scans_dir = std::path::PathBuf::from(home).join("Pictures").join("Scans");
+        let _ = std::fs::create_dir_all(&scans_dir);
+
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (idx, img) in processed.iter().enumerate() {
+            let filename = if processed.len() == 1 {
+                format!("scan_{epoch}.png")
+            } else {
+                format!("scan_{epoch}_page{}.png", idx + 1)
+            };
+            let path = scans_dir.join(filename);
+            let _ = img.save(&path);
+            self.last_scan_path = Some(path);
+        }
 
         self.is_busy = false;
         self.last_error = None;

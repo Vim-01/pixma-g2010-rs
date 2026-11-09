@@ -55,6 +55,8 @@ pub enum AppMsg {
     TriggerTestPrint(TestPrintType),
     TriggerApplyAlignment,
     TriggerScan,
+    ScanCompleted(Result<(usize, Option<std::path::PathBuf>), String>),
+    OpenScannedDocument,
 
     // Task completions
     HardwareTaskFinished(Result<String, String>),
@@ -92,6 +94,13 @@ pub struct AppWidgets {
     pub black_cartridge_row: adw::ActionRow,
     pub color_cartridge_row: adw::ActionRow,
     pub diagnostic_banner_row: adw::ActionRow,
+
+    // ScanGear Pro
+    pub scan_btn: gtk::Button,
+    pub scan_spinner: gtk::Spinner,
+    pub scan_preview_picture: gtk::Picture,
+    pub scan_result_row: adw::ActionRow,
+    pub scan_open_btn: gtk::Button,
 
     // Global
     pub toast_overlay: adw::ToastOverlay,
@@ -808,16 +817,52 @@ impl SimpleComponent for AppModel {
 
         scan_box.append(&filter_group);
 
+        let scan_action_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        scan_action_box.set_margin_top(8);
         let btn_scan = gtk::Button::builder()
             .label("Acquire Scan Document & Export")
             .css_classes(["suggested-action", "pill"])
-            .margin_top(8)
+            .hexpand(true)
             .build();
+        let scan_spinner = gtk::Spinner::new();
+
         let s_scan = sender.clone();
         btn_scan.connect_clicked(move |_| {
             s_scan.input(AppMsg::TriggerScan);
         });
-        scan_box.append(&btn_scan);
+        scan_action_box.append(&btn_scan);
+        scan_action_box.append(&scan_spinner);
+        scan_box.append(&scan_action_box);
+
+        let scan_result_group = adw::PreferencesGroup::builder()
+            .title("Acquired Scan Document Preview")
+            .build();
+
+        let scan_result_row = adw::ActionRow::builder()
+            .title("No document acquired yet")
+            .subtitle("Scans will be saved to ~/Pictures/Scans/ and previewed here")
+            .build();
+
+        let scan_open_btn = gtk::Button::builder()
+            .label("Open in Viewer")
+            .css_classes(["pill"])
+            .visible(false)
+            .build();
+        let s_open = sender.clone();
+        scan_open_btn.connect_clicked(move |_| {
+            s_open.input(AppMsg::OpenScannedDocument);
+        });
+        scan_result_row.add_suffix(&scan_open_btn);
+        scan_result_group.add(&scan_result_row);
+        scan_box.append(&scan_result_group);
+
+        let scan_preview_picture = gtk::Picture::builder()
+            .can_shrink(true)
+            .vexpand(true)
+            .height_request(280)
+            .visible(false)
+            .build();
+        scan_box.append(&scan_preview_picture);
 
         let scan_scroll = gtk::ScrolledWindow::builder()
             .child(&scan_box)
@@ -975,6 +1020,11 @@ impl SimpleComponent for AppModel {
             black_cartridge_row,
             color_cartridge_row,
             diagnostic_banner_row,
+            scan_btn: btn_scan,
+            scan_spinner,
+            scan_preview_picture,
+            scan_result_row,
+            scan_open_btn,
             toast_overlay,
         };
 
@@ -1284,23 +1334,52 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::TriggerScan => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone.dispatch_scan(&mut guard).await {
-                            Ok(pages) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(format!(
-                                    "Scan complete ({} page(s) acquired).",
-                                    pages.len()
-                                ))));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
+                self.vm.is_busy = true;
+                let client_arc = self.client.clone();
+                let mut vm_clone = self.vm.clone();
+                let s = sender.clone();
+                tokio::spawn(async move {
+                    let res: Result<(usize, Option<std::path::PathBuf>), String> = async {
+                        if let Some(arc) = client_arc {
+                            let mut guard = arc.lock().await;
+                            let pages = vm_clone.dispatch_scan(&mut guard).await?;
+                            Ok((pages.len(), vm_clone.last_scan_path))
+                        } else {
+                            let mut c = DaemonClient::connect_or_fallback(None, None)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            let pages = vm_clone.dispatch_scan(&mut c).await?;
+                            Ok((pages.len(), vm_clone.last_scan_path))
                         }
-                    });
+                    }
+                    .await;
+
+                    s.input(AppMsg::ScanCompleted(res));
+                });
+            }
+
+            AppMsg::ScanCompleted(result) => {
+                self.vm.is_busy = false;
+                match result {
+                    Ok((count, path_opt)) => {
+                        self.vm.last_scan_path = path_opt.clone();
+                        let path_str = path_opt
+                            .as_ref()
+                            .map(|p| format!("Saved to {}", p.display()))
+                            .unwrap_or_else(|| format!("{count} page(s) acquired"));
+                        self.vm.status_banner = format!("Scan complete. {path_str}");
+                        self.vm.last_error = None;
+                    }
+                    Err(err) => {
+                        self.vm.last_error = Some(err.clone());
+                        self.vm.status_banner = format!("[ERROR] {err}");
+                    }
+                }
+            }
+
+            AppMsg::OpenScannedDocument => {
+                if let Some(path) = &self.vm.last_scan_path {
+                    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
                 }
             }
 
@@ -1381,5 +1460,24 @@ impl SimpleComponent for AppModel {
         widgets
             .diagnostic_banner_row
             .set_title(&self.vm.status_banner);
+
+        // Tab 3 ScanGear Pro
+        widgets.scan_btn.set_sensitive(!self.vm.is_busy);
+        if self.vm.is_busy {
+            widgets.scan_spinner.start();
+        } else {
+            widgets.scan_spinner.stop();
+        }
+        if let Some(path) = &self.vm.last_scan_path {
+            widgets.scan_preview_picture.set_filename(Some(path));
+            widgets.scan_preview_picture.set_visible(true);
+            widgets
+                .scan_result_row
+                .set_title("Scan Acquired & Exported Successfully");
+            widgets
+                .scan_result_row
+                .set_subtitle(&path.display().to_string());
+            widgets.scan_open_btn.set_visible(true);
+        }
     }
 }
