@@ -1,5 +1,21 @@
 # Changelog
 
+## [v0.2.1] - 2026-11-09
+
+### CUPS IPP 2.0 Printing & USB Lock Concurrency Hotfix
+
+#### Fixed
+- **CUPS IPP 2.0 Multi-Part Job Pipeline (`Create-Job` + `Send-Document`)**:
+  - Implemented IPP operations `0x0005` (`OP_CREATE_JOB`) and `0x0006` (`OP_SEND_DOCUMENT`) in `pixma-printer-app` router alongside `0x0002` (`OP_PRINT_JOB`).
+  - Added required IPP response attributes (`job-uri`, `printer-uri-supported`, `uri-security-supported`, `uri-authentication-supported`, and `application/vnd.cups-pdf` MIME format) to satisfy CUPS 2.4's `/usr/lib/cups/backend/ipp`.
+- **Axum 2 MB Request Body Limit Disabled**:
+  - Attached `.layer(DefaultBodyLimit::disable())` to `pixma-printer-app` router, fixing silent `413 Payload Too Large` failures when printing PDFs larger than 2 MB (e.g. multi-page color or vector PDFs from OnlyOffice / Okular).
+- **USB Lock Contention & Daemon Deadlock (`/tmp/pixma-g2010.lock`)**:
+  - Converted `pixma-escl-server` to on-demand USB mode: the scanner server now connects to USB on-demand inside scan job handlers and drops the USB interface and `flock` immediately upon completion instead of holding it open permanently from daemon startup.
+  - Made `Get-Printer-Attributes` (`0x000b`) in `pixma-printer-app` return printer status and capabilities lock-free without acquiring hardware USB, preventing status polling stalls during job creation.
+- **End-to-End CUPS Queue Verification**:
+  - Verified automatic processing and output of pending CUPS jobs (Jobs 5, 6, and 7: 1.14 MB, 3.01 MB, and 0.63 MB) without user intervention.
+
 ## [v0.2.0] - 2026-11-09
 
 ### Hardware-Verified Production Release (Canon PIXMA G2010 `04a9:183a`)
