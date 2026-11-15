@@ -12,6 +12,10 @@ description = "pixmad background USB multiplexer and Unix domain socket broker"
 name = "pixmad"
 path = "src/bin/pixmad.rs"
 
+[[bin]]
+name = "pixma-sock-bridge"
+path = "src/bin/pixma-sock-bridge.rs"
+
 [dependencies]
 pixma-core.workspace = true
 pixma-protocol.workspace = true

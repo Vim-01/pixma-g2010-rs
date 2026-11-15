@@ -346,3 +346,58 @@ impl PrintJobTypestate<StreamingRaster> {
         Ok(self.state.thermal_monitor.observe_line(line))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_conversions_and_mechanical_bounds() {
+        assert_eq!(Dots(0).to_microns(0), Microns(0));
+        assert_eq!(Microns(25_400).to_dots(600), Dots(600));
+        assert_eq!(
+            MechanicalBounds::max_carriage_dots_for_dpi(600),
+            Ok(5_100)
+        );
+        assert!(matches!(
+            MechanicalBounds::max_carriage_dots_for_dpi(720),
+            Err(HardwareConstraintViolation::UnsupportedResolutionDpi(720))
+        ));
+    }
+
+    #[test]
+    fn validated_raster_line_and_typestate_enforce_hardware_limits() {
+        assert!(matches!(
+            ValidatedRasterLine::try_new(vec![255; 10], 5_101, 600, 1),
+            Err(HardwareConstraintViolation::CarriageOvertravel { .. })
+        ));
+        assert!(matches!(
+            ValidatedRasterLine::try_new(vec![255; 10], 100, 600, 2),
+            Err(HardwareConstraintViolation::InvalidBytesPerPixel(2))
+        ));
+        assert!(matches!(
+            ValidatedRasterLine::try_new(vec![255; 10], 100, 600, 1),
+            Err(HardwareConstraintViolation::BufferUnderrun {
+                expected: 100,
+                actual: 10
+            })
+        ));
+
+        let line = ValidatedRasterLine::try_new(vec![255; 300], 100, 600, 3).unwrap();
+        assert!((line.estimate_ink_duty_cycle() - 0.0).abs() < 1e-6);
+
+        let job = PrintJobTypestate::new();
+        assert!(matches!(
+            job.configure_page(5_101, 100, 600),
+            Err(HardwareConstraintViolation::CarriageOvertravel { .. })
+        ));
+        let configured = PrintJobTypestate::new().configure_page(100, 2, 600).unwrap();
+        let mut streaming = configured.begin_streaming();
+        assert!(streaming.accept_line(&line).is_ok());
+        assert!(streaming.accept_line(&line).is_ok());
+        assert!(matches!(
+            streaming.accept_line(&line),
+            Err(HardwareConstraintViolation::PageHeightExceeded { .. })
+        ));
+    }
+}

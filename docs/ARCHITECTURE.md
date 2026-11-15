@@ -521,7 +521,7 @@ pkgname=(
   'pixma-g2010-gui'          # PIXMA G2010 Studio (Relm4 / libadwaita)
   'pixma-g2010-meta'         # Meta-package pulling the complete desktop suite
 )
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 arch=('x86_64' 'aarch64')
 license=('AGPL-3.0-or-later')
@@ -556,7 +556,7 @@ For users compiling directly from source or running on non-AUR setups, `scripts/
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The script runs `cargo build --release -p <selected_crates>`, installs binaries to `/usr/bin`, installs udev rules and systemd units, registers the SANE backend in `/etc/sane.d/dll.d/`, reloads `systemd`, and restarts CUPS.
+The script runs `cargo build --release --locked -p <selected_crates>`, installs binaries to `/usr/bin`, installs udev rules and systemd units, registers the SANE backend in `/etc/sane.d/dll.d/`, reloads `systemd`, and restarts CUPS.
 
 ---
 

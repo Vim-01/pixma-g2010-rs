@@ -4,7 +4,9 @@
 //! active job execution (reporting marker telemetry to stderr and streaming
 //! print job bytes via `DaemonClient`).
 
-use pixma_cups::backend::{format_cups_discovery_lines, format_cups_marker_attributes};
+use pixma_cups::backend::{
+    dispatch_cups_payload, format_cups_discovery_lines, format_cups_marker_attributes,
+};
 use pixma_daemon::DaemonClient;
 use std::env;
 use std::fs::File;
@@ -62,12 +64,27 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Connect to running pixmad or fallback to local controller
-    let mut client = match DaemonClient::connect_or_fallback(None, None).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("ERROR: Failed to establish printer transport connection: {e}");
-            return ExitCode::FAILURE;
+    // Connect strictly to PIXMA_SOCKET when specified (e.g., remote SSH tunnel),
+    // otherwise connect to live pixmad or physical USB (fail-closed, never virtual mock).
+    let mut client = if let Some(sock_path) = env::var_os("PIXMA_SOCKET").filter(|v| !v.is_empty())
+    {
+        match DaemonClient::connect_socket(&sock_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "ERROR: Failed to connect to pixmad socket '{}': {e}",
+                    std::path::Path::new(&sock_path).display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match DaemonClient::connect_live(None, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ERROR: Failed to establish live printer transport connection: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -78,8 +95,9 @@ async fn main() -> ExitCode {
         }
     }
 
-    // Stream raw print job bytes to the printer bulk pipe
-    if let Err(e) = client.print_raw_stream(&print_data).await {
+    // Stream print / maintenance payload to device, routing explicitly confirmed
+    // InkFlush segments through execute_maintenance and keeping raw `choke` fail-closed.
+    if let Err(e) = dispatch_cups_payload(&mut client, &print_data).await {
         eprintln!("ERROR: Failed to stream print job to device: {e}");
         return ExitCode::FAILURE;
     }

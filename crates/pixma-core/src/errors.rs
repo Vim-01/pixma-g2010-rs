@@ -235,3 +235,22 @@ pub const SUPPORT_CODE_DATABASE: &[SupportCodeInfo] = &[
         is_fatal_service_error: true,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn support_code_lookup_resolves_support_and_lcd_codes() {
+        let p07 = SupportCodeInfo::lookup("p07").expect("P07 should match");
+        assert_eq!(p07.support_code, "5B00");
+        assert!(p07.is_fatal_service_error);
+
+        let overheat = SupportCodeInfo::lookup(" 5200 ").expect("5200 should match");
+        assert_eq!(overheat.lcd_code, "P08");
+        assert!(overheat.is_thermal_or_head_hazard);
+        assert!(overheat.is_fatal_service_error);
+
+        assert!(SupportCodeInfo::lookup("9999").is_none());
+    }
+}

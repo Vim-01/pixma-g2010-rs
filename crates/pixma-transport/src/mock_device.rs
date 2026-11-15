@@ -214,6 +214,10 @@ impl UsbTransport for MockG2010Transport {
         self.model
     }
 
+    fn is_mock(&self) -> bool {
+        true
+    }
+
     async fn get_device_id(&mut self) -> Result<String, DriverError> {
         Ok(G2010_IEEE1284_DEVICE_ID.to_string())
     }

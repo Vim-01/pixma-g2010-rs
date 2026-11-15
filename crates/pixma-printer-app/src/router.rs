@@ -13,17 +13,85 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pixma_core::errors::DriverError;
 use pixma_core::maintenance::MaintenanceAction;
-use pixma_core::models::DeviceStatus;
+use pixma_core::models::{DeviceStatus, OperationalState};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_daemon::DaemonClient;
 use pixma_raster::cups_reader::{parse_document_from_memory, RasterPageInput};
 use pixma_raster::pipeline::PrintRasterPipeline;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+const DEFAULT_PRINTER_URI_BASE: &str = "ipp://127.0.0.1:8631/ipp/print";
+const MAX_IPP_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Formats a normalized base IPP printer URI from the server bind socket address.
+pub fn printer_uri_base_from_bind(addr: SocketAddr) -> String {
+    let port = addr.port();
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            let host = if v4.is_unspecified() {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(v4)
+            };
+            format!("ipp://{host}:{port}/ipp/print")
+        }
+        IpAddr::V6(v6) => {
+            let host = if v6.is_unspecified() {
+                std::net::Ipv6Addr::LOCALHOST
+            } else {
+                v6
+            };
+            format!("ipp://[{host}]:{port}/ipp/print")
+        }
+    }
+}
+
+fn is_valid_http_host(host: &str) -> bool {
+    if host.is_empty()
+        || !host.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains("://")
+    {
+        return false;
+    }
+    if let Some(after_open) = host.strip_prefix('[') {
+        let Some((_addr, rest)) = after_open.split_once(']') else {
+            return false;
+        };
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(port) = rest.strip_prefix(':') else {
+            return false;
+        };
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    } else if let Some((name, port)) = host.split_once(':') {
+        !name.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        true
+    }
+}
+
+fn resolve_request_printer_uri(headers: &HeaderMap, fallback: &str) -> String {
+    if let Some(raw_host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        let trimmed = raw_host.trim();
+        if is_valid_http_host(trimmed) {
+            return format!("ipp://{trimmed}/ipp/print");
+        }
+    }
+    fallback.to_string()
+}
 
 /// Shared application state holding the thread-safe printer client connection
 /// and monotonically increasing job identifier counter.
@@ -31,21 +99,50 @@ use tokio::sync::Mutex;
 pub struct AppState {
     pub client: Arc<Mutex<Option<DaemonClient>>>,
     pub job_counter: Arc<AtomicU32>,
+    pub printer_uri_base: String,
+    pub socket_path: Option<PathBuf>,
 }
 
 impl AppState {
     pub fn new(client: DaemonClient) -> Self {
+        Self::new_with_uri(client, DEFAULT_PRINTER_URI_BASE)
+    }
+
+    pub fn new_with_uri(client: DaemonClient, printer_uri_base: impl Into<String>) -> Self {
         Self {
             client: Arc::new(Mutex::new(Some(client))),
             job_counter: Arc::new(AtomicU32::new(1)),
+            printer_uri_base: printer_uri_base.into(),
+            socket_path: None,
         }
     }
 
     pub fn new_on_demand() -> Self {
+        Self::new_on_demand_with_uri(DEFAULT_PRINTER_URI_BASE)
+    }
+
+    pub fn new_on_demand_with_uri(printer_uri_base: impl Into<String>) -> Self {
+        Self::new_on_demand_with_socket_and_uri(None, printer_uri_base)
+    }
+
+    pub fn new_on_demand_with_socket_and_uri(
+        socket_path: Option<PathBuf>,
+        printer_uri_base: impl Into<String>,
+    ) -> Self {
         Self {
             client: Arc::new(Mutex::new(None)),
             job_counter: Arc::new(AtomicU32::new(1)),
+            printer_uri_base: printer_uri_base.into(),
+            socket_path,
         }
+    }
+}
+
+fn offline_status(reason: &DriverError) -> DeviceStatus {
+    DeviceStatus {
+        state: OperationalState::Offline,
+        status_detail: reason.to_string(),
+        ..Default::default()
     }
 }
 
@@ -74,15 +171,17 @@ pub fn build_router(state: AppState) -> Router {
         // REST management endpoints
         .route("/api/status", get(handle_get_status))
         .route("/api/maintenance", post(handle_post_maintenance))
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(MAX_IPP_BODY_BYTES))
         .with_state(state)
 }
 
 /// Binary IPP/2.0 request dispatcher.
 async fn handle_ipp_request(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
+    let printer_uri_base = resolve_request_printer_uri(&headers, &state.printer_uri_base);
     let req = match IppRequest::parse(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -103,17 +202,25 @@ async fn handle_ipp_request(
         OP_GET_PRINTER_ATTRIBUTES => {
             let mut guard = state.client.lock().await;
             let status = if let Some(client) = guard.as_mut() {
-                client.get_status().await.unwrap_or_default()
+                client
+                    .get_status()
+                    .await
+                    .unwrap_or_else(|e| offline_status(&e))
             } else {
-                // In on-demand USB mode, return Idle capabilities immediately without
-                // claiming USB so CUPS pre-job attribute polling is instant and lock-free.
-                DeviceStatus::default()
+                match DaemonClient::connect_live(state.socket_path.as_deref(), None).await {
+                    Ok(mut temp_client) => temp_client
+                        .get_status()
+                        .await
+                        .unwrap_or_else(|e| offline_status(&e)),
+                    Err(e) => offline_status(&e),
+                }
             };
-            let resp = IppResponse::build_printer_attributes(
+            let resp = IppResponse::build_printer_attributes_with_uri(
                 req.version_major,
                 req.version_minor,
                 req.request_id,
                 &status,
+                &printer_uri_base,
             );
             resp.to_bytes()
         }
@@ -130,11 +237,12 @@ async fn handle_ipp_request(
 
         OP_CREATE_JOB => {
             let job_id = state.job_counter.fetch_add(1, Ordering::SeqCst) as i32;
-            let resp = IppResponse::build_create_job_response(
+            let resp = IppResponse::build_create_job_response_with_uri(
                 req.version_major,
                 req.version_minor,
                 req.request_id,
                 job_id,
+                &printer_uri_base,
             );
             resp.to_bytes()
         }
@@ -143,11 +251,12 @@ async fn handle_ipp_request(
             if req.data.is_empty() {
                 if req.operation_id == OP_SEND_DOCUMENT {
                     let job_id = state.job_counter.load(Ordering::SeqCst) as i32;
-                    let resp = IppResponse::build_print_job_response(
+                    let resp = IppResponse::build_print_job_response_with_uri(
                         req.version_major,
                         req.version_minor,
                         req.request_id,
                         job_id,
+                        &printer_uri_base,
                     );
                     return Ok(ipp_binary_response(resp.to_bytes()));
                 }
@@ -212,7 +321,7 @@ async fn handle_ipp_request(
                 }
             };
 
-            let timestamp = format_timestamp_now();
+            let timestamp = pixma_core::current_utc_timestamp_14();
             let job_stream = match PrintRasterPipeline::compile_ivec_bjraster3_job(
                 &pages, &config, &timestamp,
             ) {
@@ -229,12 +338,12 @@ async fn handle_ipp_request(
                 }
             };
 
-            // Stream to device via client (or on-demand USB/daemon connection)
+            // Stream to device via bound client or fail-closed live USB/daemon connection
             let mut guard = state.client.lock().await;
             let print_res = if let Some(client) = guard.as_mut() {
                 client.print_raw_stream(&job_stream).await
             } else {
-                match DaemonClient::connect_or_fallback(None, None).await {
+                match DaemonClient::connect_live(state.socket_path.as_deref(), None).await {
                     Ok(mut temp_client) => temp_client.print_raw_stream(&job_stream).await,
                     Err(e) => Err(e),
                 }
@@ -250,21 +359,23 @@ async fn handle_ipp_request(
                 return Ok(ipp_binary_response(resp.to_bytes()));
             }
 
-            let resp = IppResponse::build_print_job_response(
+            let resp = IppResponse::build_print_job_response_with_uri(
                 req.version_major,
                 req.version_minor,
                 req.request_id,
                 job_id,
+                &printer_uri_base,
             );
             resp.to_bytes()
         }
 
         OP_GET_JOB_ATTRIBUTES => {
-            let resp = IppResponse::build_print_job_response(
+            let resp = IppResponse::build_print_job_response_with_uri(
                 req.version_major,
                 req.version_minor,
                 req.request_id,
                 1,
+                &printer_uri_base,
             );
             resp.to_bytes()
         }
@@ -311,7 +422,7 @@ async fn handle_get_status(
     let res = if let Some(client) = guard.as_mut() {
         client.get_status().await
     } else {
-        match DaemonClient::connect_or_fallback(None, None).await {
+        match DaemonClient::connect_live(state.socket_path.as_deref(), None).await {
             Ok(mut temp_client) => temp_client.get_status().await,
             Err(e) => Err(e),
         }
@@ -319,9 +430,9 @@ async fn handle_get_status(
     match res {
         Ok(status) => Ok(Json(status)),
         Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: format!("Failed to query status: {e}"),
+                error: format!("Failed to query live printer status: {e}"),
             }),
         )),
     }
@@ -342,7 +453,7 @@ async fn handle_post_maintenance(
             )
             .await
     } else {
-        match DaemonClient::connect_or_fallback(None, None).await {
+        match DaemonClient::connect_live(state.socket_path.as_deref(), None).await {
             Ok(mut temp_client) => {
                 temp_client
                     .execute_maintenance(
@@ -357,38 +468,80 @@ async fn handle_post_maintenance(
     };
     match res {
         Ok(status) => Ok(Json(status)),
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Maintenance error: {e}"),
-            }),
-        )),
+        Err(e) => {
+            let status_code = match &e {
+                DriverError::Transport(_) | DriverError::Io(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err((
+                status_code,
+                Json(ErrorResponse {
+                    error: format!("Maintenance error: {e}"),
+                }),
+            ))
+        }
     }
 }
 
-/// Formats current UTC timestamp as 14-character string `YYYYMMDDHHMMSS`.
-fn format_timestamp_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let days = (secs / 86400) as i64;
-    let rem_secs = (secs % 86400) as u32;
-    let hour = rem_secs / 3600;
-    let minute = (rem_secs % 3600) / 60;
-    let second = rem_secs % 60;
+    #[test]
+    fn printer_uri_base_from_bind_normalizes_wildcard_addresses() {
+        assert_eq!(
+            printer_uri_base_from_bind("0.0.0.0:8631".parse().unwrap()),
+            "ipp://127.0.0.1:8631/ipp/print"
+        );
+        assert_eq!(
+            printer_uri_base_from_bind("[::]:8631".parse().unwrap()),
+            "ipp://[::1]:8631/ipp/print"
+        );
+        assert_eq!(
+            printer_uri_base_from_bind("192.0.2.50:9631".parse().unwrap()),
+            "ipp://192.0.2.50:9631/ipp/print"
+        );
+        assert_eq!(
+            printer_uri_base_from_bind("[2001:db8::1]:8631".parse().unwrap()),
+            "ipp://[2001:db8::1]:8631/ipp/print"
+        );
+    }
 
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1024 + doe / 1460 - doe / 36524) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    #[test]
+    fn resolve_request_printer_uri_validates_host_header_strictly() {
+        let fallback = "ipp://127.0.0.1:8631/ipp/print";
 
-    format!("{y:04}{m:02}{d:02}{hour:02}{minute:02}{second:02}")
+        let mut ok_headers = HeaderMap::new();
+        ok_headers.insert(header::HOST, HeaderValue::from_static("printer.local:8631"));
+        assert_eq!(
+            resolve_request_printer_uri(&ok_headers, fallback),
+            "ipp://printer.local:8631/ipp/print"
+        );
+
+        let mut v6_headers = HeaderMap::new();
+        v6_headers.insert(header::HOST, HeaderValue::from_static("[::1]:8631"));
+        assert_eq!(
+            resolve_request_printer_uri(&v6_headers, fallback),
+            "ipp://[::1]:8631/ipp/print"
+        );
+
+        for bad in [
+            "evil.com/path",
+            "http://evil.com",
+            "user@evil.com",
+            "evil.com?x=1",
+            "evil.com#frag",
+            "bad host",
+            "bad:notport",
+            "[::1",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(header::HOST, HeaderValue::from_str(bad).unwrap());
+            assert_eq!(
+                resolve_request_printer_uri(&h, fallback),
+                fallback,
+                "malicious Host header '{bad}' must fall back"
+            );
+        }
+    }
 }

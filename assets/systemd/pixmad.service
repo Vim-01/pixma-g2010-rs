@@ -5,7 +5,7 @@ After=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pixmad --socket /run/pixma/pixmad.sock
+ExecStart=/usr/bin/pixmad --require-hardware --socket /run/pixma/pixmad.sock --state-file /var/lib/pixma-g2010/state.json
 RuntimeDirectory=pixma
 RuntimeDirectoryMode=0775
 StateDirectory=pixma-g2010
@@ -13,13 +13,16 @@ StateDirectoryMode=0755
 Group=lp
 SupplementaryGroups=scanner
 Restart=on-failure
-RestartSec=3s
+RestartSec=10s
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+NoNewPrivileges=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ReadWritePaths=/dev/bus/usb -/run/lock
 
 [Install]
 WantedBy=multi-user.target

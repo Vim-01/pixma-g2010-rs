@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut bind_addr = "127.0.0.1:8080".to_string();
+    let mut socket_path: Option<std::path::PathBuf> = None;
     let mut mock = false;
 
     let args: Vec<String> = std::env::args().collect();
@@ -26,10 +27,18 @@ async fn main() -> anyhow::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--bind" => {
-                if i + 1 < args.len() {
-                    bind_addr = args[i + 1].clone();
-                    i += 1;
+                if i + 1 >= args.len() {
+                    anyhow::bail!("--bind requires an address argument");
                 }
+                bind_addr = args[i + 1].clone();
+                i += 1;
+            }
+            "--socket" => {
+                if i + 1 >= args.len() {
+                    anyhow::bail!("--socket requires a path argument");
+                }
+                socket_path = Some(std::path::PathBuf::from(&args[i + 1]));
+                i += 1;
             }
             "--mock" => {
                 mock = true;
@@ -39,13 +48,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Usage: pixma-escl-server [OPTIONS]");
                 println!();
                 println!("Options:");
-                println!("  --bind <ADDR>   Address to bind HTTP server (default: 127.0.0.1:8080)");
-                println!("  --mock          Run using virtual G2010 hardware emulator");
-                println!("  -h, --help      Print help information");
+                println!("  --bind <ADDR>     Address to bind HTTP server (default: 127.0.0.1:8080)");
+                println!("  --socket <PATH>   Path to pixmad Unix domain socket");
+                println!("  --mock            Run using virtual G2010 hardware emulator");
+                println!("  -h, --help        Print help information");
                 return Ok(());
             }
             other => {
-                eprintln!("Unknown argument: {other}. Use --help for usage information.");
+                anyhow::bail!("Unknown argument: {other}. Use --help for usage information.");
             }
         }
         i += 1;
@@ -53,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting eSCL server on {bind_addr} (mock={mock})");
 
-    let state = Arc::new(EsclServerState::new(mock));
+    let state = Arc::new(EsclServerState::with_socket(mock, socket_path));
     let router = create_escl_router(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;

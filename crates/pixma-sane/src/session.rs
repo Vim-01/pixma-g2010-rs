@@ -5,15 +5,14 @@
 //! raster streaming.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use image::RgbImage;
-use pixma_core::maintenance::{MaintenanceRecord, MaintenanceSupervisor};
+use pixma_core::errors::DriverError;
 use pixma_core::scan_params::{ScanColorMode, ScanGeometry, ScanParameters, ScanResolution};
-use pixma_imageproc::execute_scan_pipeline;
+use pixma_daemon::DaemonClient;
+use pixma_imageproc::{decode_raw_scan_buffer, execute_scan_pipeline};
 use pixma_transport::controller::{AnyTransport, G2010Controller};
-use pixma_transport::mock_device::MockG2010Transport;
-use pixma_transport::nusb_transport::{discover_canon_devices, NusbTransport};
 
 use crate::sane_types::*;
 
@@ -232,16 +231,37 @@ pub static OPTION_DESCRIPTORS: [SANE_Option_Descriptor; NUM_OPTIONS as usize] = 
     },
 ];
 
-/// Helper to execute an async future synchronously, safely handling nested runtimes.
-fn run_async<F: std::future::Future>(f: F) -> F::Output {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(f))
-    } else {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build tokio runtime for SANE session");
-        rt.block_on(f)
+/// Helper to execute an async future synchronously, safely handling multi-threaded,
+/// current-thread, and non-Tokio caller threads without panicking.
+fn run_async<F>(f: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(f))
+            }
+            _ => std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build tokio runtime for SANE session");
+                    rt.block_on(f)
+                })
+                .join()
+                .expect("SANE async worker thread panicked")
+            }),
+        },
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build tokio runtime for SANE session");
+            rt.block_on(f)
+        }
     }
 }
 
@@ -260,8 +280,10 @@ pub struct SaneScannerSession {
     pub gutter_shadow: bool,
     pub auto_crop: bool,
 
-    // Hardware controller instance
-    controller: Option<G2010Controller<AnyTransport>>,
+    // Daemon IPC / direct hardware client
+    client: Option<DaemonClient>,
+    is_mock: bool,
+    socket_override: Option<PathBuf>,
 
     // Acquisition & streaming buffer
     buffer: Vec<u8>,
@@ -272,10 +294,13 @@ pub struct SaneScannerSession {
 }
 
 impl SaneScannerSession {
-    /// Creates a new scanner session with default settings.
-    ///
-    /// Automatically connects to physical hardware or falls back to `MockG2010Transport`.
+    /// Creates a new live scanner session (honoring `PIXMA_MOCK=1` if set in environment).
     pub fn new() -> Self {
+        let is_mock = std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
+        Self::with_mode(is_mock, None)
+    }
+
+    fn with_mode(is_mock: bool, socket_override: Option<PathBuf>) -> Self {
         Self {
             resolution: ScanResolution::Dpi300,
             mode_str: "Color".to_string(),
@@ -289,7 +314,9 @@ impl SaneScannerSession {
             remove_dust: false,
             gutter_shadow: false,
             auto_crop: false,
-            controller: None,
+            client: None,
+            is_mock,
+            socket_override,
             buffer: Vec::new(),
             read_offset: 0,
             scanning: false,
@@ -300,45 +327,33 @@ impl SaneScannerSession {
 
     /// Creates a session pre-configured with a custom controller (useful for unit tests).
     pub fn new_with_controller(controller: G2010Controller<AnyTransport>) -> Self {
-        let mut session = Self::new();
-        session.controller = Some(controller);
+        let is_mock = controller.transport().is_mock();
+        let mut session = Self::with_mode(is_mock, None);
+        session.client = Some(DaemonClient::direct(controller));
         session
     }
 
     /// Creates a session with in-memory mock hardware for tests.
     pub fn new_mock() -> Self {
-        let mock = MockG2010Transport::new();
-        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-        let controller = G2010Controller::new(AnyTransport::Mock(Box::new(mock)), supervisor);
-        Self::new_with_controller(controller)
+        let mut session = Self::with_mode(true, None);
+        session.client = DaemonClient::connect_mock(None).ok();
+        session
     }
 
-    /// Ensures an active controller is initialized.
-    fn ensure_controller(&mut self) {
-        if self.controller.is_some() {
-            return;
-        }
-
-        let is_mock_forced = std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
-        let transport = if !is_mock_forced {
-            if let Ok(devs) = discover_canon_devices() {
-                if !devs.is_empty() {
-                    match NusbTransport::open_first() {
-                        Ok(usb) => AnyTransport::Usb(usb),
-                        Err(_) => AnyTransport::Mock(Box::new(MockG2010Transport::new())),
-                    }
-                } else {
-                    AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-                }
+    /// Ensures a live (`pixmad`/USB) or mock `DaemonClient` is initialized.
+    fn ensure_client(&mut self) -> Result<&mut DaemonClient, DriverError> {
+        if self.client.is_none() {
+            if self.is_mock {
+                self.client = Some(DaemonClient::connect_mock(None)?);
             } else {
-                AnyTransport::Mock(Box::new(MockG2010Transport::new()))
+                let sock = self.socket_override.clone();
+                let client = run_async(async move {
+                    DaemonClient::connect_live(sock.as_deref(), None).await
+                })?;
+                self.client = Some(client);
             }
-        } else {
-            AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-        };
-
-        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-        self.controller = Some(G2010Controller::new(transport, supervisor));
+        }
+        Ok(self.client.as_mut().expect("client initialized"))
     }
 
     /// Returns the scan color mode derived from the option string.
@@ -419,7 +434,6 @@ impl SaneScannerSession {
     /// Starts acquisition: acquires raw scanlines, applies pipeline, buffers raster bytes.
     pub fn start_scan(&mut self) -> SANE_Status {
         self.cancelled.store(false, Ordering::SeqCst);
-        self.ensure_controller();
 
         let geom = self.calculate_geometry();
         let color_mode = self.color_mode();
@@ -436,16 +450,23 @@ impl SaneScannerSession {
             gamma: 2.2,
         };
 
-        let controller = match self.controller.as_mut() {
-            Some(c) => c,
-            None => return SANE_STATUS_IO_ERROR,
+        let client = match self.ensure_client() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to connect SANE scanner client: {e}");
+                return SANE_STATUS_IO_ERROR;
+            }
         };
 
-        // Acquire raw bytes from hardware controller
-        let raw_bytes = match run_async(controller.acquire_raw_scan(&params)) {
+        let acquire_res = run_async(client.acquire_scan(&params));
+        let raw_bytes = match acquire_res {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!("Scanner raw acquisition error: {e}");
+                if !self.is_mock {
+                    // Drop cached socket/USB client so a subsequent scan after pixmad restart reconnects cleanly.
+                    self.client = None;
+                }
                 return SANE_STATUS_IO_ERROR;
             }
         };
@@ -454,35 +475,13 @@ impl SaneScannerSession {
             return SANE_STATUS_CANCELLED;
         }
 
-        // Convert raw byte stream into RgbImage
         let width = geom.width;
         let height = geom.height;
-        let bpp = color_mode.bytes_per_pixel();
-        let expected_len = (width as usize) * (height as usize) * bpp;
-
-        if raw_bytes.len() < expected_len {
-            tracing::error!(
-                "Acquired scan payload length mismatch: got {}, expected {}",
-                raw_bytes.len(),
-                expected_len
-            );
-            return SANE_STATUS_IO_ERROR;
-        }
-
-        let rgb_img = if bpp == 3 {
-            match RgbImage::from_raw(width, height, raw_bytes[..expected_len].to_vec()) {
-                Some(img) => img,
-                None => return SANE_STATUS_IO_ERROR,
-            }
-        } else {
-            // Expand 8-bit Gray to RGB for post-processing pipeline
-            let mut rgb_buf = Vec::with_capacity((width * height * 3) as usize);
-            for &g in &raw_bytes[..expected_len] {
-                rgb_buf.extend_from_slice(&[g, g, g]);
-            }
-            match RgbImage::from_raw(width, height, rgb_buf) {
-                Some(img) => img,
-                None => return SANE_STATUS_IO_ERROR,
+        let rgb_img = match decode_raw_scan_buffer(raw_bytes, width, height, color_mode) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::error!("Failed to decode raw SANE scan buffer: {e}");
+                return SANE_STATUS_IO_ERROR;
             }
         };
 
@@ -497,6 +496,12 @@ impl SaneScannerSession {
 
         if processed_images.is_empty() {
             return SANE_STATUS_IO_ERROR;
+        }
+        if processed_images.len() > 1 {
+            tracing::warn!(
+                "SANE single-frame scan truncating {} multi-cropped images to the first image",
+                processed_images.len()
+            );
         }
 
         let out_img = &processed_images[0];
@@ -840,5 +845,23 @@ mod tests {
         }
         assert!(total_read > 0);
         assert_eq!(total_read, (params.lines * params.bytes_per_line) as usize);
+    }
+
+    #[tokio::test]
+    async fn test_run_async_inside_current_thread_runtime_does_not_panic() {
+        let val = run_async(async { 42u32 });
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn test_live_session_offline_returns_io_error_without_mock_fallback() {
+        let missing_sock = std::env::temp_dir().join(format!(
+            "pixma_sane_missing_{}.sock",
+            std::process::id()
+        ));
+        let mut session = SaneScannerSession::with_mode(false, Some(missing_sock));
+        session.br_x = 20.0;
+        session.br_y = 20.0;
+        assert_eq!(session.start_scan(), SANE_STATUS_IO_ERROR);
     }
 }

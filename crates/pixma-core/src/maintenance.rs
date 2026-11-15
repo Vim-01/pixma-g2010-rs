@@ -55,23 +55,24 @@ impl CleaningType {
     }
 }
 
-/// Ink group target for cleaning (`all`, `inkgroup1` Black, `inkgroup2` Color).
+/// Ink group target for cleaning (`all`, `group1`, `group2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CleaningTarget {
-    /// Both Black (PGBK) and Color (CMY) heads.
+    /// Both Black (PGBK) and Color (CMY) heads (`all`).
     All,
-    /// Black (GI-790 PGBK / BH-4) only (`inkgroup1`).
+    /// Black (GI-790 PGBK / BH-4) only (`group1`).
     BlackOnly,
-    /// Color (GI-790 C/M/Y / CH-41) only (`inkgroup2`).
+    /// Color (GI-790 C/M/Y / CH-41) only (`group2`).
     ColorOnly,
 }
 
 impl CleaningTarget {
+    /// Canon IVEC `<ivec:inkgroup>` wire token (confirmed via official PPD `#CNIJ-IVEC-CAPABILITY-MAINTENANCE`).
     pub const fn ivec_xml_value(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::BlackOnly => "inkgroup1",
-            Self::ColorOnly => "inkgroup2",
+            Self::BlackOnly => "group1",
+            Self::ColorOnly => "group2",
         }
     }
 }
@@ -170,13 +171,71 @@ impl MaintenanceSupervisor {
         }
     }
 
+    /// Probes whether `dir` exists (creating it if absent) and supports creating/deleting files.
+    pub fn probe_dir_writable(dir: &Path) -> Result<(), std::io::Error> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsafe directory path (symlink or non-directory): {}", dir.display()),
+                ));
+            }
+        } else {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o755);
+            }
+            builder.create(dir)?;
+        }
+
+        let probe_path = dir.join(format!(
+            ".pixma_write_probe.{}.{}",
+            std::process::id(),
+            PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&probe_path)?;
+        let _ = std::fs::remove_file(&probe_path);
+        Ok(())
+    }
+
     pub fn load_or_init<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
         let path = path.as_ref().to_path_buf();
-        let record = if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            MaintenanceRecord::default()
+        if let Some(parent) = path.parent() {
+            Self::probe_dir_writable(parent)?;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Refusing symlink state file: {}", path.display()),
+                ));
+            }
+        }
+        let record = match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Corrupted maintenance state JSON {}: {e}", path.display()),
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MaintenanceRecord::default(),
+            Err(e) => return Err(e),
         };
         Ok(Self {
             state_file: Some(path),
@@ -184,13 +243,25 @@ impl MaintenanceSupervisor {
         })
     }
 
+    /// Loads persisted maintenance state read-only into an in-memory supervisor
+    /// without ever creating directories or modifying files on disk.
+    pub fn load_readonly<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let record: MaintenanceRecord = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self::in_memory(record))
+    }
+
     pub const fn record(&self) -> &MaintenanceRecord {
         &self.record
     }
 
     pub fn update_d_counter_from_hardware(&mut self, reported_percent: f32) {
-        if reported_percent > self.record.estimated_d_counter_percent {
-            self.record.estimated_d_counter_percent = reported_percent;
+        if reported_percent.is_finite()
+            && reported_percent >= 0.0
+            && reported_percent > self.record.estimated_d_counter_percent
+        {
+            self.record.estimated_d_counter_percent = reported_percent.min(100.0);
         }
     }
 
@@ -226,9 +297,10 @@ impl MaintenanceSupervisor {
                 }
             }
             CleaningType::InkFlush => {
-                if self.record.estimated_d_counter_percent >= MAX_SAFE_D_COUNTER_PERCENT {
+                let d_counter = self.record.estimated_d_counter_percent;
+                if !d_counter.is_finite() || d_counter >= MAX_SAFE_D_COUNTER_PERCENT {
                     return Err(SafetyInterlockError::AbsorberNearCapacity {
-                        current_percent: self.record.estimated_d_counter_percent,
+                        current_percent: d_counter,
                         max_safe_percent: MAX_SAFE_D_COUNTER_PERCENT,
                     });
                 }
@@ -282,14 +354,229 @@ impl MaintenanceSupervisor {
     }
 
     fn persist(&self) -> Result<(), std::io::Error> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
         if let Some(ref path) = self.state_file {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.recursive(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        builder.mode(0o755);
+                    }
+                    builder.create(parent)?;
+                }
             }
             let serialized =
                 serde_json::to_string_pretty(&self.record).map_err(std::io::Error::other)?;
-            std::fs::write(path, serialized)?;
+
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("state.json");
+            let pid = std::process::id();
+            let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_name = format!("{file_name}.tmp.{pid}.{seq}");
+            let tmp_path = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+                _ => PathBuf::from(tmp_name),
+            };
+
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o644);
+            }
+
+            let write_res = (|| -> Result<(), std::io::Error> {
+                let mut file = opts.open(&tmp_path)?;
+                file.write_all(serialized.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(e) = write_res {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+
+            if let Err(e) = std::fs::rename(&tmp_path, path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleaning_interlocks_enforce_cooldowns_override_and_tokens() {
+        let mut sup = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        assert!(sup
+            .authorize_cleaning(CleaningType::Regular, None, false, 1_000)
+            .is_ok());
+        sup.record_cleaning_executed(CleaningType::Regular, 1_000)
+            .unwrap();
+
+        assert!(matches!(
+            sup.authorize_cleaning(CleaningType::Regular, None, false, 1_030),
+            Err(SafetyInterlockError::CooldownActive {
+                remaining_seconds: 30,
+                ..
+            })
+        ));
+        assert!(sup
+            .authorize_cleaning(CleaningType::Regular, None, true, 1_030)
+            .is_ok());
+        assert!(sup
+            .authorize_cleaning(CleaningType::Regular, None, false, 1_060)
+            .is_ok());
+
+        // Backwards wall clock uses saturating subtraction and keeps cooldown enforced safely
+        assert!(matches!(
+            sup.authorize_cleaning(CleaningType::Regular, None, false, 900),
+            Err(SafetyInterlockError::CooldownActive {
+                remaining_seconds: 60,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ink_flush_blocks_high_and_non_finite_d_counter_even_with_override() {
+        for bad_val in [80.0_f32, 95.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let rec = MaintenanceRecord {
+                estimated_d_counter_percent: bad_val,
+                ..Default::default()
+            };
+            let sup = MaintenanceSupervisor::in_memory(rec);
+            assert!(matches!(
+                sup.authorize_cleaning(
+                    CleaningType::InkFlush,
+                    Some(INK_FLUSH_CONFIRMATION_TOKEN),
+                    true,
+                    100_000,
+                ),
+                Err(SafetyInterlockError::AbsorberNearCapacity { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn ink_flush_requires_confirmation_token_and_24h_cooldown() {
+        let mut sup = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        assert!(matches!(
+            sup.authorize_cleaning(CleaningType::InkFlush, Some("NOPE"), false, 10_000),
+            Err(SafetyInterlockError::ConfirmationRequired { .. })
+        ));
+        assert!(sup
+            .authorize_cleaning(
+                CleaningType::InkFlush,
+                Some(INK_FLUSH_CONFIRMATION_TOKEN),
+                false,
+                10_000
+            )
+            .is_ok());
+        sup.record_cleaning_executed(CleaningType::InkFlush, 10_000)
+            .unwrap();
+        assert_eq!(sup.record().total_ink_flushes, 1);
+
+        assert!(matches!(
+            sup.authorize_cleaning(
+                CleaningType::InkFlush,
+                Some(INK_FLUSH_CONFIRMATION_TOKEN),
+                false,
+                10_500
+            ),
+            Err(SafetyInterlockError::CooldownActive { .. })
+        ));
+    }
+
+    #[test]
+    fn atomic_persist_and_reload_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "pixma-maint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_path = dir.join("sub").join("state.json");
+
+        let mut sup = MaintenanceSupervisor::load_or_init(&state_path).unwrap();
+        sup.update_d_counter_from_hardware(f32::NAN);
+        sup.update_d_counter_from_hardware(12.5);
+        sup.record_cleaning_executed(CleaningType::Deep, 5_000)
+            .unwrap();
+
+        let reloaded = MaintenanceSupervisor::load_or_init(&state_path).unwrap();
+        assert_eq!(reloaded.record().last_deep_clean_epoch, 5_000);
+        assert!((reloaded.record().estimated_d_counter_percent - 13.7).abs() < 0.01);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                file_mode, 0o644,
+                "State file must remain readable by CUPS filters (lp) at 0644"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_init_rejects_unwritable_parent_dir() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+        if uid == 0 {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "pixma-maint-ro-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = MaintenanceSupervisor::load_or_init(dir.join("state.json"))
+            .expect_err("Read-only parent dir must fail early in load_or_init");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_init_rejects_corrupted_json_without_overwriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "pixma-maint-corrupt-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let corrupt = b"{not valid maintenance json";
+        std::fs::write(&state_path, corrupt).unwrap();
+
+        let err = MaintenanceSupervisor::load_or_init(&state_path)
+            .expect_err("Corrupted state.json must return InvalidData instead of zeroing state");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&state_path).unwrap(), corrupt);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

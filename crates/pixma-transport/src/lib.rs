@@ -6,7 +6,7 @@ pub mod mock_device;
 pub mod nusb_transport;
 pub mod traits;
 
-pub use controller::{AnyTransport, G2010Controller};
+pub use controller::{extract_ieee1284_tag, AnyTransport, G2010Controller};
 pub use mock_device::{MockG2010Transport, G2010_IEEE1284_DEVICE_ID};
 pub use nusb_transport::{discover_canon_devices, FileLockGuard, NusbTransport, SUPPORTED_PIDS};
 pub use traits::UsbTransport;
@@ -292,5 +292,43 @@ mod tests {
             )
             .await;
         assert!(test_print_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_controller_cleaning_uses_nul_framing_and_valid_inkgroup() {
+        let mock = MockG2010Transport::new();
+        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        let mut controller = G2010Controller::new(mock, supervisor);
+
+        let status = controller
+            .execute_maintenance(
+                MaintenanceAction::Clean {
+                    kind: CleaningType::Regular,
+                    target: CleaningTarget::ColorOnly,
+                },
+                None,
+                false,
+            )
+            .await
+            .expect("Cleaning should succeed in mock transport");
+        assert_eq!(status.state, pixma_core::models::OperationalState::Idle);
+
+        let writes = controller.transport().recorded_printer_writes();
+        // write[0] is initial GetStatus, write[1] StartJob, write[2] NUL pad, write[3] Cleaning, write[4] EndJob
+        let start_xml = String::from_utf8_lossy(&writes[1]);
+        assert!(start_xml.contains("<ivec:operation>StartJob</ivec:operation>"));
+        assert!(start_xml.contains("servicetype=\"maintenance\""));
+        assert!(start_xml.contains("<ivec:bidi>0</ivec:bidi>"));
+
+        let nul_pad = &writes[2];
+        assert_eq!(nul_pad.len(), writes[1].len());
+        assert!(nul_pad.iter().all(|&b| b == 0));
+
+        let clean_xml = String::from_utf8_lossy(&writes[3]);
+        assert!(clean_xml.contains("<ivec:inkgroup>group2</ivec:inkgroup>"));
+        assert!(clean_xml.contains("<ivec:type>regular</ivec:type>"));
+
+        let end_xml = String::from_utf8_lossy(&writes[4]);
+        assert!(end_xml.contains("<ivec:operation>EndJob</ivec:operation>"));
     }
 }

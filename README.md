@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Platform: Arch Linux](https://img.shields.io/badge/Platform-Arch_Linux-1793d1.svg)](https://archlinux.org)
-[![Rust: 1.78+](https://img.shields.io/badge/Rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 **[Русская документация (README.ru.md)](./README.ru.md)**
 
@@ -15,7 +15,7 @@ Full-featured, memory-safe Linux driver, scanner backend, maintenance utility, a
 Canon's official Linux driver packages (`cnijfilter2` and `scangearmp2`) treat the G2010 as an afterthought:
 - **Missing USB IDs & PPDs**: USB Product ID `04a9:183a` (`G2010 series`) and `04a9:183c` (`G1010 series`) are completely omitted from `80-canon_mfp2.rules`, `canon_mfp2.conf`, and `/usr/share/cups/model/`.
 - **Locked Print Engine**: Even when forced to run with a G3010 PPD, `rastertocanonij` only passes 4 flags (`--papersize`, `--media`, `--grayscale`, `--duplex`), locking print resolution to a single 600 DPI preset and ignoring draft mode (`300x300`), fine photo passes, borderless extension sliders, paper gap control, ink drying times, and manual C/M/Y color balance.
-- **65%+ of Hardware Maintenance Missing**: `cmdtocanonij3` hardcodes only three commands (`PrintSelfTestPage`, `Clean all`, `com.canon.autoalignment`). Crucial CISS operations supported by the printer's firmware — independent Black (`inkgroup1`) vs Color (`inkgroup2`) cleaning, Deep Cleaning (`deep`), **System Ink Flush (`choke`)** for purging air from CISS ink tubes, Roller Cleaning (`roller`), Bottom Plate Cleaning (`platen`), and Manual Head Alignment (`manual_registration` — the only alignment mode G2010/G3010 actually support) — are unreachable on Linux.
+- **65%+ of Hardware Maintenance Missing**: `cmdtocanonij3` hardcodes only three commands (`PrintSelfTestPage`, `Clean all`, `com.canon.autoalignment`). Crucial CISS operations supported by the printer's firmware — independent Black (`group1`) vs Color (`group2`) cleaning, Deep Cleaning (`deep`), **System Ink Flush (`choke`)** for purging air from CISS ink tubes, Roller Cleaning (`roller`), Bottom Plate Cleaning (`platen`), and Manual Head Alignment (`manual_registration` — the only alignment mode G2010/G3010 actually support) — are unreachable on Linux.
 - **Discarded Telemetry**: `cnijlgmon3` queries `<ivec:operation>GetStatus</ivec:operation>` over USB, receives full XML telemetry (`<vcn:supportcode>`, `<vcn:statusdetail>`, `<vcn:ink>`, waste ink absorber counters), and throws almost all of it away.
 - **Crippled Scanner**: `scangearmp2` caps flatbed resolution at 600 DPI and lacks CIS line-stagger compensation, auto-multi-crop, deskew, FFT moire descreening, dust removal, gutter shadow correction, and spline tone curves.
 
@@ -49,11 +49,11 @@ To protect the printheads, carriage mechanics, and mainboard:
 
 | Device Model | USB ID | Wire Protocol (`CID`) | Print Engine | Scanner (`MP2`) | Support Tier |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Canon PIXMA G2010** | `04a9:183a` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | 75–1200 DPI (A4/Letter) | **Tier 1: Hardware-Verified** (Tested on live physical unit `0051B0`, FW `1.020`) |
+| **Canon PIXMA G2010** | `04a9:183a` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | 75–1200 DPI (A4/Letter) | **Tier 1: Hardware-Verified** (Tested on live physical hardware, FW `1.020`) |
 | **Canon PIXMA G1010 / G1000** | `04a9:183c` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | N/A (Single-function) | **Tier 2: Protocol-Identical** (Same `BJR520` table & `BH-4`/`CH-41` heads; community testing) |
 | **Canon PIXMA G2000** | `04a9:1795` | `CA_BJR520_IJP` | `BJRaster3` (`BJR520`) + `IVEC` | 75–1200 DPI | **Tier 2: Protocol-Identical** (Same `BJR520` + `MP2` architecture; community testing) |
 | **Canon PIXMA G3010 / G3000** | `04a9:183b` / `04a9:1794` | `CA_IVEC1TYPE4_IJP` | `PWGRaster` (`RaS2`) + `IVEC` | 75–1200 DPI | **Tier 3: Protocol-Supported** (`compile_ivec_pwg_job` implemented; community testing) |
-| **Canon PIXMA G4010 / G2020** | `04a9:183d` / `04a9:1892` | `CA_IVEC1TYPE4_IJP` | `PWGRaster` (`RaS2`) + `IVEC` | 75–1200 DPI | **Tier 3: Experimental / Community** (Untested on physical hardware; PRs welcome) |
+| **Canon PIXMA G4010 / G2020** | `04a9:183d` / `04a9:18bd` | `CA_IVEC1TYPE4_IJP` | `PWGRaster` (`RaS2`) + `IVEC` | 75–1200 DPI | **Tier 3: Experimental / Community** (Untested on physical hardware; PRs welcome) |
 
 > **Policy on Other Canon Models**: Only the **Canon PIXMA G2010 (`04a9:183a`)** is certified as **Tier 1 (Hardware-Verified)** because we test every commit against physical G2010 hardware. Other Canon MegaTank models with known `BJRxxx` / `IVEC` tables can be added via modular protocol descriptors, and community verification reports with real hardware logs are welcome via GitHub Issues/PRs.
 

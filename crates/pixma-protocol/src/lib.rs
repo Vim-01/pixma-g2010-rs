@@ -22,11 +22,13 @@ pub use cncl_codec::{decode_cncl_string, encode_cncl_string};
 pub use errors::ProtocolError;
 pub use ivec::{
     build_bjl_set_time_send_data, build_cancel_job, build_cleaning_cmd, build_end_job,
-    build_get_status_cmd, build_manual_alignment_values_cmd, build_mode_shift,
-    build_roller_cleaning_cmd, build_send_data_header, build_set_job_configuration,
-    build_set_maintenance_job_configuration, build_set_page_configuration,
-    build_set_print_configuration, build_start_job, build_test_print_cmd, parse_status_response,
-    IVEC_COMMON_NS, VCN_CANON_NS,
+    build_get_maintenance_capability_cmd, build_get_status_cmd, build_maintenance_start_job,
+    build_manual_alignment_values_cmd, build_mode_shift, build_roller_cleaning_cmd,
+    build_send_data_header, build_set_job_configuration, build_set_maintenance_job_configuration,
+    build_set_page_configuration, build_set_print_configuration, build_start_job,
+    build_test_print_cmd, extract_ivec_cleaning_actions, parse_maintenance_cleaning_groups,
+    parse_status_response, parse_status_response_with_meta, ParsedStatusReport, IVEC_COMMON_NS,
+    VCN_CANON_NS,
 };
 pub use mp2_scanner::{
     aligned_scan_width, build_cancel_or_finish_scan, build_gamma_table,

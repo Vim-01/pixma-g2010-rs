@@ -179,6 +179,20 @@ impl Default for InkLevels {
     }
 }
 
+/// Physical USB hardware locator and transport identity from `nusb`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UsbHardwareMarker {
+    pub is_mock: bool,
+    pub bus_number: Option<u8>,
+    pub device_address: Option<u8>,
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+    pub serial_number: String,
+    pub manufacturer: Option<String>,
+    pub product_name: Option<String>,
+    pub endpoints_summary: String,
+}
+
 /// Complete live telemetry snapshot of the printer/scanner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceStatus {
@@ -210,5 +224,34 @@ impl Default for DeviceStatus {
             color_head_state: CartridgeState::InstalledOk,
             waste_absorber_percent: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_eight_usb_pids_roundtrip() {
+        let expected = [
+            (G1010_USB_PID, PrinterModel::G1010, "G1010 series", false, false, false),
+            (G2000_USB_PID, PrinterModel::G2000, "G2000 series", true, false, false),
+            (G2010_USB_PID, PrinterModel::G2010, "G2010 series", true, false, false),
+            (G2020_USB_PID, PrinterModel::G2020, "G2020 series", true, false, false),
+            (G3000_USB_PID, PrinterModel::G3000, "G3000 series", true, false, true),
+            (G3010_USB_PID, PrinterModel::G3010, "G3010 series", true, false, true),
+            (G4000_USB_PID, PrinterModel::G4000, "G4000 series", true, true, true),
+            (G4010_USB_PID, PrinterModel::G4010, "G4010 series", true, true, true),
+        ];
+        for (pid, model, series, scanner, adf, net) in expected {
+            assert_eq!(PrinterModel::from_usb_pid(pid), Some(model));
+            assert_eq!(model.usb_pid(), pid);
+            assert_eq!(model.model_series_name(), series);
+            let caps = model.capabilities();
+            assert_eq!(caps.has_scanner, scanner);
+            assert_eq!(caps.has_adf, adf);
+            assert_eq!(caps.has_network, net);
+        }
+        assert_eq!(PrinterModel::from_usb_pid(0xFFFF), None);
     }
 }

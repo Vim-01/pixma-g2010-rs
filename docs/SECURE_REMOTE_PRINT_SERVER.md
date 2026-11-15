@@ -30,8 +30,8 @@ When an ARM laptop acts as a print server while traveling through **public Wi-Fi
 | CUPS Client        |                                       | Local Loopback Only        |
 | (ipp://127.0.0.1:   |                                       | - pixma-printer-app:8631   |
 |        8631/print) |   Encrypted SSH Tunnel / WireGuard    | - pixma-escl-server:8080   |
-|                    | ====================================> | - pixmad (/run/pixma.sock) |
-| SANE Client        |   (Mutual Auth, No Remote Shell)      |             |              |
+|                    | ====================================> | - pixmad (Unix socket      |
+| SANE Client        |   (Mutual Auth, No Remote Shell)      |    /run/pixma/pixmad.sock) |
 | (http://127.0.0.1: |                                       |             v              |
 |        8080/eSCL)  |                                       | Canon PIXMA G2010 (USB)    |
 +--------------------+                                       +----------------------------+
@@ -46,7 +46,7 @@ When an ARM laptop acts as a print server while traveling through **public Wi-Fi
 The provided systemd services (`pixma-printer-app.service` and `pixma-escl.service`) bind exclusively to loopback by default:
 - `pixma-printer-app --bind 127.0.0.1:8631`
 - `pixma-escl-server --bind 127.0.0.1:8080`
-- `pixmad --socket /run/pixma/pixmad.sock`
+- `pixmad --require-hardware --socket /run/pixma/pixmad.sock --state-file /var/lib/pixma-g2010/state.json`
 
 Verify that no service listens on `0.0.0.0` or public interfaces:
 ```bash
@@ -186,18 +186,19 @@ protocol = http
 
 Test scan over tunnel:
 ```bash
-scanimage -d "escl:http://127.0.0.1:8080" --format=png > /tmp/remote_scan.png
+scanimage -d "escl:http://127.0.0.1:8080" --format=png > remote_scan.png
 ```
 
 ### 3. PIXMA CLI Remote Query
 You can forward status queries using `curl`:
 ```bash
-curl http://127.0.0.1:8631/status
+curl -sf http://127.0.0.1:8631/api/status
 ```
-Or forward the Unix socket over SSH:
+Or forward the Unix socket into your private runtime directory over SSH:
 ```bash
-ssh -nNT -L /tmp/pixmad_remote.sock:/run/pixma/pixmad.sock user@laptop
-pixma-cli --socket /tmp/pixmad_remote.sock status
+RUNTIME_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pixmad_remote.sock"
+ssh -nNT -L "${RUNTIME_SOCK}:/run/pixma/pixmad.sock" user@laptop
+pixma-cli --socket "${RUNTIME_SOCK}" status
 ```
 
 ---

@@ -336,12 +336,29 @@ impl IppResponse {
     }
 
     /// Builds a `Get-Printer-Attributes` response populated with Canon PIXMA G2010 capabilities
-    /// and live device status.
+    /// and live device status using the default loopback printer URI.
     pub fn build_printer_attributes(
         version_major: u8,
         version_minor: u8,
         request_id: u32,
         status: &DeviceStatus,
+    ) -> Self {
+        Self::build_printer_attributes_with_uri(
+            version_major,
+            version_minor,
+            request_id,
+            status,
+            "ipp://127.0.0.1:8631/ipp/print",
+        )
+    }
+
+    /// Builds a `Get-Printer-Attributes` response using the supplied `printer_uri_base`.
+    pub fn build_printer_attributes_with_uri(
+        version_major: u8,
+        version_minor: u8,
+        request_id: u32,
+        status: &DeviceStatus,
+        printer_uri_base: &str,
     ) -> Self {
         let mut resp = Self::new(
             version_major,
@@ -402,7 +419,7 @@ impl IppResponse {
         ));
         resp.add_printer_attribute(IppAttribute::new_single(
             "printer-uri-supported",
-            IppValue::text(TAG_URI, "ipp://127.0.0.1:8631/ipp/print"),
+            IppValue::text(TAG_URI, printer_uri_base.trim_end_matches('/')),
         ));
         resp.add_printer_attribute(IppAttribute::new_single(
             "uri-security-supported",
@@ -576,12 +593,30 @@ impl IppResponse {
         resp
     }
 
-    /// Builds a `Create-Job` response with job-id, job-uri, and pending/processing job-state.
+    /// Builds a `Create-Job` response with job-id, job-uri, and pending/processing job-state
+    /// using the default loopback printer URI.
     pub fn build_create_job_response(
         version_major: u8,
         version_minor: u8,
         request_id: u32,
         job_id: i32,
+    ) -> Self {
+        Self::build_create_job_response_with_uri(
+            version_major,
+            version_minor,
+            request_id,
+            job_id,
+            "ipp://127.0.0.1:8631/ipp/print",
+        )
+    }
+
+    /// Builds a `Create-Job` response using the supplied `printer_uri_base`.
+    pub fn build_create_job_response_with_uri(
+        version_major: u8,
+        version_minor: u8,
+        request_id: u32,
+        job_id: i32,
+        printer_uri_base: &str,
     ) -> Self {
         let mut resp = Self::new(
             version_major,
@@ -589,6 +624,7 @@ impl IppResponse {
             STATUS_SUCCESSFUL_OK,
             request_id,
         );
+        let uri_base = printer_uri_base.trim_end_matches('/');
 
         resp.add_job_attribute(IppAttribute::new_single(
             "job-id",
@@ -596,10 +632,7 @@ impl IppResponse {
         ));
         resp.add_job_attribute(IppAttribute::new_single(
             "job-uri",
-            IppValue::text(
-                TAG_URI,
-                &format!("ipp://127.0.0.1:8631/ipp/print/jobs/{job_id}"),
-            ),
+            IppValue::text(TAG_URI, &format!("{uri_base}/jobs/{job_id}")),
         ));
         resp.add_job_attribute(IppAttribute::new_single(
             "job-state",
@@ -613,12 +646,30 @@ impl IppResponse {
         resp
     }
 
-    /// Builds a `Print-Job` / `Send-Document` response with job-id, job-uri, and completed job-state.
+    /// Builds a `Print-Job` / `Send-Document` response with job-id, job-uri, and completed job-state
+    /// using the default loopback printer URI.
     pub fn build_print_job_response(
         version_major: u8,
         version_minor: u8,
         request_id: u32,
         job_id: i32,
+    ) -> Self {
+        Self::build_print_job_response_with_uri(
+            version_major,
+            version_minor,
+            request_id,
+            job_id,
+            "ipp://127.0.0.1:8631/ipp/print",
+        )
+    }
+
+    /// Builds a `Print-Job` / `Send-Document` response using the supplied `printer_uri_base`.
+    pub fn build_print_job_response_with_uri(
+        version_major: u8,
+        version_minor: u8,
+        request_id: u32,
+        job_id: i32,
+        printer_uri_base: &str,
     ) -> Self {
         let mut resp = Self::new(
             version_major,
@@ -626,6 +677,7 @@ impl IppResponse {
             STATUS_SUCCESSFUL_OK,
             request_id,
         );
+        let uri_base = printer_uri_base.trim_end_matches('/');
 
         resp.add_job_attribute(IppAttribute::new_single(
             "job-id",
@@ -633,10 +685,7 @@ impl IppResponse {
         ));
         resp.add_job_attribute(IppAttribute::new_single(
             "job-uri",
-            IppValue::text(
-                TAG_URI,
-                &format!("ipp://127.0.0.1:8631/ipp/print/jobs/{job_id}"),
-            ),
+            IppValue::text(TAG_URI, &format!("{uri_base}/jobs/{job_id}")),
         ));
         resp.add_job_attribute(IppAttribute::new_single(
             "job-state",

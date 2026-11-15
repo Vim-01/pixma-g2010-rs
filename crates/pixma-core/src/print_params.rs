@@ -427,3 +427,44 @@ impl Default for PrintJobConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glossy_media_enforces_composite_cmy_black() {
+        let glossy = [
+            MediaType::PhotoPlusGlossyII,
+            MediaType::PhotoProPlatinum,
+            MediaType::PhotoProLuster,
+            MediaType::PhotoPlusSemiGloss,
+            MediaType::GlossyPhoto,
+        ];
+        for m in glossy {
+            assert!(m.requires_composite_cmy_black());
+        }
+        let non_glossy = [
+            MediaType::Plain,
+            MediaType::MattePhoto,
+            MediaType::HighResolutionPaper,
+            MediaType::Envelope,
+            MediaType::Hagaki,
+        ];
+        for m in non_glossy {
+            assert!(!m.requires_composite_cmy_black());
+        }
+    }
+
+    #[test]
+    fn option_parsing_and_quality_dpi_mappings() {
+        assert_eq!(MediaType::from_option_str("PLUSGLOSSYII"), MediaType::PhotoPlusGlossyII);
+        assert_eq!(MediaType::from_option_str("unknown"), MediaType::Plain);
+        assert_eq!(PrintQuality::Level1Fine.base_raster_dpi(), 1200);
+        assert_eq!(PrintQuality::Level3Standard.base_raster_dpi(), 600);
+        assert_eq!(PrintQuality::Level5Draft.base_raster_dpi(), 300);
+        assert_eq!(PaperSize::A4.dimensions_mm(), (210.0, 297.0));
+        assert_eq!(PaperGapMode::WidePreventAbrasion.ivec_xml_value(), "wide");
+        assert_eq!(InkDryingTime::ExtraLong.pause_seconds(), 12);
+    }
+}

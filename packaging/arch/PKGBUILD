@@ -10,7 +10,7 @@ pkgname=(
   'pixma-g2010-gui'
   'pixma-g2010-meta'
 )
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Modern memory-safe Rust software suite for Canon PIXMA G2010 on Arch Linux"
 arch=('x86_64' 'aarch64')
@@ -34,6 +34,7 @@ package_pixma-g2010-core() {
 
   cd "$_workspace_root" || return 1
   install -Dm755 target/release/pixmad "$pkgdir/usr/bin/pixmad"
+  install -Dm755 target/release/pixma-sock-bridge "$pkgdir/usr/bin/pixma-sock-bridge"
   install -Dm644 assets/udev/70-pixma-g2010.rules "$pkgdir/usr/lib/udev/rules.d/70-pixma-g2010.rules"
   install -Dm644 assets/systemd/pixmad.service "$pkgdir/usr/lib/systemd/system/pixmad.service"
 }

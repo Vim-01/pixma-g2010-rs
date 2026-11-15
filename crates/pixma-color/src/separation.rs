@@ -218,7 +218,7 @@ impl InkSeparator {
             cmyk.len() * 3,
             "RGB byte buffer length must equal cmyk.len() * 3"
         );
-        for (src, dst) in rgb.chunks_exact(3).zip(cmyk.iter_mut()) {
+        for (src, dst) in rgb.as_chunks::<3>().0.iter().zip(cmyk.iter_mut()) {
             *dst = self.separate_pixel(src[0], src[1], src[2]);
         }
     }
@@ -235,7 +235,7 @@ impl InkSeparator {
         );
         let count = rgb.len() / 3;
         let mut out = Vec::with_capacity(count);
-        for src in rgb.chunks_exact(3) {
+        for src in rgb.as_chunks::<3>().0 {
             out.push(self.separate_pixel(src[0], src[1], src[2]));
         }
         out
@@ -292,7 +292,7 @@ impl InkSeparator {
         assert_eq!(y_plane.len(), count, "Yellow plane size mismatch");
         assert_eq!(k_plane.len(), count, "Black plane size mismatch");
 
-        for (i, chunk) in rgb.chunks_exact(3).enumerate() {
+        for (i, chunk) in rgb.as_chunks::<3>().0.iter().enumerate() {
             let pixel = self.separate_pixel(chunk[0], chunk[1], chunk[2]);
             c_plane[i] = pixel.c;
             m_plane[i] = pixel.m;

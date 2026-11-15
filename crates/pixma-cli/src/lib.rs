@@ -5,22 +5,14 @@ pub mod args;
 pub mod commands;
 pub mod status;
 
-use pixma_core::maintenance::{MaintenanceRecord, MaintenanceSupervisor};
 use pixma_daemon::DaemonClient;
-use pixma_transport::controller::{AnyTransport, G2010Controller};
-use pixma_transport::mock_device::MockG2010Transport;
 use std::path::Path;
 
-/// Establishes communication with the printer via `pixmad` socket or direct controller.
+/// Establishes communication with the printer via `--mock` / `PIXMA_MOCK=1` or fail-closed live hardware (`pixmad` / USB).
 pub async fn connect_client(socket: Option<&Path>, mock: bool) -> anyhow::Result<DaemonClient> {
-    if mock {
-        let mock_transport = MockG2010Transport::new();
-        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-        let controller =
-            G2010Controller::new(AnyTransport::Mock(Box::new(mock_transport)), supervisor);
-        Ok(DaemonClient::direct(controller))
+    if mock || std::env::var("PIXMA_MOCK").as_deref() == Ok("1") {
+        Ok(DaemonClient::connect_mock(None)?)
     } else {
-        let client = DaemonClient::connect_or_fallback(socket, None).await?;
-        Ok(client)
+        Ok(DaemonClient::connect_live(socket, None).await?)
     }
 }

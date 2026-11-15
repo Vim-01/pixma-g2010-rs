@@ -492,3 +492,16 @@ fn test_cli_parse_completions() {
     assert!(out.contains("nozzle-check"));
     assert!(out.contains("status"));
 }
+
+#[tokio::test]
+async fn test_connect_client_live_fails_closed_when_socket_missing() {
+    let missing_sock = std::env::temp_dir().join(format!(
+        "pixma-cli-missing-sock-{}",
+        std::process::id()
+    ));
+    let res = connect_client(Some(&missing_sock), false).await;
+    assert!(
+        res.is_err(),
+        "connect_client without --mock must fail closed when socket is unavailable"
+    );
+}

@@ -419,4 +419,17 @@ mod tests {
         assert!(page.starts_with(&[0x1b, b'(', b'c']));
         assert_eq!(page.last(), Some(&FORM_FEED));
     }
+
+    #[test]
+    fn rejects_unsupported_resolution_and_encodes_media_codes() {
+        assert!(BjRaster3Encoder::encode_resolution(720).is_err());
+        assert_eq!(
+            BjRaster3Encoder::encode_media_type(MediaType::Plain),
+            vec![0x1b, b'(', b'M', 0x01, 0x00, 0x01]
+        );
+        assert_eq!(
+            BjRaster3Encoder::encode_media_type(MediaType::PhotoPlusGlossyII),
+            vec![0x1b, b'(', b'M', 0x01, 0x00, 0x06]
+        );
+    }
 }

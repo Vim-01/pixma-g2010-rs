@@ -10,7 +10,6 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -75,7 +74,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let timestamp = format_timestamp_now();
+    let timestamp = pixma_core::current_utc_timestamp_14();
     let compiled_stream =
         match PrintRasterPipeline::compile_ivec_bjraster3_job(&pages, &config, &timestamp) {
             Ok(s) => s,
@@ -93,31 +92,4 @@ fn main() -> ExitCode {
     let _ = stdout.flush();
 
     ExitCode::SUCCESS
-}
-
-/// Formats current UTC timestamp as 14-character string `YYYYMMDDHHMMSS`.
-fn format_timestamp_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let days = (secs / 86400) as i64;
-    let rem_secs = (secs % 86400) as u32;
-    let hour = rem_secs / 3600;
-    let minute = (rem_secs % 3600) / 60;
-    let second = rem_secs % 60;
-
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1024 + doe / 1460 - doe / 36524) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{y:04}{m:02}{d:02}{hour:02}{minute:02}{second:02}")
 }

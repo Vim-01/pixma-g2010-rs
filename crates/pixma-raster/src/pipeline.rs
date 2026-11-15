@@ -120,10 +120,12 @@ impl PrintRasterPipeline {
                                 rgb_line[i * 3 + 1],
                                 rgb_line[i * 3 + 2],
                             );
-                            debug_assert_eq!(
-                                cmyk.k_pgbk, 0,
-                                "Pigment black must be strictly 0 on glossy media"
-                            );
+                            if cmyk.k_pgbk != 0 {
+                                return Err(RasterError::SafetyViolation(
+                                    "Pigment black (PGBK) must be 0 on glossy/coated media"
+                                        .to_string(),
+                                ));
+                            }
                         }
                     }
 
@@ -164,7 +166,7 @@ impl PrintRasterPipeline {
                         cmyk_pixels.push(cmyk);
                     }
                 } else {
-                    for chunk in raw.chunks_exact(3) {
+                    for chunk in raw.as_chunks::<3>().0 {
                         let cmyk = separator.separate_pixel(chunk[0], chunk[1], chunk[2]);
                         cmyk_pixels.push(cmyk);
                     }
@@ -464,7 +466,7 @@ fn is_page_neutral_monochrome(page_lines: &[ValidatedRasterLine]) -> bool {
         if line.bytes_per_pixel() == 1 {
             continue;
         }
-        for px in line.as_bytes().chunks_exact(3) {
+        for px in line.as_bytes().as_chunks::<3>().0 {
             let r = px[0];
             let g = px[1];
             let b = px[2];
@@ -704,5 +706,18 @@ mod tests {
         assert_eq!(halftoned.len(), 1);
         let lines = &halftoned[0];
         assert_eq!(lines[0].bytes_per_pixel(), 4); // CMYK 4 planes
+    }
+
+    #[test]
+    fn test_glossy_media_runtime_check_blocks_pgbk_without_panicking() {
+        let page = make_test_page(32, 16);
+        let glossy_config = PrintJobConfig {
+            media_type: pixma_core::print_params::MediaType::PhotoPlusGlossyII,
+            ..Default::default()
+        };
+        let rendered =
+            PrintRasterPipeline::render_pages_to_validated_lines(&[page], &glossy_config).unwrap();
+        assert_eq!(rendered.len(), 1);
+        assert!(!rendered[0].is_empty());
     }
 }

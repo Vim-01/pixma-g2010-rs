@@ -29,23 +29,22 @@ mod tests {
             assert_eq!(status, SANE_STATUS_GOOD);
             assert_eq!(version_code, sane_version_code(1, 0, 4));
 
-            // 2. sane_get_devices
+            // 2. sane_get_devices (live-probed: empty when offline unless hardware/pixmad is connected)
             let mut dev_list: *const *const SANE_Device = std::ptr::null();
             let status = sane_get_devices(&mut dev_list, SANE_FALSE);
             assert_eq!(status, SANE_STATUS_GOOD);
             assert!(!dev_list.is_null());
             let first_dev = *dev_list;
-            assert!(!first_dev.is_null());
-            let dev_name = std::ffi::CStr::from_ptr((*first_dev).name)
-                .to_str()
-                .unwrap();
-            assert_eq!(dev_name, "pixma:G2010");
+            if !first_dev.is_null() {
+                let dev_name = std::ffi::CStr::from_ptr((*first_dev).name)
+                    .to_str()
+                    .unwrap();
+                assert!(dev_name == "pixma:G2010" || dev_name == "pixma:G2010:mock");
+            }
 
-            // 3. sane_open
-            // Force mock mode in test environment
-            std::env::set_var("PIXMA_MOCK", "1");
+            // 3. sane_open (explicit mock device suffix without mutating process env vars)
             let mut handle: SANE_Handle = std::ptr::null_mut();
-            let status = sane_open((*first_dev).name, &mut handle);
+            let status = sane_open(b"pixma:G2010:mock\0".as_ptr() as *const SANE_Char, &mut handle);
             assert_eq!(status, SANE_STATUS_GOOD);
             assert!(!handle.is_null());
 
@@ -197,6 +196,65 @@ mod tests {
             );
             sane_cancel(std::ptr::null_mut());
             sane_close(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_sane_open_validates_device_names() {
+        unsafe {
+            let mut version: SANE_Int = 0;
+            assert_eq!(sane_init(&mut version, None), SANE_STATUS_GOOD);
+
+            let mut handle: SANE_Handle = std::ptr::null_mut();
+            assert_eq!(
+                sane_open(std::ptr::null(), &mut handle),
+                SANE_STATUS_INVAL
+            );
+            assert!(handle.is_null());
+
+            assert_eq!(
+                sane_open(b"pixma:UNKNOWN\0".as_ptr() as *const SANE_Char, &mut handle),
+                SANE_STATUS_INVAL
+            );
+            assert!(handle.is_null());
+
+            // Live device name opens cleanly (lazy connect) and closes cleanly
+            assert_eq!(
+                sane_open(b"pixma:G2010\0".as_ptr() as *const SANE_Char, &mut handle),
+                SANE_STATUS_GOOD
+            );
+            assert!(!handle.is_null());
+            sane_close(handle);
+
+            // Empty string also defaults to live session
+            let mut empty_handle: SANE_Handle = std::ptr::null_mut();
+            assert_eq!(
+                sane_open(b"\0".as_ptr() as *const SANE_Char, &mut empty_handle),
+                SANE_STATUS_GOOD
+            );
+            sane_close(empty_handle);
+
+            sane_exit();
+        }
+    }
+
+    #[test]
+    fn test_select_device_list_probe_modes() {
+        unsafe {
+            let offline = crate::ffi::select_device_list(false, false);
+            assert!((*offline).is_null(), "Offline probe must return empty device list");
+
+            let live = crate::ffi::select_device_list(false, true);
+            assert!(!(*live).is_null());
+            let live_name = std::ffi::CStr::from_ptr((**live).name).to_str().unwrap();
+            assert_eq!(live_name, "pixma:G2010");
+
+            let mock_only = crate::ffi::select_device_list(true, false);
+            assert!(!(*mock_only).is_null());
+            let mock_name = std::ffi::CStr::from_ptr((**mock_only).name)
+                .to_str()
+                .unwrap();
+            assert_eq!(mock_name, "pixma:G2010:mock");
         }
     }
 }

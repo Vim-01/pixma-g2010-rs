@@ -17,9 +17,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.88"
 authors = ["Vim-01"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Vim-01/pixma-g2010-rs"

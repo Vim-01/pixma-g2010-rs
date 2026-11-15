@@ -9,29 +9,28 @@
 //! - `DELETE /eSCL/ScanJobs/{uuid}`
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use image::RgbImage;
-use pixma_core::maintenance::{MaintenanceRecord, MaintenanceSupervisor};
 use pixma_core::scan_params::{ScanColorMode, ScanGeometry, ScanParameters, ScanResolution};
-use pixma_imageproc::{export_jpeg, export_pdf_multipage, export_png};
-use pixma_transport::controller::{AnyTransport, G2010Controller};
-use pixma_transport::mock_device::MockG2010Transport;
-use pixma_transport::nusb_transport::{discover_canon_devices, NusbTransport};
+use pixma_daemon::DaemonClient;
+use pixma_imageproc::{decode_raw_scan_buffer, export_jpeg, export_pdf_multipage, export_png};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::xml_models::{
     build_scanner_capabilities_xml, build_scanner_status_xml, parse_scan_settings_xml, EsclJobInfo,
 };
 
+const MAX_RETAINED_JOBS: usize = 64;
+const MAX_ESCL_XML_BODY_BYTES: usize = 1024 * 1024;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Generates a compliant unique UUID string for each scan job.
@@ -57,26 +56,31 @@ pub struct StoredScanJob {
 /// Shared application state for the eSCL server.
 pub struct EsclServerState {
     pub is_mock: bool,
-    pub controller: Mutex<Option<G2010Controller<AnyTransport>>>,
+    client: Mutex<Option<DaemonClient>>,
+    socket_path: Option<PathBuf>,
     pub jobs: RwLock<HashMap<String, StoredScanJob>>,
 }
 
 impl EsclServerState {
-    /// Creates a new server state. In non-mock mode, USB is opened on-demand per scan job
-    /// so the USB interface and `/tmp/pixma-g2010.lock` are never held while idle.
+    /// Creates a new server state. In non-mock mode, connects via `pixmad` / USB on-demand
+    /// per scan job so the USB interface and session lock are never held while idle.
     pub fn new(mock: bool) -> Self {
+        Self::with_socket(mock, None)
+    }
+
+    /// Creates a new server state targeting a specific `pixmad` socket path when live.
+    pub fn with_socket(mock: bool, socket_path: Option<PathBuf>) -> Self {
         let is_mock = mock || std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
-        let controller = if is_mock {
-            let transport = AnyTransport::Mock(Box::new(MockG2010Transport::new()));
-            let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-            Some(G2010Controller::new(transport, supervisor))
+        let client = if is_mock {
+            DaemonClient::connect_mock(None).ok()
         } else {
             None
         };
 
         Self {
             is_mock,
-            controller: Mutex::new(controller),
+            client: Mutex::new(client),
+            socket_path,
             jobs: RwLock::new(HashMap::new()),
         }
     }
@@ -84,6 +88,27 @@ impl EsclServerState {
     /// Creates an in-memory mock server state for testing.
     pub fn new_mock() -> Self {
         Self::new(true)
+    }
+}
+
+fn evict_excess_jobs(jobs: &mut HashMap<String, StoredScanJob>, max_jobs: usize) {
+    while jobs.len() >= max_jobs {
+        let victim = jobs
+            .iter()
+            .filter(|(_, job)| job.retrieved)
+            .min_by_key(|(_, job)| job.created_at)
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                jobs.iter()
+                    .min_by_key(|(_, job)| job.created_at)
+                    .map(|(k, _)| k.clone())
+            });
+        match victim {
+            Some(key) => {
+                jobs.remove(&key);
+            }
+            None => break,
+        }
     }
 }
 
@@ -137,14 +162,17 @@ async fn handle_create_scan_job(
 
     // eSCL scan regions are specified in 300ths of an inch (1/300")
     let target_dpi = resolution.as_dpi() as u32;
+    let target_dpi_u64 = u64::from(target_dpi);
     let (max_w, max_h) = resolution.max_flatbed_pixels();
 
-    let x_offset = ((req.x_offset.unwrap_or(0) * target_dpi) / 300).min(max_w.saturating_sub(1));
-    let y_offset = ((req.y_offset.unwrap_or(0) * target_dpi) / 300).min(max_h.saturating_sub(1));
-    let width =
-        ((req.width.unwrap_or(2550) * target_dpi) / 300).clamp(1, max_w.saturating_sub(x_offset));
-    let height =
-        ((req.height.unwrap_or(3508) * target_dpi) / 300).clamp(1, max_h.saturating_sub(y_offset));
+    let x_offset = ((u64::from(req.x_offset.unwrap_or(0)) * target_dpi_u64) / 300)
+        .min(u64::from(max_w.saturating_sub(1))) as u32;
+    let y_offset = ((u64::from(req.y_offset.unwrap_or(0)) * target_dpi_u64) / 300)
+        .min(u64::from(max_h.saturating_sub(1))) as u32;
+    let width = ((u64::from(req.width.unwrap_or(2550)) * target_dpi_u64) / 300)
+        .clamp(1, u64::from(max_w.saturating_sub(x_offset))) as u32;
+    let height = ((u64::from(req.height.unwrap_or(3508)) * target_dpi_u64) / 300)
+        .clamp(1, u64::from(max_h.saturating_sub(y_offset))) as u32;
 
     let geometry = ScanGeometry {
         x_offset,
@@ -166,68 +194,37 @@ async fn handle_create_scan_job(
         gamma: 2.2,
     };
 
-    let raw_bytes = {
-        let mut guard = state.controller.lock().await;
-        if let Some(ctrl) = guard.as_mut() {
-            ctrl.acquire_raw_scan(&params)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        } else {
-            let transport = if let Ok(devs) = discover_canon_devices() {
-                if !devs.is_empty() {
-                    match NusbTransport::open_first() {
-                        Ok(u) => AnyTransport::Usb(u),
-                        Err(e) => {
-                            return Err((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                format!("Failed to open USB scanner: {e}"),
-                            ));
-                        }
-                    }
-                } else {
-                    AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-                }
-            } else {
-                AnyTransport::Mock(Box::new(MockG2010Transport::new()))
-            };
-            let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
-            let mut temp_ctrl = G2010Controller::new(transport, supervisor);
-            temp_ctrl
-                .acquire_raw_scan(&params)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    let raw_bytes = if state.is_mock {
+        let mut guard = state.client.lock().await;
+        if guard.is_none() {
+            let mock_client = DaemonClient::connect_mock(None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            *guard = Some(mock_client);
         }
-    };
-
-    // Reconstruct RGB image
-    let bpp = color_mode.bytes_per_pixel();
-    let expected_len = (width as usize) * (height as usize) * bpp;
-    if raw_bytes.len() < expected_len {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Scan payload truncated: {} < {}",
-                raw_bytes.len(),
-                expected_len
-            ),
-        ));
-    }
-
-    let rgb_img = if bpp == 3 {
-        RgbImage::from_raw(width, height, raw_bytes[..expected_len].to_vec()).ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Invalid RGB raster buffer".to_string(),
-        ))?
+        guard
+            .as_mut()
+            .expect("mock client initialized")
+            .acquire_scan(&params)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let mut expanded = Vec::with_capacity((width * height * 3) as usize);
-        for &g in &raw_bytes[..expected_len] {
-            expanded.extend_from_slice(&[g, g, g]);
-        }
-        RgbImage::from_raw(width, height, expanded).ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Invalid Gray raster buffer".to_string(),
-        ))?
+        let mut temp_client =
+            DaemonClient::connect_live(state.socket_path.as_deref(), None)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Scanner hardware/daemon unavailable: {e}"),
+                    )
+                })?;
+        temp_client
+            .acquire_scan(&params)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
+
+    let rgb_img = decode_raw_scan_buffer(raw_bytes, width, height, color_mode)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Decode error: {e}")))?;
 
     let processed = pixma_imageproc::execute_scan_pipeline(rgb_img, &params).map_err(|e| {
         (
@@ -246,11 +243,23 @@ async fn handle_create_scan_job(
     // Document encoding
     let (content_type, doc_bytes) = match req.document_format.as_str() {
         "image/png" => {
+            if processed.len() > 1 {
+                tracing::warn!(
+                    "eSCL PNG output truncated from {} images to 1; use application/pdf for multi-page",
+                    processed.len()
+                );
+            }
             let bytes = export_png(&processed[0])
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             ("image/png", bytes)
         }
         "image/jpeg" => {
+            if processed.len() > 1 {
+                tracing::warn!(
+                    "eSCL JPEG output truncated from {} images to 1; use application/pdf for multi-page",
+                    processed.len()
+                );
+            }
             let bytes = export_jpeg(&processed[0], 90)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             ("image/jpeg", bytes)
@@ -276,6 +285,7 @@ async fn handle_create_scan_job(
 
     {
         let mut jobs_guard = state.jobs.write().await;
+        evict_excess_jobs(&mut jobs_guard, MAX_RETAINED_JOBS);
         jobs_guard.insert(uuid, job);
     }
 
@@ -342,6 +352,7 @@ pub fn create_escl_router(state: Arc<EsclServerState>) -> Router {
             get(handle_next_document),
         )
         .route("/eSCL/ScanJobs/:uuid", delete(handle_delete_scan_job))
+        .layer(DefaultBodyLimit::max(MAX_ESCL_XML_BODY_BYTES))
         .with_state(state)
 }
 
@@ -475,5 +486,90 @@ mod tests {
 
         let resp_del = app.oneshot(req_del).await.unwrap();
         assert_eq!(resp_del.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_escl_live_offline_returns_503_instead_of_mock() {
+        let missing_sock = std::env::temp_dir().join(format!(
+            "pixma_escl_missing_{}.sock",
+            std::process::id()
+        ));
+        let state = Arc::new(EsclServerState::with_socket(false, Some(missing_sock)));
+        let app = create_escl_router(state);
+
+        let scan_settings = r#"<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03">
+  <scan:ColorMode>RGB24</scan:ColorMode>
+  <scan:XResolution>300</scan:XResolution>
+  <scan:YResolution>300</scan:YResolution>
+  <scan:DocumentFormat>application/pdf</scan:DocumentFormat>
+</scan:ScanSettings>"#;
+
+        let req = Request::builder()
+            .uri("/eSCL/ScanJobs")
+            .method("POST")
+            .header("Content-Type", "text/xml")
+            .body(Body::from(scan_settings))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_evict_excess_jobs_prefers_retrieved_and_caps_total() {
+        let mut jobs = HashMap::new();
+        for idx in 0..MAX_RETAINED_JOBS {
+            let uuid = format!("job-{idx}");
+            jobs.insert(
+                uuid.clone(),
+                StoredScanJob {
+                    uuid,
+                    content_type: "application/pdf".to_string(),
+                    document_bytes: vec![1, 2, 3],
+                    created_at: Instant::now(),
+                    retrieved: idx == 10,
+                },
+            );
+        }
+        assert_eq!(jobs.len(), MAX_RETAINED_JOBS);
+        evict_excess_jobs(&mut jobs, MAX_RETAINED_JOBS);
+        assert_eq!(jobs.len(), MAX_RETAINED_JOBS - 1);
+        assert!(
+            !jobs.contains_key("job-10"),
+            "Retrieved job should be evicted before unretrieved jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_escl_scan_region_u32_max_clamps_without_overflow() {
+        let state = Arc::new(EsclServerState::new(true));
+        let app = create_escl_router(state);
+
+        let scan_settings = r#"<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <scan:ColorMode>RGB24</scan:ColorMode>
+  <scan:XResolution>600</scan:XResolution>
+  <scan:YResolution>600</scan:YResolution>
+  <scan:DocumentFormat>image/png</scan:DocumentFormat>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
+      <pwg:XOffset>4294967295</pwg:XOffset>
+      <pwg:YOffset>4294967295</pwg:YOffset>
+      <pwg:Width>4294967295</pwg:Width>
+      <pwg:Height>4294967295</pwg:Height>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
+</scan:ScanSettings>"#;
+
+        let req = Request::builder()
+            .uri("/eSCL/ScanJobs")
+            .method("POST")
+            .header("Content-Type", "text/xml")
+            .body(Body::from(scan_settings))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }

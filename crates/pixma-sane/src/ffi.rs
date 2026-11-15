@@ -21,8 +21,48 @@ static CANON_G2010_DEVICE: SANE_Device = SANE_Device {
     type_: b"flatbed scanner\0".as_ptr() as *const SANE_Char,
 };
 
-static DEVICE_LIST: SyncWrapper<[*const SANE_Device; 2]> =
+static CANON_G2010_MOCK_DEVICE: SANE_Device = SANE_Device {
+    name: b"pixma:G2010:mock\0".as_ptr() as *const SANE_Char,
+    vendor: b"Canon\0".as_ptr() as *const SANE_Char,
+    model: b"PIXMA G2010 series (Mock)\0".as_ptr() as *const SANE_Char,
+    type_: b"flatbed scanner\0".as_ptr() as *const SANE_Char,
+};
+
+static LIVE_DEVICE_LIST: SyncWrapper<[*const SANE_Device; 2]> =
     SyncWrapper([&CANON_G2010_DEVICE, std::ptr::null()]);
+
+static MOCK_DEVICE_LIST: SyncWrapper<[*const SANE_Device; 2]> =
+    SyncWrapper([&CANON_G2010_MOCK_DEVICE, std::ptr::null()]);
+
+static EMPTY_DEVICE_LIST: SyncWrapper<[*const SANE_Device; 1]> =
+    SyncWrapper([std::ptr::null()]);
+
+fn is_live_scanner_available() -> bool {
+    if let Some(explicit) = std::env::var_os("PIXMA_SOCKET").filter(|v| !v.is_empty()) {
+        return std::os::unix::net::UnixStream::connect(explicit).is_ok();
+    }
+    for sock in pixma_daemon::default_socket_candidates() {
+        if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            return true;
+        }
+    }
+    !pixma_transport::nusb_transport::discover_canon_devices()
+        .unwrap_or_default()
+        .is_empty()
+}
+
+pub(crate) fn select_device_list(
+    is_mock_env: bool,
+    hw_available: bool,
+) -> *const *const SANE_Device {
+    if is_mock_env {
+        MOCK_DEVICE_LIST.0.as_ptr()
+    } else if hw_available {
+        LIVE_DEVICE_LIST.0.as_ptr()
+    } else {
+        EMPTY_DEVICE_LIST.0.as_ptr()
+    }
+}
 
 /// SANE v1.04 initialization entrypoint.
 #[no_mangle]
@@ -48,7 +88,7 @@ pub unsafe extern "C" fn sane_exit() {
     }));
 }
 
-/// Enumerates connected Canon PIXMA scanner devices.
+/// Enumerates connected Canon PIXMA scanner devices (returns empty list when offline).
 #[no_mangle]
 pub unsafe extern "C" fn sane_get_devices(
     device_list: *mut *const *const SANE_Device,
@@ -58,7 +98,9 @@ pub unsafe extern "C" fn sane_get_devices(
         if device_list.is_null() {
             return SANE_STATUS_INVAL;
         }
-        *device_list = DEVICE_LIST.0.as_ptr();
+        let is_mock_env = std::env::var("PIXMA_MOCK").as_deref() == Ok("1");
+        let hw_available = !is_mock_env && is_live_scanner_available();
+        *device_list = select_device_list(is_mock_env, hw_available);
         SANE_STATUS_GOOD
     }))
     .unwrap_or(SANE_STATUS_IO_ERROR)
@@ -67,15 +109,22 @@ pub unsafe extern "C" fn sane_get_devices(
 /// Opens a scanner device session.
 #[no_mangle]
 pub unsafe extern "C" fn sane_open(
-    _name: SANE_String_Const,
+    name: SANE_String_Const,
     handle: *mut SANE_Handle,
 ) -> SANE_Status {
     catch_unwind(AssertUnwindSafe(|| {
-        if handle.is_null() {
+        if name.is_null() || handle.is_null() {
             return SANE_STATUS_INVAL;
         }
-        let session = Box::new(SaneScannerSession::new());
-        *handle = Box::into_raw(session) as SANE_Handle;
+        let Ok(name_str) = std::ffi::CStr::from_ptr(name).to_str() else {
+            return SANE_STATUS_INVAL;
+        };
+        let session = match name_str {
+            "" | "pixma:G2010" => SaneScannerSession::new(),
+            "pixma:G2010:mock" => SaneScannerSession::new_mock(),
+            _ => return SANE_STATUS_INVAL,
+        };
+        *handle = Box::into_raw(Box::new(session)) as SANE_Handle;
         SANE_STATUS_GOOD
     }))
     .unwrap_or(SANE_STATUS_IO_ERROR)

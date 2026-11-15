@@ -1,9 +1,116 @@
 //! CUPS backend helper functions: USB device discovery formatting and real-time
 //! marker ink level telemetry reporting.
 
+use crate::commands::{CUPS_INK_FLUSH_CONFIRMED_END, CUPS_INK_FLUSH_CONFIRMED_START};
+use pixma_core::errors::{DriverError, SafetyInterlockError};
+use pixma_core::maintenance::{
+    CleaningTarget, CleaningType, MaintenanceAction, INK_FLUSH_CONFIRMATION_TOKEN,
+};
 use pixma_core::models::DeviceStatus;
+use pixma_daemon::DaemonClient;
 use pixma_transport::mock_device::G2010_IEEE1284_DEVICE_ID;
 use pixma_transport::nusb_transport::discover_canon_devices;
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn contains_non_whitespace(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| !b.is_ascii_whitespace())
+}
+
+fn parse_confirmed_ink_flush_target(span: &[u8]) -> Result<CleaningTarget, DriverError> {
+    const MAX_CONFIRMED_SPAN_BYTES: usize = 16 * 1024;
+    let reject = || {
+        DriverError::SafetyInterlock(SafetyInterlockError::ConfirmationRequired {
+            expected_token: INK_FLUSH_CONFIRMATION_TOKEN,
+        })
+    };
+
+    if span.len() > MAX_CONFIRMED_SPAN_BYTES {
+        return Err(reject());
+    }
+    let text = std::str::from_utf8(span);
+    // Notice StartJob/EndJob around the cleaning XML contains NUL padding bytes (`0x00`),
+    // which are valid UTF-8, so handle UTF-8 cleanly and ensure exactly one `choke` operation.
+    let Ok(xml) = text else {
+        return Err(reject());
+    };
+    let clean_ops = xml.matches("<ivec:operation>Cleaning</ivec:operation>").count();
+    let choke_ops = xml.matches("<ivec:type>choke</ivec:type>").count();
+    let cmd_tags = xml.matches("<cmd").count();
+    if clean_ops != 1 || choke_ops != 1 || cmd_tags > 3 {
+        return Err(reject());
+    }
+
+    if xml.contains("<ivec:inkgroup>group1</ivec:inkgroup>") {
+        Ok(CleaningTarget::BlackOnly)
+    } else if xml.contains("<ivec:inkgroup>group2</ivec:inkgroup>") {
+        Ok(CleaningTarget::ColorOnly)
+    } else {
+        Ok(CleaningTarget::All)
+    }
+}
+
+/// Dispatches CUPS backend payload bytes to the daemon/device.
+///
+/// Ordinary print/raster jobs and standard cleaning streams are sent via `print_raw_stream`.
+/// Confirmed `InkFlush YES-DRAIN-INK` blocks emitted by `cmdtopixma-g2010` are routed through
+/// `DaemonClient::execute_maintenance` with the explicit confirmation token, while unconfirmed
+/// raw `choke` XML still hits `print_raw_stream` and is rejected fail-closed.
+pub async fn dispatch_cups_payload(
+    client: &mut DaemonClient,
+    print_data: &[u8],
+) -> Result<(), DriverError> {
+    let start_marker = CUPS_INK_FLUSH_CONFIRMED_START.as_bytes();
+    let end_marker = CUPS_INK_FLUSH_CONFIRMED_END.as_bytes();
+
+    if find_subslice(print_data, start_marker).is_none() {
+        return client.print_raw_stream(print_data).await;
+    }
+
+    let mut offset = 0usize;
+    while let Some(rel_start) = find_subslice(&print_data[offset..], start_marker) {
+        let prefix_end = offset + rel_start;
+        let prefix = &print_data[offset..prefix_end];
+        if contains_non_whitespace(prefix) {
+            client.print_raw_stream(prefix).await?;
+        }
+
+        let span_start = prefix_end + start_marker.len();
+        let Some(rel_end) = find_subslice(&print_data[span_start..], end_marker) else {
+            return Err(DriverError::SafetyInterlock(
+                SafetyInterlockError::ConfirmationRequired {
+                    expected_token: INK_FLUSH_CONFIRMATION_TOKEN,
+                },
+            ));
+        };
+        let span = &print_data[span_start..span_start + rel_end];
+        let target = parse_confirmed_ink_flush_target(span)?;
+        client
+            .execute_maintenance(
+                MaintenanceAction::Clean {
+                    kind: CleaningType::InkFlush,
+                    target,
+                },
+                Some(INK_FLUSH_CONFIRMATION_TOKEN),
+                false,
+            )
+            .await?;
+
+        offset = span_start + rel_end + end_marker.len();
+    }
+
+    let tail = &print_data[offset..];
+    if contains_non_whitespace(tail) {
+        client.print_raw_stream(tail).await?;
+    }
+
+    Ok(())
+}
 
 /// Formats CUPS backend device discovery lines conforming to CUPS backend discovery specifications:
 /// `direct <device-uri> "<make-and-model>" "<info/description>" "<1284-device-id>" "<location>"`.
@@ -30,18 +137,12 @@ pub fn format_cups_discovery_lines() -> Vec<String> {
     }
 
     // 2. Canonical template entry for G2010
+    let canonical_prefix = "direct pixma-usb://Canon/G2010%20series ";
     let canonical_template = format!(
         r#"direct pixma-usb://Canon/G2010%20series "Canon G2010 series" "Canon PIXMA G2010 MegaTank (Native Clean-Room)" "{G2010_IEEE1284_DEVICE_ID}" """#
     );
 
-    // If canonical template URI is not already in discovered list, add it
-    if !lines
-        .iter()
-        .any(|l| l.contains("pixma-usb://Canon/G2010%20series"))
-    {
-        lines.push(canonical_template);
-    } else {
-        // Still append canonical template if needed as requested: "always includes the canonical URI templates"
+    if !lines.iter().any(|l| l.starts_with(canonical_prefix)) {
         lines.push(canonical_template);
     }
 
@@ -84,6 +185,13 @@ mod tests {
             .iter()
             .any(|l| l.contains("pixma-usb://Canon/G2010%20series")));
         assert!(lines.iter().any(|l| l.starts_with("direct pixma-usb://")));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("direct pixma-usb://Canon/G2010%20series "))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -114,5 +222,70 @@ mod tests {
             "ATTR: marker-types=ink-cartridge,ink-cartridge,ink-cartridge,ink-cartridge"
         );
         assert_eq!(attrs[3], "ATTR: marker-levels=85,70,65,90");
+    }
+
+    #[tokio::test]
+    async fn dispatch_cups_payload_executes_confirmed_ink_flush_and_enforces_cooldown() {
+        use crate::commands::{parse_cups_command_file, validate_and_compile_cups_commands};
+        use pixma_core::maintenance::{MaintenanceRecord, MaintenanceSupervisor};
+
+        let dir = std::env::temp_dir().join(format!(
+            "pixma-cups-flush-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_path = dir.join("state.json");
+
+        let cmds = parse_cups_command_file(&format!(
+            "InkFlush {INK_FLUSH_CONFIRMATION_TOKEN}\nReportStatus"
+        ))
+        .unwrap();
+        let mut sup = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        let payload = validate_and_compile_cups_commands(&cmds, 77, &mut sup, 1_000_000).unwrap();
+
+        let mut client = DaemonClient::connect_mock(Some(&state_path)).unwrap();
+        dispatch_cups_payload(&mut client, &payload)
+            .await
+            .expect("Confirmed CUPS InkFlush YES-DRAIN-INK must succeed end-to-end");
+
+        let persisted = MaintenanceSupervisor::load_readonly(&state_path).unwrap();
+        assert_eq!(persisted.record().total_ink_flushes, 1);
+        assert!(persisted.record().estimated_d_counter_percent >= 20.0);
+        assert!(persisted.record().last_ink_flush_epoch > 0);
+
+        // Second dispatch hits the 24h InkFlush cooldown recorded on the daemon controller
+        let second_err = dispatch_cups_payload(&mut client, &payload)
+            .await
+            .expect_err("Repeated confirmed InkFlush inside 24h must fail cooldown");
+        assert!(matches!(
+            second_err,
+            DriverError::SafetyInterlock(SafetyInterlockError::CooldownActive { .. })
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_cups_payload_rejects_unconfirmed_choke_and_malformed_marker() {
+        use pixma_protocol::ivec::build_cleaning_cmd;
+
+        let mut client = DaemonClient::connect_mock(None).unwrap();
+        let raw_choke = build_cleaning_cmd(88, CleaningType::InkFlush, CleaningTarget::All);
+        let err = dispatch_cups_payload(&mut client, raw_choke.as_bytes())
+            .await
+            .expect_err("Unconfirmed raw choke XML must still fail closed");
+        assert!(matches!(
+            err,
+            DriverError::SafetyInterlock(SafetyInterlockError::ConfirmationRequired { .. })
+        ));
+
+        let unclosed_marker = format!("{CUPS_INK_FLUSH_CONFIRMED_START}\n{raw_choke}");
+        let err_marker = dispatch_cups_payload(&mut client, unclosed_marker.as_bytes())
+            .await
+            .expect_err("Unclosed marker must fail closed");
+        assert!(matches!(
+            err_marker,
+            DriverError::SafetyInterlock(SafetyInterlockError::ConfirmationRequired { .. })
+        ));
     }
 }

@@ -14,6 +14,61 @@ use crate::restoration::{
 };
 use crate::tone::ToneCurve;
 
+/// Decodes raw MP2 flatbed scanner bytes into a normalized 24-bit [`RgbImage`].
+///
+/// Strictly rejects truncated buffers (`raw_bytes.len() < expected_len`) so USB/IPC
+/// read errors cannot be masked by silent white-padding, while cleanly trimming
+/// trailing 32-pixel/512-byte hardware alignment bytes when `raw_bytes.len() > expected_len`.
+pub fn decode_raw_scan_buffer(
+    raw_bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    color_mode: ScanColorMode,
+) -> Result<RgbImage, ImageProcError> {
+    if width == 0 || height == 0 {
+        return Err(ImageProcError::EmptyImage);
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(ImageProcError::EmptyImage)?;
+
+    match color_mode {
+        ScanColorMode::Color24Bit => {
+            let expected_len = pixel_count
+                .checked_mul(3)
+                .ok_or(ImageProcError::EmptyImage)?;
+            if raw_bytes.len() < expected_len {
+                return Err(ImageProcError::InvalidLineLength {
+                    expected: expected_len,
+                    actual: raw_bytes.len(),
+                });
+            }
+            let mut data = raw_bytes;
+            data.truncate(expected_len);
+            RgbImage::from_raw(width, height, data).ok_or(ImageProcError::EmptyImage)
+        }
+        ScanColorMode::Grayscale8Bit | ScanColorMode::Lineart1Bit => {
+            let expected_len = pixel_count;
+            if raw_bytes.len() < expected_len {
+                return Err(ImageProcError::InvalidLineLength {
+                    expected: expected_len,
+                    actual: raw_bytes.len(),
+                });
+            }
+            let mut rgb = Vec::with_capacity(
+                expected_len
+                    .checked_mul(3)
+                    .ok_or(ImageProcError::EmptyImage)?,
+            );
+            for &b in &raw_bytes[..expected_len] {
+                rgb.extend_from_slice(&[b, b, b]);
+            }
+            RgbImage::from_raw(width, height, rgb).ok_or(ImageProcError::EmptyImage)
+        }
+    }
+}
+
 /// Executes the full post-processing pipeline on an acquired raw scan image.
 ///
 /// Order of operations:
@@ -193,5 +248,53 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].width(), 64);
         assert_eq!(results[0].height(), 64);
+    }
+
+    #[test]
+    fn decode_raw_scan_buffer_handles_exact_oversized_and_rejects_short() {
+        let img = decode_raw_scan_buffer(vec![10, 20, 30, 40, 50, 60], 2, 1, ScanColorMode::Color24Bit)
+            .unwrap();
+        assert_eq!(img.get_pixel(0, 0), &Rgb([10, 20, 30]));
+        assert_eq!(img.get_pixel(1, 0), &Rgb([40, 50, 60]));
+
+        // Trailing USB 512-byte alignment bytes trimmed cleanly
+        let trimmed = decode_raw_scan_buffer(
+            vec![100, 150, 200, 99, 99, 99],
+            1,
+            1,
+            ScanColorMode::Color24Bit,
+        )
+        .unwrap();
+        assert_eq!(trimmed.get_pixel(0, 0), &Rgb([100, 150, 200]));
+
+        // Grayscale & Lineart expansion
+        let gray = decode_raw_scan_buffer(vec![42, 84, 0, 0], 2, 1, ScanColorMode::Grayscale8Bit)
+            .unwrap();
+        assert_eq!(gray.get_pixel(0, 0), &Rgb([42, 42, 42]));
+        assert_eq!(gray.get_pixel(1, 0), &Rgb([84, 84, 84]));
+
+        let lineart =
+            decode_raw_scan_buffer(vec![250], 1, 1, ScanColorMode::Lineart1Bit).unwrap();
+        assert_eq!(lineart.get_pixel(0, 0), &Rgb([250, 250, 250]));
+
+        // Reject truncated buffers
+        assert!(matches!(
+            decode_raw_scan_buffer(vec![1, 2], 1, 1, ScanColorMode::Color24Bit),
+            Err(ImageProcError::InvalidLineLength {
+                expected: 3,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            decode_raw_scan_buffer(vec![1], 2, 1, ScanColorMode::Grayscale8Bit),
+            Err(ImageProcError::InvalidLineLength {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            decode_raw_scan_buffer(vec![], 0, 10, ScanColorMode::Color24Bit),
+            Err(ImageProcError::EmptyImage)
+        ));
     }
 }

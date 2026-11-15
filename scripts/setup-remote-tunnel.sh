@@ -35,13 +35,13 @@ CMD="${1:-}"
 case "$CMD" in
     test-local)
         echo "Checking local loopback services (IPP: $IPP_PORT, eSCL: $ESCL_PORT)..."
-        if curl -s -m 2 "http://127.0.0.1:${IPP_PORT}/status" >/dev/null 2>&1; then
+        if curl -sf -m 2 "http://127.0.0.1:${IPP_PORT}/api/status" >/dev/null 2>&1; then
             echo -e "  [${GREEN}OK${NC}] IPP / Printer Application responding on 127.0.0.1:${IPP_PORT}"
         else
             echo -e "  [${YELLOW}WARN${NC}] IPP Printer Application not responding on 127.0.0.1:${IPP_PORT}"
         fi
 
-        if curl -s -m 2 "http://127.0.0.1:${ESCL_PORT}/eSCL/ScannerCapabilities" >/dev/null 2>&1; then
+        if curl -sf -m 2 "http://127.0.0.1:${ESCL_PORT}/eSCL/ScannerCapabilities" >/dev/null 2>&1; then
             echo -e "  [${GREEN}OK${NC}] eSCL AirScan Server responding on 127.0.0.1:${ESCL_PORT}"
         else
             echo -e "  [${YELLOW}WARN${NC}] eSCL AirScan Server not responding on 127.0.0.1:${ESCL_PORT}"

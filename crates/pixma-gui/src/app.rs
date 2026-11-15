@@ -1,19 +1,33 @@
 //! Native Wayland/X11 GTK4 + Libadwaita application for PIXMA G2010 Studio.
 
 use pixma_core::maintenance::{CleaningTarget, CleaningType, RollerCleanTarget, TestPrintType};
-use pixma_core::models::CartridgeState;
+use pixma_core::models::{CartridgeState, OperationalState};
 use pixma_core::print_params::{
     BorderlessExtension, InkDryingTime, MediaType, PageLayout, PaperGapMode, PaperSize,
     PrintQuality, QuietMode,
 };
 use pixma_core::scan_params::{ScanColorMode, ScanResolution};
-use pixma_daemon::DaemonClient;
+use pixma_daemon::{ConnectionSource, DaemonClient, JobLockKind, LiveDaemonSnapshot};
 use relm4::adw::prelude::*;
 use relm4::{adw, gtk, ComponentParts, ComponentSender, SimpleComponent};
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
-use crate::state::{StudioEvent, StudioViewModel, GLOSSY_COMPOSITE_CMY_NOTICE};
+use crate::state::{
+    ConnectionLedState, ConnectionTelemetry, StudioEvent, StudioViewModel,
+    GLOSSY_COMPOSITE_CMY_NOTICE,
+};
+
+/// Startup configuration passed from `main.rs` into [`AppModel`].
+pub struct AppLaunchInit {
+    pub client: Option<DaemonClient>,
+    pub is_mock_mode: bool,
+    pub configured_socket: Option<String>,
+    pub configured_remote_host: Option<String>,
+}
 
 /// Application messages processed by the Relm4 runtime loop.
 #[derive(Debug)]
@@ -47,6 +61,13 @@ pub enum AppMsg {
     AlignmentColumnChanged(usize, i8),
     InkFlushConfirmationToggled(bool),
 
+    // Live telemetry updates from physical hardware / daemon
+    LiveSnapshotReceived {
+        source: ConnectionSource,
+        snapshot: Box<LiveDaemonSnapshot>,
+    },
+    TelemetryDisconnected(String),
+
     // Asynchronous hardware actions
     TriggerRefreshTelemetry,
     TriggerPrintTestPage,
@@ -74,21 +95,142 @@ pub enum AppMsg {
 /// Main application model holding the state view-model and hardware client.
 pub struct AppModel {
     pub vm: StudioViewModel,
-    pub client: Option<Arc<TokioMutex<DaemonClient>>>,
+    pub client: Arc<TokioMutex<Option<DaemonClient>>>,
+    pub poll_notify: Arc<Notify>,
+    pub configured_socket: Option<PathBuf>,
+    pub pending_toasts: RefCell<Vec<(String, u32)>>,
+    pub last_maint_feedback: Option<Result<String, String>>,
+    pub last_scan_error: Option<String>,
+}
+
+impl AppModel {
+    fn notify_telemetry_refresh(&self, sender: &ComponentSender<Self>) {
+        if self.vm.is_mock_mode {
+            sender.input(AppMsg::TriggerRefreshTelemetry);
+        } else {
+            self.poll_notify.notify_one();
+        }
+    }
+
+    /// Applies scan completion result, propagating concise errors and clearing/setting preview metadata.
+    pub fn apply_scan_completed(
+        &mut self,
+        result: Result<(usize, Option<PathBuf>, Option<PathBuf>), String>,
+    ) {
+        self.vm.is_busy = false;
+        self.vm.busy_operation = None;
+        match result {
+            Ok((count, path_opt, thumb_opt)) => {
+                self.vm.last_scan_path = path_opt.clone();
+                self.vm.last_scan_thumb = thumb_opt;
+                self.last_scan_error = None;
+                let path_str = path_opt
+                    .as_ref()
+                    .map(|p| format!("Сохранено в {}", p.display()))
+                    .unwrap_or_else(|| format!("Получено страниц: {count}"));
+                let msg = format!("Сканирование завершено. {path_str}");
+                self.vm.status_banner = msg.clone();
+                self.vm.last_error = None;
+                self.pending_toasts.borrow_mut().push((msg, 5));
+            }
+            Err(err) => {
+                let concise = format_concise_error(&err);
+                self.vm.last_scan_path = None;
+                self.vm.last_scan_thumb = None;
+                self.vm.last_error = Some(concise.clone());
+                self.last_scan_error = Some(concise.clone());
+                self.vm.status_banner = format!("[ERROR] {concise}");
+                self.pending_toasts
+                    .borrow_mut()
+                    .push((format_toast_error(&concise), 7));
+            }
+        }
+    }
+
+    /// Applies completion state for asynchronous hardware operations and resets
+    /// the Ink Flush safety latch so every purge requires a fresh confirmation.
+    pub fn apply_hardware_task_finished(&mut self, result: Result<String, String>) {
+        self.vm
+            .handle_event(StudioEvent::ResetInkFlushConfirmation);
+        match &result {
+            Ok(msg) => {
+                self.vm.status_banner = msg.clone();
+                self.vm.last_error = None;
+                self.pending_toasts.borrow_mut().push((msg.clone(), 5));
+            }
+            Err(err) => {
+                let concise = format_concise_error(err);
+                self.vm.last_error = Some(concise.clone());
+                self.vm.status_banner = format!("[ERROR] {concise}");
+                self.pending_toasts
+                    .borrow_mut()
+                    .push((format_toast_error(&concise), 7));
+            }
+        }
+        self.last_maint_feedback = Some(result);
+        self.vm.is_busy = false;
+        self.vm.busy_operation = None;
+    }
+
+    fn spawn_hardware_task<F>(
+        &mut self,
+        op_label: String,
+        toast_msg: String,
+        sender: &ComponentSender<Self>,
+        op: F,
+    ) where
+        F: for<'a> FnOnce(&'a mut DaemonClient) -> ActionFutureFn<'a, String> + Send + 'static,
+    {
+        if self.vm.is_busy {
+            return;
+        }
+        self.vm.is_busy = true;
+        self.vm.last_error = None;
+        self.vm.busy_operation = Some(op_label);
+        self.pending_toasts.borrow_mut().push((toast_msg, 3));
+        let client_arc = self.client.clone();
+        let is_mock = self.vm.is_mock_mode;
+        let configured_socket = self.configured_socket.clone();
+        let s = sender.clone();
+        tokio::spawn(async move {
+            let res =
+                run_action_with_client(client_arc, is_mock, configured_socket, op).await;
+            s.input(AppMsg::HardwareTaskFinished(res));
+        });
+    }
 }
 
 /// Collection of widgets that need real-time updates when state changes.
 pub struct AppWidgets {
+    // Persistent connection status strip & LED
+    pub led_drawing: gtk::DrawingArea,
+    pub led_state_cell: Rc<Cell<ConnectionLedState>>,
+    pub conn_headline_label: gtk::Label,
+    pub conn_detail_label: gtk::Label,
+    pub usb_badge_label: gtk::Label,
+
+    // Connection & exact USB marker group (Tab 4)
+    pub conn_mode_row: adw::ActionRow,
+    pub usb_marker_row: adw::ActionRow,
+    pub usb_endpoints_row: adw::ActionRow,
+    pub ieee1284_row: adw::ActionRow,
+    pub usb_port_ivec_row: adw::ActionRow,
+
     // Print settings
     pub print_summary_label: gtk::Label,
     pub glossy_notice_label: gtk::Label,
+    pub print_test_btn: gtk::Button,
 
     // Maintenance
+    pub maint_status_row: adw::ActionRow,
+    pub maint_spinner: gtk::Spinner,
+    pub maint_action_buttons: Vec<gtk::Button>,
     pub flush_execute_btn: gtk::Button,
     pub flush_confirm_switch: gtk::Switch,
     pub align_scales: Vec<gtk::Scale>,
 
     // Status monitor
+    pub ink_group: adw::PreferencesGroup,
     pub pgbk_bar: gtk::LevelBar,
     pub pgbk_label: gtk::Label,
     pub cyan_bar: gtk::LevelBar,
@@ -118,26 +260,40 @@ pub struct AppWidgets {
 impl SimpleComponent for AppModel {
     type Input = AppMsg;
     type Output = ();
-    type Init = Option<DaemonClient>;
+    type Init = AppLaunchInit;
     type Root = adw::ApplicationWindow;
     type Widgets = AppWidgets;
 
     fn init_root() -> Self::Root {
         adw::ApplicationWindow::builder()
             .title("PIXMA G2010 Studio")
-            .default_width(920)
-            .default_height(780)
+            .default_width(940)
+            .default_height(820)
             .build()
     }
 
     fn init(
-        client_opt: Self::Init,
+        launch: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let vm = StudioViewModel::default();
-        let client = client_opt.map(|c| Arc::new(TokioMutex::new(c)));
-        let model = Self { vm, client };
+        let mut vm = StudioViewModel::default();
+        let configured_socket = launch.configured_socket.as_deref().map(PathBuf::from);
+        vm.is_mock_mode = launch.is_mock_mode;
+        vm.telemetry.configured_socket = launch.configured_socket;
+        vm.telemetry.configured_remote_host = launch.configured_remote_host;
+
+        let shared_client = Arc::new(TokioMutex::new(launch.client));
+        let poll_notify = Arc::new(Notify::new());
+        let model = Self {
+            vm,
+            client: Arc::clone(&shared_client),
+            poll_notify: Arc::clone(&poll_notify),
+            configured_socket: configured_socket.clone(),
+            pending_toasts: RefCell::new(Vec::new()),
+            last_maint_feedback: None,
+            last_scan_error: None,
+        };
 
         let toast_overlay = adw::ToastOverlay::new();
 
@@ -153,6 +309,72 @@ impl SimpleComponent for AppModel {
             .build();
         header_bar.set_title_widget(Some(&view_switcher));
         main_box.append(&header_bar);
+
+        // Persistent 4-color LED + USB Marker Connection Strip
+        let conn_strip = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(10)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(14)
+            .margin_end(14)
+            .build();
+
+        let led_state_cell = Rc::new(Cell::new(model.vm.led_state()));
+        let led_cell_draw = Rc::clone(&led_state_cell);
+        let led_drawing = gtk::DrawingArea::builder()
+            .content_width(18)
+            .content_height(18)
+            .valign(gtk::Align::Center)
+            .build();
+        led_drawing.set_draw_func(move |_area, cr, width, height| {
+            let state = led_cell_draw.get();
+            let (r, g, b) = state.rgb();
+            let cx = (width as f64) / 2.0;
+            let cy = (height as f64) / 2.0;
+            let radius = cx.min(cy) - 1.5;
+            if radius <= 1.0 {
+                return;
+            }
+            cr.set_source_rgba(r, g, b, 0.28);
+            cr.arc(cx, cy, radius, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+            cr.set_source_rgba(r, g, b, 1.0);
+            cr.arc(cx, cy, radius * 0.68, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
+            cr.set_line_width(1.0);
+            cr.arc(cx, cy, radius * 0.68, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+        });
+        conn_strip.append(&led_drawing);
+
+        let conn_text_box = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        conn_text_box.set_hexpand(true);
+        let conn_headline_label = gtk::Label::builder()
+            .label("Нет подключения")
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .build();
+        let conn_detail_label = gtk::Label::builder()
+            .label("Опрос физического устройства...")
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        conn_text_box.append(&conn_headline_label);
+        conn_text_box.append(&conn_detail_label);
+        conn_strip.append(&conn_text_box);
+
+        let usb_badge_label = gtk::Label::builder()
+            .label("USB: ожидание")
+            .css_classes(["caption", "monospace", "dim-label"])
+            .valign(gtk::Align::Center)
+            .build();
+        conn_strip.append(&usb_badge_label);
+
+        main_box.append(&conn_strip);
+        main_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         // -------------------------------------------------------------------
         // TAB 1: Print Settings
@@ -436,8 +658,26 @@ impl SimpleComponent for AppModel {
         // -------------------------------------------------------------------
         // TAB 2: Maintenance Assistant
         // -------------------------------------------------------------------
+        // Pinned live Maintenance Operation Feedback Banner (stays visible when scrolling)
+        let maint_status_group = adw::PreferencesGroup::builder()
+            .title("Maintenance Status")
+            .margin_top(12)
+            .margin_bottom(8)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        let maint_status_row = adw::ActionRow::builder()
+            .title("Готово к обслуживанию")
+            .subtitle("Ожидание команды")
+            .subtitle_lines(0)
+            .build();
+        let maint_spinner = gtk::Spinner::new();
+        maint_spinner.set_visible(false);
+        maint_status_row.add_suffix(&maint_spinner);
+        maint_status_group.add(&maint_status_row);
+
         let maint_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        maint_box.set_margin_top(16);
+        maint_box.set_margin_top(10);
         maint_box.set_margin_bottom(16);
         maint_box.set_margin_start(16);
         maint_box.set_margin_end(16);
@@ -687,6 +927,21 @@ impl SimpleComponent for AppModel {
         apply_align_row.add_suffix(&btn_apply_align);
         diag_group.add(&apply_align_row);
 
+        let maint_action_buttons = vec![
+            btn_reg_all,
+            btn_reg_bk,
+            btn_reg_col,
+            btn_deep_all,
+            btn_deep_bk,
+            btn_deep_col,
+            btn_roller,
+            btn_platen,
+            btn_nozzle,
+            btn_man_align,
+            btn_half_align,
+            btn_apply_align,
+        ];
+
         maint_box.append(&diag_group);
 
         let maint_scroll = gtk::ScrolledWindow::builder()
@@ -694,7 +949,12 @@ impl SimpleComponent for AppModel {
             .vexpand(true)
             .build();
 
-        let maint_page = view_stack.add_titled(&maint_scroll, Some("maintenance"), "Maintenance");
+        let maint_tab_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        maint_tab_root.append(&maint_status_group);
+        maint_tab_root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        maint_tab_root.append(&maint_scroll);
+
+        let maint_page = view_stack.add_titled(&maint_tab_root, Some("maintenance"), "Maintenance");
         maint_page.set_icon_name(Some("emblem-system-symbolic"));
 
         // -------------------------------------------------------------------
@@ -890,10 +1150,43 @@ impl SimpleComponent for AppModel {
         status_box.set_margin_start(16);
         status_box.set_margin_end(16);
 
+        let conn_group = adw::PreferencesGroup::builder()
+            .title("Подключение и точный USB-маркер")
+            .description("Фактическое состояние физического канала, шины USB, порта IEEE-1284 и ответа IVEC")
+            .build();
+
+        let conn_mode_row = adw::ActionRow::builder()
+            .title("Состояние и режим канала")
+            .subtitle("Нет подключения (опрос...)")
+            .build();
+        let usb_marker_row = adw::ActionRow::builder()
+            .title("Точный USB-маркер (Bus / Dev / VID:PID / S/N)")
+            .subtitle("Нет подключения")
+            .build();
+        let usb_endpoints_row = adw::ActionRow::builder()
+            .title("USB Интерфейсы и Endpoints")
+            .subtitle("Нет данных")
+            .build();
+        let ieee1284_row = adw::ActionRow::builder()
+            .title("IEEE-1284 GET_DEVICE_ID")
+            .subtitle("Нет данных")
+            .build();
+        let usb_port_ivec_row = adw::ActionRow::builder()
+            .title("USB Port Status + сырой ответ IVEC")
+            .subtitle("Нет данных")
+            .build();
+
+        conn_group.add(&conn_mode_row);
+        conn_group.add(&usb_marker_row);
+        conn_group.add(&usb_endpoints_row);
+        conn_group.add(&ieee1284_row);
+        conn_group.add(&usb_port_ivec_row);
+        status_box.append(&conn_group);
+
         let diag_banner_group = adw::PreferencesGroup::new();
         let diagnostic_banner_row = adw::ActionRow::builder()
-            .title("Status: Device Ready")
-            .subtitle("No hardware support codes active")
+            .title("Нет подключения: опрос устройства...")
+            .subtitle("Ожидание реального ответа от принтера")
             .css_classes(["card"])
             .build();
         diag_banner_group.add(&diagnostic_banner_row);
@@ -901,8 +1194,8 @@ impl SimpleComponent for AppModel {
 
         // GI-790 CISS Ink Levels
         let ink_group = adw::PreferencesGroup::builder()
-            .title("GI-790 CISS Ink Tank Levels (Estimated)")
-            .description("Droplet usage accounting & firmware low-ink markers")
+            .title("Уровни чернил GI-790 СНПЧ (ответ прошивки)")
+            .description("Ожидание телеметрии от принтера")
             .build();
 
         let make_gauge_row = |name: &'static str| {
@@ -911,12 +1204,13 @@ impl SimpleComponent for AppModel {
             let bar = gtk::LevelBar::builder()
                 .min_value(0.0)
                 .max_value(1.0)
-                .value(1.0)
+                .value(0.0)
                 .width_request(180)
                 .build();
             let lbl = gtk::Label::builder()
-                .label("100%")
-                .width_request(45)
+                .label("—")
+                .width_request(95)
+                .xalign(1.0)
                 .build();
             box_h.append(&bar);
             box_h.append(&lbl);
@@ -937,11 +1231,11 @@ impl SimpleComponent for AppModel {
 
         // Waste Ink Absorber
         let absorber_group = adw::PreferencesGroup::builder()
-            .title("Waste Ink Absorber (D-Counter)")
-            .description("Internal felt pad saturation. Ink Flush blocked at >= 80%. Fatal error 5B00/P07 at 100%.")
+            .title("Абсорбер отработанных чернил (D-Counter)")
+            .description("Показания из ответа принтера (блокировка Ink Flush при >= 80%, ошибка 5B00/P07 при 100%)")
             .build();
 
-        let absorber_row = adw::ActionRow::builder().title("Saturation Level").build();
+        let absorber_row = adw::ActionRow::builder().title("Заполнение абсорбера").build();
         let abs_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let absorber_bar = gtk::LevelBar::builder()
             .min_value(0.0)
@@ -950,8 +1244,9 @@ impl SimpleComponent for AppModel {
             .width_request(180)
             .build();
         let absorber_label = gtk::Label::builder()
-            .label("0.0%")
-            .width_request(55)
+            .label("—")
+            .width_request(110)
+            .xalign(1.0)
             .build();
         abs_box.append(&absorber_bar);
         abs_box.append(&absorber_label);
@@ -959,7 +1254,7 @@ impl SimpleComponent for AppModel {
         absorber_group.add(&absorber_row);
 
         let absorber_warning_label = gtk::Label::builder()
-            .label("[!] DANGER: Waste ink absorber >= 80%! Ink Flush is hard-blocked to prevent overflow.")
+            .label("[!] ОПАСНОСТЬ: абсорбер >= 80%! Прокачка чернил (Ink Flush) заблокирована.")
             .css_classes(["error", "caption"])
             .wrap(true)
             .xalign(0.0)
@@ -971,23 +1266,23 @@ impl SimpleComponent for AppModel {
 
         // FINE Printhead Health
         let head_group = adw::PreferencesGroup::builder()
-            .title("FINE Printhead Cartridges")
+            .title("Печатающие головки FINE")
             .build();
 
         let black_cartridge_row = adw::ActionRow::builder()
-            .title("Black Printhead (BH-4)")
-            .subtitle("OK (Installed)")
+            .title("Чёрная головка (BH-4)")
+            .subtitle("Неизвестно (нет подключения)")
             .build();
         let color_cartridge_row = adw::ActionRow::builder()
-            .title("Color Printhead (CH-41)")
-            .subtitle("OK (Installed)")
+            .title("Цветная головка (CH-41)")
+            .subtitle("Неизвестно (нет подключения)")
             .build();
         head_group.add(&black_cartridge_row);
         head_group.add(&color_cartridge_row);
         status_box.append(&head_group);
 
         let btn_refresh = gtk::Button::builder()
-            .label("Refresh Telemetry Now")
+            .label("Обновить телеметрию сейчас")
             .css_classes(["suggested-action", "pill"])
             .margin_top(8)
             .build();
@@ -1009,12 +1304,35 @@ impl SimpleComponent for AppModel {
         toast_overlay.set_child(Some(&main_box));
         root.set_content(Some(&toast_overlay));
 
+        spawn_live_telemetry_poller(
+            model.vm.is_mock_mode,
+            model.configured_socket.clone(),
+            Arc::clone(&shared_client),
+            Arc::clone(&poll_notify),
+            sender.clone(),
+        );
+
         let widgets = AppWidgets {
+            led_drawing,
+            led_state_cell,
+            conn_headline_label,
+            conn_detail_label,
+            usb_badge_label,
+            conn_mode_row,
+            usb_marker_row,
+            usb_endpoints_row,
+            ieee1284_row,
+            usb_port_ivec_row,
             print_summary_label,
             glossy_notice_label,
+            print_test_btn,
+            maint_status_row,
+            maint_spinner,
+            maint_action_buttons,
             flush_execute_btn,
             flush_confirm_switch,
             align_scales,
+            ink_group,
             pgbk_bar,
             pgbk_label,
             cyan_bar,
@@ -1222,201 +1540,219 @@ impl SimpleComponent for AppModel {
                     .handle_event(StudioEvent::SetInkFlushConfirmation(confirmed));
             }
 
-            // Async Hardware Actions
+            // Live telemetry events
+            AppMsg::LiveSnapshotReceived { source, snapshot } => {
+                self.vm
+                    .handle_event(StudioEvent::ApplyLiveSnapshot { source, snapshot });
+            }
+            AppMsg::TelemetryDisconnected(err) => {
+                self.vm
+                    .handle_event(StudioEvent::ReportTelemetryDisconnected(err));
+            }
+
+            // Asynchronous hardware actions
             AppMsg::TriggerRefreshTelemetry => {
-                if let Some(client_arc) = self.client.clone() {
+                if self.vm.is_mock_mode {
+                    let client_arc = self.client.clone();
+                    let configured_socket = self.configured_socket.clone();
                     let s = sender.clone();
                     tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match guard.get_status().await {
-                            Ok(status) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(format!(
-                                    "Telemetry refreshed: {:?}",
-                                    status.state
-                                ))));
+                        let res = run_action_with_client(
+                            client_arc,
+                            true,
+                            configured_socket,
+                            |c| {
+                                Box::pin(async move {
+                                    let snap =
+                                        c.get_live_snapshot().await.map_err(|e| e.to_string())?;
+                                    Ok((c.source().clone(), Box::new(snap)))
+                                })
+                            },
+                        )
+                        .await;
+                        match res {
+                            Ok((source, snapshot)) => {
+                                s.input(AppMsg::LiveSnapshotReceived { source, snapshot });
                             }
                             Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e.to_string())));
+                                s.input(AppMsg::TelemetryDisconnected(e));
                             }
                         }
                     });
+                } else {
+                    self.poll_notify.notify_one();
                 }
             }
             AppMsg::TriggerPrintTestPage => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone.dispatch_print_test_page(&mut guard).await {
-                            Ok(()) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(
-                                    "Diagnostic test page submitted to printer.".into(),
-                                )));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
-                        }
-                    });
+                if self.vm.is_busy {
+                    return;
                 }
+                let mut vm_clone = self.vm.clone();
+                self.spawn_hardware_task(
+                    "Печать тестовой страницы".to_string(),
+                    "Отправка тестовой страницы на принтер...".to_string(),
+                    &sender,
+                    |c| {
+                        Box::pin(async move {
+                            vm_clone.dispatch_print_test_page(c).await?;
+                            Ok("Тестовая страница отправлена на принтер.".to_string())
+                        })
+                    },
+                );
             }
             AppMsg::TriggerClean(kind, target) => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone
-                            .dispatch_cleaning(&mut guard, kind, target, false)
-                            .await
-                        {
-                            Ok(st) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(format!(
-                                    "Cleaning complete. Absorber: {:.1}%",
-                                    st.waste_absorber_percent
-                                ))));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
-                        }
-                    });
+                if self.vm.is_busy {
+                    return;
                 }
+                let op_label = format!("Очистка ({kind:?} · {target:?})");
+                let mut vm_clone = self.vm.clone();
+                self.spawn_hardware_task(
+                    op_label.clone(),
+                    format!("Запуск: {op_label}..."),
+                    &sender,
+                    move |c| {
+                        Box::pin(async move {
+                            let st = vm_clone.dispatch_cleaning(c, kind, target, false).await?;
+                            Ok(format!(
+                                "Прочистка принята принтером. Текущий статус: {:?}",
+                                st.state
+                            ))
+                        })
+                    },
+                );
             }
             AppMsg::TriggerMechanicalClean(target) => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone.dispatch_mechanical_clean(&mut guard, target).await {
-                            Ok(_) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(
-                                    "Mechanical cleaning complete.".into(),
-                                )));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
-                        }
-                    });
+                if self.vm.is_busy {
+                    return;
                 }
+                let mut vm_clone = self.vm.clone();
+                self.spawn_hardware_task(
+                    "Очистка роликов / поддона".to_string(),
+                    "Запуск механической очистки...".to_string(),
+                    &sender,
+                    move |c| {
+                        Box::pin(async move {
+                            let st = vm_clone.dispatch_mechanical_clean(c, target).await?;
+                            Ok(format!(
+                                "Механическая очистка запущена. Статус: {:?}",
+                                st.state
+                            ))
+                        })
+                    },
+                );
             }
             AppMsg::TriggerTestPrint(t) => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone.dispatch_test_print(&mut guard, t).await {
-                            Ok(_) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(
-                                    "Pattern print job submitted.".into(),
-                                )));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
-                        }
-                    });
+                if self.vm.is_busy {
+                    return;
                 }
+                let mut vm_clone = self.vm.clone();
+                self.spawn_hardware_task(
+                    format!("Тест-шаблон ({t:?})"),
+                    format!("Отправка шаблона {t:?}..."),
+                    &sender,
+                    move |c| {
+                        Box::pin(async move {
+                            let st = vm_clone.dispatch_test_print(c, t).await?;
+                            Ok(format!(
+                                "Задание диагностической печати принято. Статус: {:?}",
+                                st.state
+                            ))
+                        })
+                    },
+                );
             }
             AppMsg::TriggerApplyAlignment => {
-                if let Some(client_arc) = self.client.clone() {
-                    let mut vm_clone = self.vm.clone();
-                    let s = sender.clone();
-                    tokio::spawn(async move {
-                        let mut guard = client_arc.lock().await;
-                        match vm_clone.dispatch_apply_alignment(&mut guard).await {
-                            Ok(_) => {
-                                s.input(AppMsg::HardwareTaskFinished(Ok(
-                                    "Manual alignment offsets successfully saved to printer."
-                                        .into(),
-                                )));
-                            }
-                            Err(e) => {
-                                s.input(AppMsg::HardwareTaskFinished(Err(e)));
-                            }
-                        }
-                    });
+                if self.vm.is_busy {
+                    return;
                 }
+                let mut vm_clone = self.vm.clone();
+                self.spawn_hardware_task(
+                    "Запись калибровки головок".to_string(),
+                    "Запись смещений A..N в NVRAM...".to_string(),
+                    &sender,
+                    |c| {
+                        Box::pin(async move {
+                            vm_clone.dispatch_apply_alignment(c).await?;
+                            Ok("Значения выравнивания сохранены в принтер.".to_string())
+                        })
+                    },
+                );
             }
             AppMsg::TriggerScan => {
+                if self.vm.is_busy {
+                    return;
+                }
                 self.vm.is_busy = true;
+                self.vm.last_error = None;
+                self.last_scan_error = None;
+                self.vm.busy_operation = Some("Сканирование планшета MP2".to_string());
                 let client_arc = self.client.clone();
                 let mut vm_clone = self.vm.clone();
+                let is_mock = self.vm.is_mock_mode;
+                let configured_socket = self.configured_socket.clone();
                 let s = sender.clone();
                 tokio::spawn(async move {
-                    let res: Result<
-                        (
-                            usize,
-                            Option<std::path::PathBuf>,
-                            Option<std::path::PathBuf>,
-                        ),
-                        String,
-                    > = async {
-                        if let Some(arc) = client_arc {
-                            let mut guard = arc.lock().await;
-                            let pages = vm_clone.dispatch_scan(&mut guard).await?;
-                            Ok((pages.len(), vm_clone.last_scan_path, vm_clone.last_scan_thumb))
-                        } else {
-                            let mut c = DaemonClient::connect_or_fallback(None, None)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let pages = vm_clone.dispatch_scan(&mut c).await?;
-                            Ok((pages.len(), vm_clone.last_scan_path, vm_clone.last_scan_thumb))
-                        }
-                    }
-                    .await;
+                    let res =
+                        run_action_with_client(client_arc, is_mock, configured_socket, |c| {
+                            Box::pin(async move {
+                                let pages = vm_clone.dispatch_scan(c).await?;
+                                Ok((
+                                    pages.len(),
+                                    vm_clone.last_scan_path,
+                                    vm_clone.last_scan_thumb,
+                                ))
+                            })
+                        })
+                        .await;
 
                     s.input(AppMsg::ScanCompleted(res));
                 });
             }
 
             AppMsg::ScanCompleted(result) => {
-                self.vm.is_busy = false;
-                match result {
-                    Ok((count, path_opt, thumb_opt)) => {
-                        self.vm.last_scan_path = path_opt.clone();
-                        self.vm.last_scan_thumb = thumb_opt;
-                        let path_str = path_opt
-                            .as_ref()
-                            .map(|p| format!("Saved to {}", p.display()))
-                            .unwrap_or_else(|| format!("{count} page(s) acquired"));
-                        self.vm.status_banner = format!("Scan complete. {path_str}");
-                        self.vm.last_error = None;
-                    }
-                    Err(err) => {
-                        self.vm.last_error = Some(err.clone());
-                        self.vm.status_banner = format!("[ERROR] {err}");
-                    }
-                }
+                self.apply_scan_completed(result);
+                self.notify_telemetry_refresh(&sender);
             }
 
             AppMsg::OpenScannedDocument => {
                 if let Some(path) = &self.vm.last_scan_path {
-                    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                    if let Err(err) = std::process::Command::new("xdg-open").arg(path).spawn() {
+                        let msg =
+                            format!("Не удалось открыть скан ({}): {err}", path.display());
+                        self.vm.last_error = Some(msg.clone());
+                        self.pending_toasts.borrow_mut().push((msg, 5));
+                    }
                 }
             }
 
             AppMsg::HardwareTaskFinished(result) => {
-                match result {
-                    Ok(msg) => {
-                        self.vm.status_banner = msg;
-                        self.vm.last_error = None;
-                    }
-                    Err(err) => {
-                        self.vm.last_error = Some(err.clone());
-                        self.vm.status_banner = format!("[ERROR] {err}");
-                    }
-                }
-                self.vm.is_busy = false;
+                self.apply_hardware_task_finished(result);
+                self.notify_telemetry_refresh(&sender);
             }
         }
     }
 
     fn update_view(&self, widgets: &mut Self::Widgets, _sender: ComponentSender<Self>) {
+        for (text, timeout) in self.pending_toasts.borrow_mut().drain(..) {
+            let toast = adw::Toast::builder()
+                .title(&text)
+                .timeout(timeout)
+                .build();
+            widgets.toast_overlay.add_toast(toast);
+        }
+
+        // Persistent 4-color LED + exact USB marker strip
+        let led = self.vm.led_state();
+        widgets.led_state_cell.set(led);
+        widgets.led_drawing.queue_draw();
+
+        let (headline, detail) = format_connection_strip(&self.vm, led);
+        widgets.conn_headline_label.set_label(&headline);
+        widgets.conn_detail_label.set_label(&detail);
+        widgets
+            .usb_badge_label
+            .set_label(&self.vm.telemetry.usb_marker_short());
+
         // Tab 1 Print Settings
         widgets
             .print_summary_label
@@ -1428,71 +1764,202 @@ impl SimpleComponent for AppModel {
         }
 
         // Tab 2 Maintenance
+        let hw_active_state = self
+            .vm
+            .telemetry
+            .snapshot
+            .as_ref()
+            .filter(|_| self.vm.telemetry.connected)
+            .and_then(|snap| {
+                matches!(
+                    snap.status.state,
+                    OperationalState::Cleaning
+                        | OperationalState::Testing
+                        | OperationalState::Printing
+                        | OperationalState::Scanning
+                        | OperationalState::Waiting
+                )
+                .then_some(snap.status.state)
+            });
+        let hw_busy = hw_active_state.is_some();
+        let maint_locked = self.vm.is_busy || hw_busy;
+
+        widgets.print_test_btn.set_sensitive(!maint_locked);
+        for btn in &widgets.maint_action_buttons {
+            btn.set_sensitive(!maint_locked);
+        }
         widgets
             .flush_execute_btn
-            .set_sensitive(self.vm.ink_flush_confirmed && !self.vm.is_busy);
+            .set_sensitive(self.vm.ink_flush_confirmed && !maint_locked);
         widgets
             .flush_confirm_switch
             .set_active(self.vm.ink_flush_confirmed);
 
-        // Tab 4 Status Monitor
-        let pgbk = self.vm.device_status.ink_levels.pigment_black_percent;
-        let cyan = self.vm.device_status.ink_levels.cyan_percent;
-        let mag = self.vm.device_status.ink_levels.magenta_percent;
-        let yel = self.vm.device_status.ink_levels.yellow_percent;
+        if self.vm.is_busy {
+            widgets.maint_spinner.set_visible(true);
+            widgets.maint_spinner.start();
+            widgets.maint_status_row.set_title("Выполняется команда...");
+            widgets.maint_status_row.set_subtitle(
+                self.vm
+                    .busy_operation
+                    .as_deref()
+                    .unwrap_or("Отправка команды на принтер..."),
+            );
+        } else if let Some(active_state) = hw_active_state {
+            widgets.maint_spinner.set_visible(true);
+            widgets.maint_spinner.start();
+            widgets
+                .maint_status_row
+                .set_title("Принтер выполняет обслуживание");
+            widgets.maint_status_row.set_subtitle(&format!(
+                "Реальный ответ принтера: {} ({:?})",
+                format_op_state_ru(active_state),
+                active_state
+            ));
+        } else if let Some(Err(ref err)) = self.last_maint_feedback {
+            widgets.maint_spinner.stop();
+            widgets.maint_spinner.set_visible(false);
+            widgets.maint_status_row.set_title("Ошибка / отклонено");
+            widgets
+                .maint_status_row
+                .set_subtitle(&format_concise_error(err));
+        } else if let Some(Ok(ref msg)) = self.last_maint_feedback {
+            widgets.maint_spinner.stop();
+            widgets.maint_spinner.set_visible(false);
+            widgets.maint_status_row.set_title("Последняя операция");
+            widgets.maint_status_row.set_subtitle(&format!(
+                "{msg} · Текущий статус: {}",
+                self.vm.status_banner
+            ));
+        } else {
+            widgets.maint_spinner.stop();
+            widgets.maint_spinner.set_visible(false);
+            widgets.maint_status_row.set_title("Готово к обслуживанию");
+            widgets
+                .maint_status_row
+                .set_subtitle(&self.vm.status_banner);
+        }
 
-        widgets.pgbk_bar.set_value(pgbk as f64 / 100.0);
-        widgets.pgbk_label.set_label(&format!("{pgbk}%"));
-        widgets.cyan_bar.set_value(cyan as f64 / 100.0);
-        widgets.cyan_label.set_label(&format!("{cyan}%"));
-        widgets.magenta_bar.set_value(mag as f64 / 100.0);
-        widgets.magenta_label.set_label(&format!("{mag}%"));
-        widgets.yellow_bar.set_value(yel as f64 / 100.0);
-        widgets.yellow_label.set_label(&format!("{yel}%"));
+        // Tab 4 Status Monitor: Connection + USB Hardware Marker rows
+        update_connection_detail_rows(widgets, &self.vm);
 
-        let absorber = self.vm.device_status.waste_absorber_percent;
-        widgets.absorber_bar.set_value(absorber as f64 / 100.0);
-        widgets.absorber_label.set_label(&format!("{absorber:.1}%"));
-        widgets.absorber_warning_label.set_visible(absorber >= 80.0);
+        // Tab 4 Status Monitor: Real hardware telemetry (no fake values when disconnected or unreported)
+        match self.vm.telemetry.snapshot.as_ref() {
+            Some(snap) if self.vm.telemetry.connected => {
+                if snap.firmware_reported_ink {
+                    widgets.ink_group.set_description(Some(
+                        "Показания получены из IVEC-ответа прошивки принтера",
+                    ));
+                    let pgbk = snap.status.ink_levels.pigment_black_percent;
+                    let cyan = snap.status.ink_levels.cyan_percent;
+                    let mag = snap.status.ink_levels.magenta_percent;
+                    let yel = snap.status.ink_levels.yellow_percent;
 
-        widgets
-            .black_cartridge_row
-            .set_subtitle(match self.vm.device_status.black_head_state {
-                CartridgeState::InstalledOk => "OK (Installed)",
-                CartridgeState::NotRecognized => "ERROR: Not Recognized",
-                CartridgeState::NotInstalled => "MISSING: Not Installed",
-                CartridgeState::LockUnlatched => "WARNING: Lever Unlatched",
-                CartridgeState::Overheated => "CRITICAL: Overheated",
-            });
-        widgets
-            .color_cartridge_row
-            .set_subtitle(match self.vm.device_status.color_head_state {
-                CartridgeState::InstalledOk => "OK (Installed)",
-                CartridgeState::NotRecognized => "ERROR: Not Recognized",
-                CartridgeState::NotInstalled => "MISSING: Not Installed",
-                CartridgeState::LockUnlatched => "WARNING: Lever Unlatched",
-                CartridgeState::Overheated => "CRITICAL: Overheated",
-            });
+                    widgets.pgbk_bar.set_value(pgbk as f64 / 100.0);
+                    widgets.pgbk_label.set_label(&format!("{pgbk}%"));
+                    widgets.cyan_bar.set_value(cyan as f64 / 100.0);
+                    widgets.cyan_label.set_label(&format!("{cyan}%"));
+                    widgets.magenta_bar.set_value(mag as f64 / 100.0);
+                    widgets.magenta_label.set_label(&format!("{mag}%"));
+                    widgets.yellow_bar.set_value(yel as f64 / 100.0);
+                    widgets.yellow_label.set_label(&format!("{yel}%"));
+                } else {
+                    widgets.ink_group.set_description(Some(
+                        "Прошивка принтера в GetStatusResponse не передаёт % чернил — физические датчики уровня в СНПЧ G2010 отсутствуют",
+                    ));
+                    widgets.pgbk_bar.set_value(0.0);
+                    widgets.pgbk_label.set_label("Нет датчика");
+                    widgets.cyan_bar.set_value(0.0);
+                    widgets.cyan_label.set_label("Нет датчика");
+                    widgets.magenta_bar.set_value(0.0);
+                    widgets.magenta_label.set_label("Нет датчика");
+                    widgets.yellow_bar.set_value(0.0);
+                    widgets.yellow_label.set_label("Нет датчика");
+                }
+
+                if snap.firmware_reported_waste {
+                    let absorber = snap.status.waste_absorber_percent;
+                    widgets.absorber_bar.set_value(absorber as f64 / 100.0);
+                    widgets.absorber_label.set_label(&format!("{absorber:.1}%"));
+                    widgets.absorber_warning_label.set_visible(absorber >= 80.0);
+                } else {
+                    widgets.absorber_bar.set_value(0.0);
+                    widgets.absorber_label.set_label("Не передано");
+                    widgets.absorber_warning_label.set_visible(false);
+                }
+
+                widgets.black_cartridge_row.set_subtitle(
+                    format_cartridge_state_ru(snap.status.black_head_state),
+                );
+                widgets.color_cartridge_row.set_subtitle(
+                    format_cartridge_state_ru(snap.status.color_head_state),
+                );
+            }
+            _ => {
+                widgets.ink_group.set_description(Some(
+                    "Нет подключения к принтеру — данные о чернилах недоступны",
+                ));
+                widgets.pgbk_bar.set_value(0.0);
+                widgets.pgbk_label.set_label("—");
+                widgets.cyan_bar.set_value(0.0);
+                widgets.cyan_label.set_label("—");
+                widgets.magenta_bar.set_value(0.0);
+                widgets.magenta_label.set_label("—");
+                widgets.yellow_bar.set_value(0.0);
+                widgets.yellow_label.set_label("—");
+
+                widgets.absorber_bar.set_value(0.0);
+                widgets.absorber_label.set_label("—");
+                widgets.absorber_warning_label.set_visible(false);
+
+                widgets
+                    .black_cartridge_row
+                    .set_subtitle("Неизвестно (нет подключения)");
+                widgets
+                    .color_cartridge_row
+                    .set_subtitle("Неизвестно (нет подключения)");
+            }
+        }
 
         widgets
             .diagnostic_banner_row
             .set_title(&self.vm.status_banner);
+        let banner_sub = match (&self.vm.telemetry.snapshot, &self.vm.telemetry.last_error) {
+            (_, Some(err)) => format!("Ошибка связи: {err}"),
+            (Some(snap), None) => match (&snap.status.support_code, &snap.status.lcd_code) {
+                (Some(code), Some(lcd)) => format!("Активен код поддержки {code} (LCD: {lcd})"),
+                (Some(code), None) => format!("Активен код поддержки {code}"),
+                (None, _) => "Активных кодов ошибок от принтера нет".to_string(),
+            },
+            (None, None) => "Ожидание реального ответа от принтера".to_string(),
+        };
+        widgets.diagnostic_banner_row.set_subtitle(&banner_sub);
 
         // Tab 3 ScanGear Pro
-        widgets.scan_btn.set_sensitive(!self.vm.is_busy);
+        widgets.scan_btn.set_sensitive(!maint_locked);
         if self.vm.is_busy {
             widgets.scan_spinner.start();
         } else {
             widgets.scan_spinner.stop();
         }
-        if let Some(thumb) = &self.vm.last_scan_thumb {
+        if self.last_scan_error.is_some() {
+            widgets.scan_preview_picture.set_filename(None::<&std::path::Path>);
+            widgets.scan_preview_picture.set_visible(false);
+        } else if let Some(thumb) = &self.vm.last_scan_thumb {
             widgets.scan_preview_picture.set_filename(Some(thumb));
             widgets.scan_preview_picture.set_visible(true);
         } else if let Some(path) = &self.vm.last_scan_path {
             widgets.scan_preview_picture.set_filename(Some(path));
             widgets.scan_preview_picture.set_visible(true);
+        } else {
+            widgets.scan_preview_picture.set_filename(None::<&std::path::Path>);
+            widgets.scan_preview_picture.set_visible(false);
         }
-        if let Some(path) = &self.vm.last_scan_path {
+        if let Some(ref scan_err) = self.last_scan_error {
+            widgets.scan_result_row.set_title("Ошибка сканирования");
+            widgets.scan_result_row.set_subtitle(scan_err);
+            widgets.scan_open_btn.set_visible(false);
+        } else if let Some(path) = &self.vm.last_scan_path {
             widgets
                 .scan_result_row
                 .set_title("Scan Acquired & Exported Successfully");
@@ -1501,5 +1968,513 @@ impl SimpleComponent for AppModel {
                 .set_subtitle(&path.display().to_string());
             widgets.scan_open_btn.set_visible(true);
         }
+    }
+}
+
+enum PollOutcome {
+    Snapshot {
+        source: ConnectionSource,
+        snapshot: Box<LiveDaemonSnapshot>,
+    },
+    DirectBusy,
+    Disconnected(String),
+}
+
+type ActionFutureFn<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'a>>;
+
+fn spawn_live_telemetry_poller(
+    is_mock_mode: bool,
+    configured_socket: Option<PathBuf>,
+    shared_direct: Arc<TokioMutex<Option<DaemonClient>>>,
+    poll_notify: Arc<Notify>,
+    sender: ComponentSender<AppModel>,
+) {
+    if is_mock_mode {
+        sender.input(AppMsg::TriggerRefreshTelemetry);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut socket_poll_client: Option<DaemonClient> = None;
+
+        loop {
+            let outcome = poll_once(
+                &mut socket_poll_client,
+                &shared_direct,
+                configured_socket.as_deref(),
+            )
+            .await;
+            let connected_now = match outcome {
+                PollOutcome::Snapshot { source, snapshot } => {
+                    sender.input(AppMsg::LiveSnapshotReceived { source, snapshot });
+                    true
+                }
+                PollOutcome::DirectBusy => true,
+                PollOutcome::Disconnected(err) => {
+                    sender.input(AppMsg::TelemetryDisconnected(err));
+                    false
+                }
+            };
+
+            let delay = if connected_now {
+                std::time::Duration::from_millis(1500)
+            } else {
+                std::time::Duration::from_millis(2500)
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = poll_notify.notified() => {}
+            }
+        }
+    });
+}
+
+async fn poll_once(
+    socket_poll_client: &mut Option<DaemonClient>,
+    shared_direct: &Arc<TokioMutex<Option<DaemonClient>>>,
+    configured_socket: Option<&Path>,
+) -> PollOutcome {
+    if let Some(ref mut client) = socket_poll_client {
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            client.get_live_snapshot(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => PollOutcome::Snapshot {
+                source: client.source().clone(),
+                snapshot: Box::new(snapshot),
+            },
+            Ok(Err(e)) => {
+                *socket_poll_client = None;
+                PollOutcome::Disconnected(e.to_string())
+            }
+            Err(_) => {
+                *socket_poll_client = None;
+                PollOutcome::Disconnected("Таймаут опроса сокета демона (4с)".to_string())
+            }
+        };
+    }
+
+    let Ok(mut guard) = shared_direct.try_lock() else {
+        return PollOutcome::DirectBusy;
+    };
+
+    if let Some(ref mut direct_client) = *guard {
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            direct_client.get_live_snapshot(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => PollOutcome::Snapshot {
+                source: direct_client.source().clone(),
+                snapshot: Box::new(snapshot),
+            },
+            Ok(Err(e)) => {
+                *guard = None;
+                PollOutcome::Disconnected(e.to_string())
+            }
+            Err(_) => {
+                *guard = None;
+                PollOutcome::Disconnected("Таймаут опроса USB-устройства (4с)".to_string())
+            }
+        };
+    }
+
+    let connect_res = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        DaemonClient::connect_live(configured_socket, None),
+    )
+    .await;
+
+    let mut new_client = match connect_res {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return PollOutcome::Disconnected(e.to_string()),
+        Err(_) => {
+            return PollOutcome::Disconnected("Таймаут подключения к принтеру (3с)".to_string())
+        }
+    };
+
+    let snap_res = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        new_client.get_live_snapshot(),
+    )
+    .await;
+
+    match snap_res {
+        Ok(Ok(snapshot)) => {
+            let source = new_client.source().clone();
+            if matches!(source, ConnectionSource::DaemonSocket { .. }) {
+                *socket_poll_client = Some(new_client);
+            } else {
+                *guard = Some(new_client);
+            }
+            PollOutcome::Snapshot {
+                source,
+                snapshot: Box::new(snapshot),
+            }
+        }
+        Ok(Err(e)) => PollOutcome::Disconnected(e.to_string()),
+        Err(_) => PollOutcome::Disconnected("Таймаут получения ответа GetStatus (4с)".to_string()),
+    }
+}
+
+async fn run_action_with_client<F, T>(
+    shared_direct: Arc<TokioMutex<Option<DaemonClient>>>,
+    is_mock_mode: bool,
+    configured_socket: Option<PathBuf>,
+    op: F,
+) -> Result<T, String>
+where
+    F: for<'a> FnOnce(&'a mut DaemonClient) -> ActionFutureFn<'a, T>,
+{
+    let action_socket = {
+        let mut guard = shared_direct.lock().await;
+        if is_mock_mode {
+            if guard.is_none() {
+                *guard = Some(DaemonClient::connect_mock(None).map_err(|e| e.to_string())?);
+            }
+            let client = guard
+                .as_mut()
+                .ok_or_else(|| "Mock client unavailable after initialization".to_string())?;
+            return op(client).await;
+        }
+
+        if let Some(ref mut existing_direct) = *guard {
+            let res = op(existing_direct).await;
+            if res.is_err() {
+                *guard = None;
+            }
+            return res;
+        }
+
+        let new_client = DaemonClient::connect_live(configured_socket.as_deref(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        if matches!(new_client.source(), ConnectionSource::DaemonSocket { .. }) {
+            Some(new_client)
+        } else {
+            *guard = Some(new_client);
+            let direct_client = guard
+                .as_mut()
+                .ok_or_else(|| "Direct USB client unavailable after initialization".to_string())?;
+            let res = op(direct_client).await;
+            if res.is_err() {
+                *guard = None;
+            }
+            return res;
+        }
+    };
+
+    let mut c =
+        action_socket.ok_or_else(|| "Daemon socket client unexpectedly missing".to_string())?;
+    op(&mut c).await
+}
+
+fn format_connection_strip(vm: &StudioViewModel, led: ConnectionLedState) -> (String, String) {
+    if let Some(snap) = vm.telemetry.snapshot.as_ref().filter(|_| vm.telemetry.connected) {
+        let model_name = snap.hardware_marker.product_name.as_deref().unwrap_or("Canon PIXMA");
+        let transport_scope = if vm.telemetry.is_remote() {
+            format!("Удалённо: {} ← {}", snap.daemon_hostname, vm.telemetry.local_hostname)
+        } else if snap.hardware_marker.is_mock {
+            "Локальный мок-эмулятор (--mock)".to_string()
+        } else {
+            format!("Локальная USB-шина: {}", snap.daemon_hostname)
+        };
+
+        let headline = match led {
+            ConnectionLedState::Disconnected => format!("Нет подключения · {transport_scope}"),
+            ConnectionLedState::LocalUsbReady => format!("На USB-шине (локально) · {model_name}"),
+            ConnectionLedState::RemoteReady => {
+                format!("Удалённо вкл ({}) · {model_name}", snap.daemon_hostname)
+            }
+            ConnectionLedState::Busy => {
+                let reason = if let Some(ref op) = vm.busy_operation {
+                    op.as_str()
+                } else if let Some(job) = snap.active_job {
+                    format_job_kind_ru(job)
+                } else {
+                    format_op_state_ru(snap.status.state)
+                };
+                format!("Печатает / Занят: {reason}")
+            }
+        };
+
+        let ivec_status = snap.raw_ivec_status.as_deref().unwrap_or("—");
+        let ivec_resp = snap.ivec_response.as_deref().unwrap_or("—");
+        let detail = format!("{transport_scope} · IVEC {ivec_resp}/{ivec_status}");
+        (headline, detail)
+    } else {
+        let err = vm
+            .telemetry
+            .last_error
+            .as_deref()
+            .unwrap_or("ожидание ответа от принтера / демона...");
+        let target_hint = match (
+            &vm.telemetry.configured_remote_host,
+            &vm.telemetry.configured_socket,
+        ) {
+            (Some(host), Some(sock)) => format!("Удалённый канал {host} ({sock}): {err}"),
+            (None, Some(sock)) => format!("Сокет {sock}: {err}"),
+            _ => err.to_string(),
+        };
+        ("Нет подключения".to_string(), target_hint)
+    }
+}
+
+fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
+    if let Some(snap) = vm.telemetry.snapshot.as_ref().filter(|_| vm.telemetry.connected) {
+        let mode_str = match &vm.telemetry.source {
+            Some(ConnectionSource::DaemonSocket { socket_path }) => {
+                if vm.telemetry.is_remote() {
+                    format!(
+                        "Удалённо по SSH-мосту · клиент {} → хост принтера {} · сокет {}",
+                        vm.telemetry.local_hostname, snap.daemon_hostname, socket_path
+                    )
+                } else {
+                    format!(
+                        "Локальный демон pixmad ({}) · сокет {}",
+                        snap.daemon_hostname, socket_path
+                    )
+                }
+            }
+            Some(ConnectionSource::DirectUsb) => format!(
+                "Локальная USB-шина напрямую (in-process nusb) на {}",
+                vm.telemetry.local_hostname
+            ),
+            Some(ConnectionSource::DirectMock) | None => {
+                "Виртуальный эмулятор (--mock), реальная шина USB не используется".to_string()
+            }
+        };
+        widgets.conn_mode_row.set_subtitle(&mode_str);
+
+        let m = &snap.hardware_marker;
+        let marker_full = if m.is_mock {
+            format!("MOCK · S/N {} (физический USB не подключён)", m.serial_number)
+        } else {
+            let bus = m
+                .bus_number
+                .map(|b| format!("{b:03}"))
+                .unwrap_or_else(|| "?".into());
+            let dev = m
+                .device_address
+                .map(|d| format!("{d:03}"))
+                .unwrap_or_else(|| "?".into());
+            let vid = m
+                .vendor_id
+                .map(|v| format!("{v:04x}"))
+                .unwrap_or_else(|| "????".into());
+            let pid = m
+                .product_id
+                .map(|p| format!("{p:04x}"))
+                .unwrap_or_else(|| "????".into());
+            let mfg = m.manufacturer.as_deref().unwrap_or("?");
+            let prod = m.product_name.as_deref().unwrap_or("?");
+            format!(
+                "Bus {bus} Dev {dev} | VID:PID {vid}:{pid} | {mfg} {prod} | S/N {}",
+                m.serial_number
+            )
+        };
+        widgets.usb_marker_row.set_subtitle(&marker_full);
+        widgets.usb_endpoints_row.set_subtitle(&m.endpoints_summary);
+        widgets
+            .ieee1284_row
+            .set_subtitle(snap.ieee1284_id.as_deref().unwrap_or("Не передано устройством"));
+
+        let port_str = snap
+            .usb_port_status
+            .map(ConnectionTelemetry::format_port_status)
+            .unwrap_or_else(|| "Не получен".to_string());
+        let fw_str = if snap.firmware_reported_version && !snap.status.firmware_version.is_empty()
+        {
+            snap.status.firmware_version.as_str()
+        } else {
+            "не передана прошивкой"
+        };
+        let active_str = match snap.active_job {
+            Some(kind) => format!(" · Арбитр USB: занят ({})", format_job_kind_ru(kind)),
+            None if vm.is_busy => " · Арбитр UI: выполняется операция".to_string(),
+            None => String::new(),
+        };
+        let ivec_str = format!(
+            "{} | IVEC: resp={}, status={}, detail={}, support={}, FW={}{}",
+            port_str,
+            snap.ivec_response.as_deref().unwrap_or("—"),
+            snap.raw_ivec_status.as_deref().unwrap_or("—"),
+            snap.raw_status_detail.as_deref().unwrap_or("none"),
+            snap.raw_support_code.as_deref().unwrap_or("none"),
+            fw_str,
+            active_str,
+        );
+        widgets.usb_port_ivec_row.set_subtitle(&ivec_str);
+    } else {
+        let err = vm
+            .telemetry
+            .last_error
+            .as_deref()
+            .unwrap_or("ожидание ответа...");
+        let remote_prefix = vm
+            .telemetry
+            .configured_remote_host
+            .as_deref()
+            .map(|h| format!("Удалённый канал ({h}) не активен: "))
+            .unwrap_or_default();
+        widgets
+            .conn_mode_row
+            .set_subtitle(&format!("{remote_prefix}{err}"));
+        widgets
+            .usb_marker_row
+            .set_subtitle("Физическое USB-устройство не обнаружено / не отвечает");
+        widgets.usb_endpoints_row.set_subtitle("Нет данных");
+        widgets.ieee1284_row.set_subtitle("Нет данных");
+        widgets.usb_port_ivec_row.set_subtitle("Нет данных");
+    }
+}
+
+fn format_cartridge_state_ru(state: CartridgeState) -> &'static str {
+    match state {
+        CartridgeState::InstalledOk => "OK (ошибка картриджа от прошивки не активна)",
+        CartridgeState::NotRecognized => "ОШИБКА: не распознана (код ошибки)",
+        CartridgeState::NotInstalled => "ОТСУТСТВУЕТ: не установлена",
+        CartridgeState::LockUnlatched => "ВНИМАНИЕ: фиксатор не защёлкнут",
+        CartridgeState::Overheated => "КРИТИЧНО: перегрев (5200)",
+    }
+}
+
+fn format_job_kind_ru(kind: JobLockKind) -> &'static str {
+    match kind {
+        JobLockKind::Printing => "Печать (поток USB)",
+        JobLockKind::Scanning => "Сканирование (MP2)",
+        JobLockKind::Maintenance => "Обслуживание",
+        JobLockKind::Telemetry => "Опрос телеметрии",
+    }
+}
+
+fn format_op_state_ru(state: OperationalState) -> &'static str {
+    match state {
+        OperationalState::Idle => "Готов",
+        OperationalState::Printing => "Печать",
+        OperationalState::Scanning => "Сканирование",
+        OperationalState::Cleaning => "Очистка",
+        OperationalState::Testing => "Тестовая печать",
+        OperationalState::Waiting => "Ожидание",
+        OperationalState::CoverOpen => "Открыта крышка",
+        OperationalState::PaperOut => "Нет бумаги",
+        OperationalState::PaperJam => "Замятие бумаги",
+        OperationalState::OperatorCall => "Требуется действие",
+        OperationalState::ServiceError => "Сервисная ошибка",
+        OperationalState::Offline => "Не в сети",
+    }
+}
+
+/// Strips redundant nested transport/protocol prefixes before showing an error in UI widgets.
+fn format_concise_error(raw: &str) -> String {
+    let mut s = raw.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("Protocol error:")
+            .or_else(|| s.strip_prefix("USB transport error:"))
+            .or_else(|| s.strip_prefix("I/O error:"))
+            .or_else(|| s.strip_prefix("Ошибка:"))
+            .map(str::trim_start);
+        match stripped {
+            Some(next) => s = next,
+            None => break,
+        }
+    }
+    s.to_string()
+}
+
+/// Formats a concise error for single-line `adw::Toast`, trimming on word boundaries if long.
+fn format_toast_error(raw: &str) -> String {
+    const MAX_TOAST_CHARS: usize = 92;
+    let concise = format_concise_error(raw);
+    let prefixed = format!("Ошибка: {concise}");
+    if prefixed.chars().count() <= MAX_TOAST_CHARS {
+        return prefixed;
+    }
+    let suffix = "… (см. статус)";
+    let keep = MAX_TOAST_CHARS.saturating_sub(suffix.chars().count());
+    let mut byte_end = prefixed
+        .char_indices()
+        .nth(keep)
+        .map(|(idx, _)| idx)
+        .unwrap_or(prefixed.len());
+    if let Some(last_space) = prefixed[..byte_end].rfind(' ') {
+        if last_space > 20 {
+            byte_end = last_space;
+        }
+    }
+    format!("{}{}", prefixed[..byte_end].trim_end(), suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_error_strips_nested_transport_prefixes_and_avoids_midword_chop() {
+        let raw = "Protocol error: USB transport error: Принтер остался в Idle и не начал очистку (Regular / ColorOnly, токен 'group2') (прошивка разрешает: regular=[all, group1, group2], deep=[all, group1]).";
+        assert_eq!(
+            format_concise_error(raw),
+            "Принтер остался в Idle и не начал очистку (Regular / ColorOnly, токен 'group2') (прошивка разрешает: regular=[all, group1, group2], deep=[all, group1])."
+        );
+        let toast = format_toast_error(raw);
+        assert!(toast.starts_with("Ошибка: Принтер остался в Idle"));
+        assert!(toast.ends_with("… (см. статус)"));
+        assert!(!toast.contains("Protocol error"));
+        assert!(!toast.contains("USB transport error"));
+        assert!(toast.chars().count() <= 92);
+    }
+
+    #[test]
+    fn hardware_task_finished_resets_ink_flush_confirmed_and_busy_flags() {
+        let mut vm = StudioViewModel::default();
+        vm.handle_event(StudioEvent::SetInkFlushConfirmation(true));
+        vm.is_busy = true;
+        vm.busy_operation = Some("InkFlush".to_string());
+        let mut model = AppModel {
+            vm,
+            client: Arc::new(TokioMutex::new(None)),
+            poll_notify: Arc::new(Notify::new()),
+            configured_socket: None,
+            pending_toasts: RefCell::new(Vec::new()),
+            last_maint_feedback: None,
+            last_scan_error: None,
+        };
+
+        model.apply_hardware_task_finished(Ok("Done".to_string()));
+        assert!(!model.vm.ink_flush_confirmed);
+        assert!(!model.vm.is_busy);
+        assert!(model.vm.busy_operation.is_none());
+        assert!(model.vm.last_error.is_none());
+        assert_eq!(model.vm.status_banner, "Done");
+
+        model.vm.handle_event(StudioEvent::SetInkFlushConfirmation(true));
+        model.vm.is_busy = true;
+        model.apply_hardware_task_finished(Err("USB transport error: timeout".to_string()));
+        assert!(!model.vm.ink_flush_confirmed);
+        assert!(!model.vm.is_busy);
+        assert_eq!(model.vm.last_error.as_deref(), Some("timeout"));
+
+        model.vm.last_scan_path = Some(PathBuf::from("stale_scan.png"));
+        model.vm.last_scan_thumb = Some(PathBuf::from("stale_thumb.png"));
+        model.vm.is_busy = true;
+        model.apply_scan_completed(Err("USB transport error: scanner lid open".to_string()));
+        assert!(!model.vm.is_busy);
+        assert_eq!(model.last_scan_error.as_deref(), Some("scanner lid open"));
+        assert!(model.vm.last_scan_path.is_none());
+        assert!(model.vm.last_scan_thumb.is_none());
+        assert!(!model.pending_toasts.borrow().is_empty());
+
+        let scan_path = PathBuf::from("scan.png");
+        model.vm.is_busy = true;
+        model.apply_scan_completed(Ok((1, Some(scan_path.clone()), None)));
+        assert!(!model.vm.is_busy);
+        assert!(model.last_scan_error.is_none());
+        assert_eq!(model.vm.last_scan_path, Some(scan_path));
     }
 }

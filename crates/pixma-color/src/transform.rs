@@ -226,14 +226,14 @@ impl ColorPipeline {
         }
 
         if self.adjustment.grayscale {
-            for chunk in rgb.chunks_exact_mut(3) {
+            for chunk in rgb.as_chunks_mut::<3>().0 {
                 let gray = rgb_to_sgray_fixed_point(chunk[0], chunk[1], chunk[2]);
                 chunk[0] = self.lut_r[gray as usize];
                 chunk[1] = self.lut_g[gray as usize];
                 chunk[2] = self.lut_b[gray as usize];
             }
         } else {
-            for chunk in rgb.chunks_exact_mut(3) {
+            for chunk in rgb.as_chunks_mut::<3>().0 {
                 chunk[0] = self.lut_r[chunk[0] as usize];
                 chunk[1] = self.lut_g[chunk[1] as usize];
                 chunk[2] = self.lut_b[chunk[2] as usize];

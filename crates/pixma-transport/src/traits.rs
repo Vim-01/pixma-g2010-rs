@@ -17,6 +17,11 @@ pub trait UsbTransport: Send + Sync {
         "UNKNOWN"
     }
 
+    /// Returns `true` when backed by an in-memory mock device rather than physical USB hardware.
+    fn is_mock(&self) -> bool {
+        false
+    }
+
     /// Queries the IEEE-1284 Device ID string via control endpoint 0
     /// (`bmRequestType = 0xA1, bRequest = 0x00`).
     fn get_device_id(&mut self) -> impl Future<Output = Result<String, DriverError>> + Send;
@@ -56,4 +61,8 @@ pub trait UsbTransport: Send + Sync {
     /// Polls the scanner interrupt IN endpoint (Interface 0, EP `0x83`) for
     /// front-panel button events. Returns `Ok(None)` if no event is pending.
     fn poll_interrupt(&mut self) -> impl Future<Output = Result<Option<u8>, DriverError>> + Send;
+
+    /// Discards any locally buffered trailing scanner bulk-IN bytes from an
+    /// aborted/unaligned USB read so subsequent recovery reads drain the pipe.
+    fn clear_scanner_rx_overflow(&mut self) {}
 }

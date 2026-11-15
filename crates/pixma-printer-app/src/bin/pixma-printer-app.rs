@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use pixma_daemon::DaemonClient;
-use pixma_printer_app::router::{build_router, AppState};
+use pixma_printer_app::router::{build_router, printer_uri_base_from_bind, AppState};
 use std::env;
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,16 +20,25 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
     let mut bind_str = String::from("127.0.0.1:8631");
+    let mut socket_path: Option<std::path::PathBuf> = None;
     let mut force_mock = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--bind" | "-b" => {
-                if i + 1 < args.len() {
-                    bind_str = args[i + 1].clone();
-                    i += 1;
+                if i + 1 >= args.len() {
+                    anyhow::bail!("--bind requires an <ADDR:PORT> argument");
                 }
+                bind_str = args[i + 1].clone();
+                i += 1;
+            }
+            "--socket" => {
+                if i + 1 >= args.len() {
+                    anyhow::bail!("--socket requires a <PATH> argument");
+                }
+                socket_path = Some(std::path::PathBuf::from(&args[i + 1]));
+                i += 1;
             }
             "--mock" | "-m" => {
                 force_mock = true;
@@ -41,32 +50,32 @@ async fn main() -> Result<()> {
                 println!();
                 println!("Options:");
                 println!("  -b, --bind <ADDR:PORT>   Socket address to listen on (default: 127.0.0.1:8631)");
+                println!("      --socket <PATH>      Path to pixmad Unix domain socket");
                 println!(
                     "  -m, --mock               Simulate hardware with virtual in-memory device"
                 );
                 println!("  -h, --help               Show this help message");
                 return Ok(());
             }
-            _ => {}
+            other => {
+                anyhow::bail!("Unknown argument: {other}. Use --help for usage information.");
+            }
         }
         i += 1;
-    }
-
-    if force_mock {
-        env::set_var("PIXMA_MOCK", "1");
-        tracing::info!("Mock mode forced via CLI flag --mock");
     }
 
     let bind_addr: SocketAddr = bind_str
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid bind address '{bind_str}': {e}"))?;
+    let uri_base = printer_uri_base_from_bind(bind_addr);
 
     let state = if force_mock {
-        let client = DaemonClient::connect_or_fallback(None, None).await?;
-        AppState::new(client)
+        tracing::info!("Mock mode forced via CLI flag --mock");
+        let client = DaemonClient::connect_mock(None)?;
+        AppState::new_with_uri(client, uri_base)
     } else {
-        tracing::info!("Configured on-demand USB/daemon connection mode (releases USB when idle)");
-        AppState::new_on_demand()
+        tracing::info!("Configured fail-closed live USB/daemon connection mode");
+        AppState::new_on_demand_with_socket_and_uri(socket_path, uri_base)
     };
     let app = build_router(state);
 

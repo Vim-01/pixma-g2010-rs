@@ -44,4 +44,8 @@ pub enum RasterError {
     /// Dithering or halftoning processing error.
     #[error("Halftone error: {0}")]
     Halftone(String),
+
+    /// Runtime hardware safety interlock violation (e.g. non-zero PGBK on glossy media).
+    #[error("Safety interlock violation: {0}")]
+    SafetyViolation(String),
 }

@@ -21,6 +21,7 @@ INSTALL_PRINTER_APP=false
 INSTALL_CLI=true
 INSTALL_GUI=true
 DRY_RUN=false
+HAS_OVERRIDE_FLAGS=false
 
 # CLI argument parsing for non-interactive/automated setups
 while [[ $# -gt 0 ]]; do
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
             INSTALL_PRINTER_APP=true
             INSTALL_CLI=true
             INSTALL_GUI=true
+            HAS_OVERRIDE_FLAGS=true
             shift
             ;;
         --core-only)
@@ -43,10 +45,12 @@ while [[ $# -gt 0 ]]; do
             INSTALL_PRINTER_APP=false
             INSTALL_CLI=true
             INSTALL_GUI=false
+            HAS_OVERRIDE_FLAGS=true
             shift
             ;;
         --no-gui)
             INSTALL_GUI=false
+            HAS_OVERRIDE_FLAGS=true
             shift
             ;;
         --dry-run)
@@ -64,7 +68,9 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            shift
+            echo -e "${RED}Error: Unknown option '$1'${NC}" >&2
+            echo "Run '$0 --help' for supported options." >&2
+            exit 1
             ;;
     esac
 done
@@ -89,7 +95,7 @@ run_cmd() {
 }
 
 # If running interactively on a terminal with dialog/whiptail and no override flags passed
-if [ -t 0 ] && [ "$DRY_RUN" = false ] && { command -v whiptail >/dev/null 2>&1 || command -v dialog >/dev/null 2>&1; }; then
+if [ -t 0 ] && [ "$DRY_RUN" = false ] && [ "$HAS_OVERRIDE_FLAGS" = false ] && { command -v whiptail >/dev/null 2>&1 || command -v dialog >/dev/null 2>&1; }; then
     DIALOG_CMD="whiptail"
     if ! command -v whiptail >/dev/null 2>&1; then
         DIALOG_CMD="dialog"
@@ -140,7 +146,11 @@ if [ "$INSTALL_CLI" = true ]; then BUILD_CRATES+=("-p" "pixma-cli"); fi
 if [ "$INSTALL_GUI" = true ]; then BUILD_CRATES+=("-p" "pixma-gui"); fi
 
 if [ ${#BUILD_CRATES[@]} -gt 0 ]; then
-    cargo build --release "${BUILD_CRATES[@]}"
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "  ${YELLOW}[DRY-RUN]${NC} cargo build --release --locked ${BUILD_CRATES[*]}"
+    else
+        cargo build --release --locked "${BUILD_CRATES[@]}"
+    fi
 else
     echo "No crates selected to build."
     exit 0
@@ -151,6 +161,7 @@ echo -e "\n${YELLOW}Installing components...${NC}"
 if [ "$INSTALL_CORE" = true ]; then
     echo "Installing core daemon and udev rules..."
     run_cmd $SUDO install -Dm755 target/release/pixmad /usr/bin/pixmad
+    run_cmd $SUDO install -Dm755 target/release/pixma-sock-bridge /usr/bin/pixma-sock-bridge
     run_cmd $SUDO install -Dm644 assets/udev/70-pixma-g2010.rules /usr/lib/udev/rules.d/70-pixma-g2010.rules
     run_cmd $SUDO install -Dm644 assets/systemd/pixmad.service /usr/lib/systemd/system/pixmad.service
     run_cmd $SUDO udevadm control --reload-rules

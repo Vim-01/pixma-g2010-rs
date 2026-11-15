@@ -268,3 +268,77 @@ async fn test_axum_rest_status_and_maintenance() {
     let maint_status: DeviceStatus = serde_json::from_slice(&maint_bytes).unwrap();
     assert_eq!(maint_status.serial_number, "UNKNOWN");
 }
+
+#[tokio::test]
+async fn test_on_demand_fails_closed_when_socket_unavailable() {
+    let missing_sock = std::env::temp_dir().join(format!(
+        "pixma-missing-printer-app-sock-{}",
+        std::process::id()
+    ));
+    let state = AppState::new_on_demand_with_socket_and_uri(
+        Some(missing_sock),
+        "ipp://127.0.0.1:8631/ipp/print",
+    );
+    let app = build_router(state);
+
+    // 1. GET /api/status must fail closed with 503 SERVICE_UNAVAILABLE instead of mock fallback
+    let status_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 2. POST /api/maintenance must fail closed with 503 SERVICE_UNAVAILABLE
+    let maint_body = serde_json::to_vec(&MaintenanceApiRequest {
+        action: MaintenanceAction::Clean {
+            kind: CleaningType::Regular,
+            target: CleaningTarget::All,
+        },
+        confirmation_token: None,
+        override_cooldown: false,
+    })
+    .unwrap();
+    let maint_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/maintenance")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(maint_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(maint_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 3. OP_GET_PRINTER_ATTRIBUTES reports printer-state = stopped (5) when offline
+    let attr_req = build_raw_ipp_request(OP_GET_PRINTER_ATTRIBUTES, 77, None);
+    let attr_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ipp/print")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .body(axum::body::Body::from(attr_req))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attr_resp.status(), StatusCode::OK);
+    let attr_bytes = to_bytes(attr_resp.into_body(), usize::MAX).await.unwrap();
+    let parsed = IppRequest::parse(&attr_bytes).unwrap();
+    let p_state = parsed
+        .printer_attributes
+        .iter()
+        .find(|a| a.name() == "printer-state")
+        .unwrap();
+    assert_eq!(p_state.first_value().unwrap().as_i32(), Some(5));
+}

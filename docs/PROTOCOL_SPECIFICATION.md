@@ -206,20 +206,24 @@ All IVEC commands use UTF-8 XML with namespaces:
 - **Paper Gap / Abrasion Prevention (`<vcn:papergap>`):** `auto` or `wide`.
 
 ### 3.4 Maintenance Operations (`servicetype="maintenance"`)
-1. **Print Head Cleaning (`<ivec:operation>Cleaning</ivec:operation>`):**
+1. **Framing (`cmdtocanonij3` / IVEC USB framing):**
+   - `StartJob` (`servicetype="maintenance"`, `<ivec:bidi>0</ivec:bidi>`, `<ivec:jobname/>`, `<ivec:username/>`, `<ivec:computername/>`, `<ivec:job_description><![CDATA[1]]></ivec:job_description>`)
+   - Exact `len(StartJob)` zero (`0x00`) NUL padding bytes
+   - Operation XML (`Cleaning`, `RollerCleaning`, `TestPrint`, or `VendorCmd/SetAlignmentPattern`)
+   - `EndJob` (`servicetype="maintenance"`)
+2. **Print Head Cleaning (`<ivec:operation>Cleaning</ivec:operation>`):**
    - `<ivec:type>`:
      - `regular`: Standard cleaning
      - `deep`: Deep cleaning
      - `choke`: System Cleaning / Ink Flush (high ink consumption!)
-   - `<ivec:target>`:
+   - `<ivec:inkgroup>`:
      - `all`: All ink groups (Black + Color)
      - `group1`: Black (`PGBK`) only
-     - `group2`: Color (`C, M, Y`) only
-   - `<ivec:bidirectional>OFF</ivec:bidirectional>`
-2. **Mechanical Roller & Bottom Plate Cleaning (`<ivec:operation>RollerCleaning</ivec:operation>`):**
+     - `group2`: Color (`C, M, Y`) only (note: some G-series firmware revisions reject `group2`-only cleaning with idle rejection and require `all`)
+3. **Mechanical Roller & Bottom Plate Cleaning (`<ivec:operation>RollerCleaning</ivec:operation>`):**
    - `<ivec:target>roller</ivec:target>` (Paper feed roller cleaning)
    - `<ivec:target>platen</ivec:target>` (Bottom plate cleaning)
-3. **Diagnostic Test Prints & Head Alignment (`<ivec:operation>TestPrint</ivec:operation>`):**
+4. **Diagnostic Test Prints & Head Alignment (`<ivec:operation>TestPrint</ivec:operation>`):**
    - `<ivec:type>nozzle_check</ivec:type>` (Nozzle Check Pattern, 1 sheet)
    - `<ivec:type>manual_registration</ivec:type>` (Manual Head Alignment Pattern, 2 sheets, supports column offset parameters)
    - `<ivec:type>half_auto_registration</ivec:type>` (Semi-automatic alignment, 1 sheet)

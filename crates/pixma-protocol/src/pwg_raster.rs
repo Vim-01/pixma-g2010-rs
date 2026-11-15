@@ -6,8 +6,17 @@
 use crate::errors::ProtocolError;
 use pixma_core::safety::ValidatedRasterLine;
 
-/// PWG Raster 4-byte stream magic (`"RaS2"`).
+/// PWG / CUPS Raster 4-byte stream magic (`"RaS2"` big-endian compressed v2).
 pub const PWG_RASTER_MAGIC: [u8; 4] = *b"RaS2";
+
+/// Little-endian CUPS Raster v2 4-byte stream magic (`"2SaR"`).
+pub const CUPS_RASTER_REVSYNC_V2: [u8; 4] = *b"2SaR";
+
+/// Big-endian CUPS Raster v3 4-byte stream magic (`"RaS3"` uncompressed).
+pub const CUPS_RASTER_SYNC_V3: [u8; 4] = *b"RaS3";
+
+/// Little-endian CUPS Raster v3 4-byte stream magic (`"3SaR"` uncompressed).
+pub const CUPS_RASTER_REVSYNC_V3: [u8; 4] = *b"3SaR";
 
 /// Size of PWG Raster per-page header in bytes (1796 bytes = 0x704).
 pub const PWG_HEADER_SIZE: usize = 1796;
@@ -191,14 +200,28 @@ impl PwgRasterHeader {
         buf
     }
 
-    /// Parses a 1796-byte buffer into a `PwgRasterHeader`.
+    /// Parses a 1796-byte big-endian buffer into a `PwgRasterHeader`.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, ProtocolError> {
+        Self::from_bytes_with_endian(buf, false)
+    }
+
+    /// Parses a 1796-byte CUPS/PWG Raster v2/v3 header with explicit endianness.
+    pub fn from_bytes_with_endian(buf: &[u8], little_endian: bool) -> Result<Self, ProtocolError> {
         if buf.len() < PWG_HEADER_SIZE {
             return Err(ProtocolError::BufferTooShort {
                 expected: PWG_HEADER_SIZE,
                 actual: buf.len(),
             });
         }
+
+        let read_u32 = |offset: usize| -> u32 {
+            let bytes: [u8; 4] = buf[offset..offset + 4].try_into().unwrap();
+            if little_endian {
+                u32::from_le_bytes(bytes)
+            } else {
+                u32::from_be_bytes(bytes)
+            }
+        };
 
         let media_class = String::from_utf8_lossy(&buf[0..64])
             .trim_matches('\0')
@@ -207,35 +230,27 @@ impl PwgRasterHeader {
             .trim_matches('\0')
             .to_string();
 
-        let dpi_x = u32::from_be_bytes(buf[276..280].try_into().unwrap());
-        let dpi_y = u32::from_be_bytes(buf[280..284].try_into().unwrap());
+        let dpi_x = read_u32(276);
+        let dpi_y = read_u32(280);
 
-        let imaging_bbox = (
-            u32::from_be_bytes(buf[284..288].try_into().unwrap()),
-            u32::from_be_bytes(buf[288..292].try_into().unwrap()),
-            u32::from_be_bytes(buf[292..296].try_into().unwrap()),
-            u32::from_be_bytes(buf[296..300].try_into().unwrap()),
-        );
+        let imaging_bbox = (read_u32(284), read_u32(288), read_u32(292), read_u32(296));
 
-        let num_copies = u32::from_be_bytes(buf[340..344].try_into().unwrap());
+        let num_copies = read_u32(340);
 
-        let page_size_pts = (
-            u32::from_be_bytes(buf[352..356].try_into().unwrap()),
-            u32::from_be_bytes(buf[356..360].try_into().unwrap()),
-        );
+        let page_size_pts = (read_u32(352), read_u32(356));
 
-        let width_px = u32::from_be_bytes(buf[372..376].try_into().unwrap());
-        let height_px = u32::from_be_bytes(buf[376..380].try_into().unwrap());
-        let bits_per_color = u32::from_be_bytes(buf[384..388].try_into().unwrap());
-        let bits_per_pixel = u32::from_be_bytes(buf[388..392].try_into().unwrap());
-        let bytes_per_line = u32::from_be_bytes(buf[392..396].try_into().unwrap());
-        let color_space = u32::from_be_bytes(buf[400..404].try_into().unwrap());
-        let num_colors = u32::from_be_bytes(buf[420..424].try_into().unwrap());
-        let total_pages = u32::from_be_bytes(buf[428..432].try_into().unwrap());
+        let width_px = read_u32(372);
+        let height_px = read_u32(376);
+        let bits_per_color = read_u32(384);
+        let bits_per_pixel = read_u32(388);
+        let bytes_per_line = read_u32(392);
+        let color_space = read_u32(400);
+        let num_colors = read_u32(420);
+        let total_pages = read_u32(428);
 
         let mut cups_integer = [0u32; 16];
-        for i in 0..16 {
-            cups_integer[i] = u32::from_be_bytes(buf[452 + i * 4..456 + i * 4].try_into().unwrap());
+        for (i, slot) in cups_integer.iter_mut().enumerate() {
+            *slot = read_u32(452 + i * 4);
         }
 
         let rendering_intent = String::from_utf8_lossy(&buf[1668..1732])
@@ -614,5 +629,17 @@ mod tests {
             CnclIpcFrameHeader::from_bytes(&bytes),
             Err(ProtocolError::InvalidMagic { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_headers_and_roundtrips_sgray() {
+        assert!(CnclIpcFrameHeader::from_bytes(&[0u8; 16]).is_err());
+        let gray = PwgRasterHeader::new_sgray(120, 80, 300);
+        let raw = gray.to_bytes();
+        assert_eq!(raw.len(), PWG_HEADER_SIZE);
+        let decoded = PwgRasterHeader::from_bytes(&raw).unwrap();
+        assert_eq!(decoded.width_px, 120);
+        assert_eq!(decoded.height_px, 80);
+        assert_eq!(decoded.bits_per_pixel, 8);
     }
 }

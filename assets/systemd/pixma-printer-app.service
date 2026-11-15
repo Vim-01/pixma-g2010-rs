@@ -7,12 +7,17 @@ Wants=pixmad.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/pixma-printer-app --bind 127.0.0.1:8631
+DynamicUser=true
 Group=lp
 Restart=on-failure
 RestartSec=3s
+NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target

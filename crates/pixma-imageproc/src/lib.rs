@@ -30,7 +30,7 @@ pub use export::{
     save_tiff,
 };
 pub use geometry::{auto_multi_crop, deskew_image, estimate_skew_angle_deg, rotate_bilinear};
-pub use pipeline::execute_scan_pipeline;
+pub use pipeline::{decode_raw_scan_buffer, execute_scan_pipeline};
 pub use restoration::{
     correct_gutter_shadow, descreen_moire_2d_fft, remove_dust_and_scratches, unsharp_mask,
 };

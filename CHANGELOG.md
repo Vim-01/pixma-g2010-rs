@@ -1,5 +1,36 @@
 # Changelog
 
+## [v0.3.0] - 2026-11-15
+
+### Workspace Hardening, Binary IPC Framing & Release Hygiene Audit
+
+#### Changed
+- **Workspace Metadata & MSRV (`1.88`)**:
+  - Bumped workspace version to `0.3.0` and set `rust-version = "1.88"` with locked dependency graph (`Cargo.lock`).
+- **Fail-Closed Hardware Isolation (`pixma-escl`, `pixma-sane`, `pixma-printer-app`, `pixma-gui`)**:
+  - Removed silent mock fallback in live mode across HTTP/SANE services (`pixma-escl` returns `503 Service Unavailable`, `pixma-sane` reports device offline when live hardware/`pixmad` is absent).
+  - Removed runtime `std::env::set_var` mutations in `pixma-printer-app`, `pixma-sane` tests, and `pixma-gui` (`PIXMA_MOCK`, `PIXMA_SOCKET`, `PIXMA_REMOTE_HOST`), switching to explicit `DaemonClient::connect_mock` and direct socket path plumbing.
+  - Updated `pixma-gui` Relm4 application ID to `org.pixma.G2010Studio` matching the desktop entry and icon.
+
+#### Security & Reliability
+- **Private Socket & Lock File Hardening (`pixma-daemon`, `pixma-transport`, `pixma-gui`)**:
+  - Eliminated predictable shared `/tmp/pixmad.sock` fallback in `pixmad`, `pixma-sock-bridge`, `pixma-daemon`, and `pixma-gui` auto-bridge in favor of `/run/pixma/pixmad.sock`, `$XDG_RUNTIME_DIR/pixma`, or UID-owned `0o700` verified private directories.
+  - Added symlink/ownership validation (`is_verified_private_dir`, `ensure_verified_private_dir`), enforced `0o660` permissions on the daemon socket, and hardened `/run/lock/pixma-g2010.lock` with explicit `0o664` creation and read-only non-create fallback for unprivileged `uaccess` users.
+  - Hardened `assets/systemd/pixma-escl.service` and `assets/systemd/pixma-printer-app.service` with `DynamicUser=true`, `Group=lp`, `NoNewPrivileges=true`, and restricted address families.
+- **Bounded IPC & Scanner Buffer Framing (`pixma-daemon`, `pixma-transport`)**:
+  - Switched `pixma-daemon` binary IPC framing to CBOR (`MAX_IPC_CBOR_BYTES = 512 MiB`, `MAX_IPC_JSON_BYTES = 16 MiB`) with pre-allocation length checks while retaining JSON read compatibility.
+  - Fixed multi-read USB scanner overflow buffering in `NusbTransport` (`read_scanner_with_overflow`) and bounded MP2 scan chunk allocations (`MAX_SCAN_CHUNK_BYTES = 16 MiB`).
+- **CUPS Safety Enforcement, HTTP Limits & UI Fixes (`pixma-cups`, `pixma-printer-app`, `pixma-escl`, `pixma-gui`)**:
+  - Wired read-only `MaintenanceSupervisor::load_readonly` checks into `cmdtopixma-g2010` before issuing maintenance commands (including Ink Flush `choke` absorber/cooldown/confirmation verification).
+  - Added strict HTTP `Host` header validation and `512 MiB` body cap in `pixma-printer-app`, bounded retained eSCL scan jobs (`MAX_RETAINED_JOBS = 64`), and `1 MiB` XML request limit in `pixma-escl`.
+  - Consolidated duplicated scan buffer decoding (`pixma_imageproc::decode_raw_scan_buffer`) and UTC timestamp formatting (`pixma_core::current_utc_timestamp_14`).
+  - Reaped timed-out SSH bridge child processes in `pixma-gui`, isolated `--self-test` scans to a temporary directory (`scan_output_dir`), reset `ink_flush_confirmed` + sensitive button states on `HardwareTaskFinished`, and cleared stale scan previews on scan error.
+- **PWG Raster Bounds, Maintenance State Integrity & Transport Safety (`pixma-raster`, `pixma-core`, `pixma-transport`, `pixma-cups`, `pixma-escl`, `pixma-daemon`)**:
+  - Bounded `parse_pwg_raster` and PDF rasterization across multi-page streams (`MAX_PWG_TOTAL_RGB_BYTES = 512 MiB`, `MAX_PWG_PAGES = 256`) and enforced exact PackBits scanline byte counts instead of truncating overruns.
+  - Enforced `0o755`/`0o644` state file permissions on `/var/lib/pixma-g2010/state.json`, rejected corrupted JSON (`InvalidData`) in `MaintenanceSupervisor::load_or_init`, `pixmad`, `DaemonClient::load_supervisor`, and `cmdtopixma-g2010` rather than zeroing D-counter state, and guarded post-hardware `record_cleaning_executed` persistence failures.
+  - Wired end-to-end confirmed CUPS `InkFlush YES-DRAIN-INK` dispatch (`dispatch_cups_payload`) while keeping raw unconfirmed `choke` XML fail-closed across both `execute_maintenance` and `print_raw_stream` (with comment/prefix/order-agnostic IVEC `<cmd>` inspection).
+  - Eliminated silent `connect_or_fallback` mock substitution across `pixma-cups`, `pixma-cli`, `pixma-printer-app`, and `pixma-escl`, hardened `pixma-sock-bridge` listener checks (fail-closed `SO_PEERCRED` UID verification, symlink/non-socket refusal, world-writable parent rejection), and promoted eSCL region scaling to `u64` arithmetic.
+
 ## [v0.2.3] - 2026-11-09
 
 ### BJR520 Firmware Table Restoration, IPP Orientation Support & 1200 DPI Optical Sensor Mapping
