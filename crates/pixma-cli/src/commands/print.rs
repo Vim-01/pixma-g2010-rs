@@ -5,10 +5,9 @@ use pixma_core::print_params::{
     PaperGapMode, PaperSize, PrintJobConfig, PrintQuality, QuietMode,
 };
 use pixma_daemon::DaemonClient;
-use pixma_protocol::pwg_raster::PWG_RASTER_MAGIC;
-use pixma_raster::{
-    generate_test_print_page, parse_document_from_memory, PrintRasterPipeline, RasterPageInput,
-};
+use pixma_raster::{generate_test_print_page, DocumentPageSource, PrintRasterPipeline};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,32 +95,55 @@ pub async fn execute_print(
     }
 
     // Ingest pages
-    let pages: Vec<RasterPageInput> = if test_page {
+    let timestamp = current_timestamp_14();
+    let (pages_printed, job_stream) = if test_page {
         if !json {
             println!(
                 "Generating internal diagnostic test page at {} DPI...",
                 quality.base_raster_dpi()
             );
+            println!(
+                "Streaming and compiling diagnostic test page, {:?}, {:?}, quality {:?}...",
+                media_type, paper_size, quality
+            );
         }
-        vec![generate_test_print_page(quality.base_raster_dpi())]
+        let page = generate_test_print_page(quality.base_raster_dpi());
+        let mut source = DocumentPageSource::from_page(page);
+        let mut stream = Vec::new();
+        let count = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+            &mut source,
+            &config,
+            &timestamp,
+            &mut stream,
+        )
+        .map_err(|e| anyhow::anyhow!("Raster pipeline compilation failed: {e}"))?;
+        (count, stream)
     } else if let Some(path) = input_path {
-        let file_bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read input file {}: {e}", path.display()))?;
-
         if !json {
-            if file_bytes.starts_with(&PWG_RASTER_MAGIC) {
-                println!("Parsing input PWG Raster stream (RaS2)...");
-            } else if file_bytes.starts_with(b"%PDF") {
-                println!(
-                    "Rasterizing input PDF document at {} DPI...",
-                    quality.base_raster_dpi()
-                );
-            } else {
-                println!("Decoding input image format...");
-            }
+            println!(
+                "Streaming and compiling print job from {}, {:?}, {:?}, quality {:?}...",
+                path.display(),
+                media_type,
+                paper_size,
+                quality
+            );
         }
-        parse_document_from_memory(&file_bytes, Some(quality.base_raster_dpi()))
-            .map_err(|e| anyhow::anyhow!("Failed to decode document file: {e}"))?
+        let file = File::open(path)
+            .map_err(|e| anyhow::anyhow!("Failed to open input file {}: {e}", path.display()))?;
+        let mut source = DocumentPageSource::from_reader(
+            BufReader::with_capacity(64 * 1024, file),
+            Some(quality.base_raster_dpi()),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decode document file: {e}"))?;
+        let mut stream = Vec::new();
+        let count = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+            &mut source,
+            &config,
+            &timestamp,
+            &mut stream,
+        )
+        .map_err(|e| anyhow::anyhow!("Raster pipeline compilation failed: {e}"))?;
+        (count, stream)
     } else {
         return Err(anyhow::anyhow!(
             "Either `--input <PATH>` or `--test-page` must be specified for print."
@@ -130,22 +152,9 @@ pub async fn execute_print(
 
     if !json {
         println!(
-            "Rendering and compiling print job: {} page(s), {:?}, {:?}, quality {:?}...",
-            pages.len(),
-            media_type,
-            paper_size,
-            quality
-        );
-    }
-
-    let timestamp = current_timestamp_14();
-    let job_stream = PrintRasterPipeline::compile_ivec_bjraster3_job(&pages, &config, &timestamp)
-        .map_err(|e| anyhow::anyhow!("Raster pipeline compilation failed: {e}"))?;
-
-    if !json {
-        println!(
-            "Compiled {} bytes of wire data. Streaming to printer Bulk OUT pipe...",
-            job_stream.len()
+            "Compiled {} bytes ({} output page(s)) of wire data. Streaming to printer Bulk OUT pipe...",
+            job_stream.len(),
+            pages_printed
         );
     }
 
@@ -154,7 +163,7 @@ pub async fn execute_print(
     if json {
         let result = serde_json::json!({
             "status": "success",
-            "pages_printed": pages.len(),
+            "pages_printed": pages_printed,
             "media_type": format!("{:?}", media_type),
             "paper_size": format!("{:?}", paper_size),
             "quality": quality_int,

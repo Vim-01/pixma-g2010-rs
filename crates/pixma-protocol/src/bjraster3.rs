@@ -180,9 +180,27 @@ impl BjRaster3Encoder {
         printable_width_600: u32,
         printable_height_600: u32,
     ) -> Vec<u8> {
+        Self::encode_bjr520_page_prologue(
+            config,
+            page_no <= 1,
+            page_no.max(1),
+            printable_width_600,
+            printable_height_600,
+        )
+    }
+
+    /// Generates the hardware-verified BJR520 page prologue with explicit first-page flag,
+    /// avoiding `ESC [ K` / `ESC ( b` re-emission when `page_id` wraps past 255 pages.
+    pub fn encode_bjr520_page_prologue(
+        config: &PrintJobConfig,
+        is_first_page: bool,
+        page_id: u8,
+        printable_width_600: u32,
+        printable_height_600: u32,
+    ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(180);
 
-        if page_no <= 1 {
+        if is_first_page {
             // ESC [ K (len=2): 00 0f — Enter BJRaster3 command mode
             buf.extend_from_slice(&[0x1b, b'[', b'K', 0x02, 0x00, 0x00, 0x0f]);
             // ESC ( b (len=1): 01 — Enable PackBits RLE compression
@@ -190,7 +208,7 @@ impl BjRaster3Encoder {
         }
 
         // ESC ( q (len=1): page ID
-        buf.extend_from_slice(&[0x1b, b'(', b'q', 0x01, 0x00, page_no.max(1)]);
+        buf.extend_from_slice(&[0x1b, b'(', b'q', 0x01, 0x00, page_id.max(1)]);
 
         // ESC ( d (len=4): 02 58 02 58 (600 x 600 DPI in big-endian u16)
         buf.extend_from_slice(&[0x1b, b'(', b'd', 0x04, 0x00, 0x02, 0x58, 0x02, 0x58]);

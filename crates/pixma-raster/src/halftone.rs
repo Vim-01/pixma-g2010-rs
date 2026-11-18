@@ -169,7 +169,8 @@ impl BlueNoiseDitherer {
                 for x in 0..width {
                     let matrix_idx = matrix_y + (x % MATRIX_SIZE);
                     let threshold = matrix[matrix_idx];
-                    row[x] = if src_row[x] > threshold { 1 } else { 0 };
+                    let val = src_row[x];
+                    row[x] = if val == 255 || val > threshold { 1 } else { 0 };
                 }
             });
 
@@ -637,5 +638,20 @@ mod tests {
         assert_eq!(m.len(), width * height);
         assert_eq!(y.len(), width * height);
         assert_eq!(k.len(), width * height);
+    }
+
+    #[test]
+    fn blue_noise_1bit_emits_solid_255_and_zero_without_matrix_dropouts() {
+        let bn = BlueNoiseDitherer::new();
+        let solid = vec![255u8; 64 * 64];
+        let ones = bn.dither_plane_1bit(&solid, 64, 64);
+        assert!(
+            ones.iter().all(|&d| d == 1),
+            "Solid 255 must fire 1 on every pixel across all 64x64 matrix cells"
+        );
+
+        let blank = vec![0u8; 64 * 64];
+        let zeros = bn.dither_plane_1bit(&blank, 64, 64);
+        assert!(zeros.iter().all(|&d| d == 0), "0 must emit zero droplets");
     }
 }

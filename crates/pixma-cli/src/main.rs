@@ -32,6 +32,20 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", render_ascii_status(&status));
             }
         }
+        Commands::Capabilities => {
+            let caps = client.get_maintenance_capabilities().await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&caps)?);
+            } else if caps.cleaning_groups.is_empty() {
+                println!("Firmware returned GetCapabilityResponse with no parsed <ivec:Cleaning> groups.");
+                println!("Raw XML:\n{}", caps.raw_xml);
+            } else {
+                println!("Firmware maintenance cleaning capabilities:");
+                for (kind, groups) in &caps.cleaning_groups {
+                    println!("  {kind:<10} -> [{}]", groups.join(", "));
+                }
+            }
+        }
         Commands::Clean {
             kind,
             target,

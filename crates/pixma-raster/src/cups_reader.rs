@@ -11,6 +11,8 @@ use pixma_protocol::pwg_raster::{
     PwgRasterHeader, CUPS_RASTER_REVSYNC_V2, CUPS_RASTER_REVSYNC_V3, CUPS_RASTER_SYNC_V3,
     PWG_HEADER_SIZE, PWG_RASTER_MAGIC,
 };
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::path::PathBuf;
 
 /// An uncompressed 24-bit sRGB raster page ready for layout, color processing, and halftoning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,58 +291,143 @@ const MAX_PWG_WIDTH_PX: u32 = 16_384;
 const MAX_PWG_HEIGHT_PX: u32 = 32_768;
 const MAX_PWG_RGB_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PWG_TOTAL_RGB_BYTES: usize = 512 * 1024 * 1024;
+/// Upper bound on total buffered RGB bytes when collecting multi-page documents
+/// that require random page access (N-Up, Booklet, Reverse Order, Collated Copies).
+pub const MAX_MULTI_PAGE_COLLECT_RGB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_PWG_PAGES: usize = 256;
 const MAX_PWG_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PWG_EAGER_PREALLOC_BYTES: usize = 16 * 1024 * 1024;
 
-/// Parses a PWG / CUPS Raster v2 (`RaS2`/`2SaR`) or v3 (`RaS3`/`3SaR`) stream into pages.
-pub fn parse_pwg_raster(stream: &[u8]) -> Result<Vec<RasterPageInput>, RasterError> {
-    parse_pwg_raster_with_limits(stream, MAX_PWG_TOTAL_RGB_BYTES, MAX_PWG_PAGES)
+fn read_prefix<R: Read + ?Sized>(reader: &mut R, max_len: usize) -> Result<Vec<u8>, RasterError> {
+    let mut buf = Vec::with_capacity(max_len);
+    while buf.len() < max_len {
+        let mut chunk = [0u8; 64];
+        let want = (max_len - buf.len()).min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(RasterError::Io(e)),
+        }
+    }
+    Ok(buf)
 }
 
-fn parse_pwg_raster_with_limits(
-    mut stream: &[u8],
-    max_total_rgb_bytes: usize,
+fn read_exact_stream<R: Read + ?Sized>(
+    reader: &mut R,
+    dst: &mut [u8],
+    eof_msg: &str,
+) -> Result<(), RasterError> {
+    match reader.read_exact(dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(RasterError::StreamParse(eof_msg.to_string()))
+        }
+        Err(e) => Err(RasterError::Io(e)),
+    }
+}
+
+fn read_u8_stream<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<u8>, RasterError> {
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => return Ok(None),
+            Ok(buf) => {
+                let b = buf[0];
+                reader.consume(1);
+                return Ok(Some(b));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(RasterError::Io(e)),
+        }
+    }
+}
+
+/// Streaming CUPS / PWG Raster (`RaS2`/`2SaR`/`RaS3`/`3SaR`) decoder yielding one page at a time.
+pub struct PwgRasterReader<R: BufRead> {
+    reader: R,
+    little_endian: bool,
+    compressed: bool,
+    pages_emitted: usize,
     max_pages: usize,
-) -> Result<Vec<RasterPageInput>, RasterError> {
-    if stream.len() < 4 + PWG_HEADER_SIZE {
-        return Err(RasterError::StreamParse(format!(
-            "Stream too short for CUPS/PWG Raster: length is {} bytes",
-            stream.len()
-        )));
+}
+
+impl<R: BufRead> PwgRasterReader<R> {
+    /// Opens a CUPS / PWG Raster stream and validates its 4-byte stream magic prefix.
+    pub fn new(reader: R) -> Result<Self, RasterError> {
+        Self::with_max_pages(reader, MAX_PWG_PAGES)
     }
 
-    let format = detect_cups_raster_magic(&stream[..4]).ok_or_else(|| {
-        RasterError::StreamParse("Missing CUPS/PWG Raster magic prefix".to_string())
-    })?;
-    let (little_endian, compressed) = match format {
-        CupsRasterFormat::Compressed { little_endian } => (little_endian, true),
-        CupsRasterFormat::Uncompressed { little_endian } => (little_endian, false),
-    };
-    stream = &stream[4..];
-
-    let mut pages = Vec::new();
-    let mut cumulative_rgb_bytes: usize = 0;
-
-    while !stream.is_empty() {
-        // Some multi-page streams re-emit the 4-byte sync magic before each page header
-        if stream.len() >= 4 && detect_cups_raster_magic(&stream[..4]).is_some() {
-            stream = &stream[4..];
-        }
-
-        if stream.len() < PWG_HEADER_SIZE {
-            break;
-        }
-
-        if pages.len() >= max_pages {
+    fn with_max_pages(mut reader: R, max_pages: usize) -> Result<Self, RasterError> {
+        let magic = read_prefix(&mut reader, 4)?;
+        if magic.len() < 4 {
             return Err(RasterError::StreamParse(format!(
-                "PWG Raster stream exceeded maximum page limit of {max_pages}"
+                "Stream too short for CUPS/PWG Raster: length is {} bytes",
+                magic.len()
+            )));
+        }
+        let format = detect_cups_raster_magic(&magic).ok_or_else(|| {
+            RasterError::StreamParse("Missing CUPS/PWG Raster magic prefix".to_string())
+        })?;
+        let (little_endian, compressed) = match format {
+            CupsRasterFormat::Compressed { little_endian } => (little_endian, true),
+            CupsRasterFormat::Uncompressed { little_endian } => (little_endian, false),
+        };
+        Ok(Self {
+            reader,
+            little_endian,
+            compressed,
+            pages_emitted: 0,
+            max_pages,
+        })
+    }
+
+    /// Reads and decodes the next raster page from the stream (`Ok(None)` at clean EOF).
+    pub fn next_page(&mut self) -> Result<Option<RasterPageInput>, RasterError> {
+        let mut dummy = 0usize;
+        self.next_page_with_budget(None, &mut dummy)
+    }
+
+    fn next_page_with_budget(
+        &mut self,
+        max_cumulative_rgb_bytes: Option<usize>,
+        cumulative_rgb_bytes: &mut usize,
+    ) -> Result<Option<RasterPageInput>, RasterError> {
+        let prefix = read_prefix(&mut self.reader, 4)?;
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        if prefix.len() < 4 {
+            return Err(RasterError::StreamParse(format!(
+                "Truncated CUPS/PWG Raster page boundary: only {} trailing bytes",
+                prefix.len()
             )));
         }
 
-        let header = PwgRasterHeader::from_bytes_with_endian(&stream[..PWG_HEADER_SIZE], little_endian)?;
-        stream = &stream[PWG_HEADER_SIZE..];
+        let mut hdr_buf = [0u8; PWG_HEADER_SIZE];
+        if detect_cups_raster_magic(&prefix).is_some() {
+            // Multi-page streams may re-emit the 4-byte sync magic before each page header
+            read_exact_stream(
+                &mut self.reader,
+                &mut hdr_buf,
+                "Truncated PWG page header after sync magic",
+            )?;
+        } else {
+            hdr_buf[..4].copy_from_slice(&prefix);
+            read_exact_stream(
+                &mut self.reader,
+                &mut hdr_buf[4..],
+                "Truncated PWG page header",
+            )?;
+        }
 
+        if self.pages_emitted >= self.max_pages {
+            return Err(RasterError::StreamParse(format!(
+                "PWG Raster stream exceeded maximum page limit of {}",
+                self.max_pages
+            )));
+        }
+
+        let header = PwgRasterHeader::from_bytes_with_endian(&hdr_buf, self.little_endian)?;
         let width = header.width_px;
         let height = header.height_px;
         let dpi = header.dpi_x.max(header.dpi_y);
@@ -369,18 +456,19 @@ fn parse_pwg_raster_with_limits(
                 "PWG page RGB size {rgb_total_bytes} exceeds maximum allowed {MAX_PWG_RGB_BYTES} bytes"
             )));
         }
-        let next_cumulative_bytes =
-            cumulative_rgb_bytes
+        if let Some(budget) = max_cumulative_rgb_bytes {
+            let next_cumulative = cumulative_rgb_bytes
                 .checked_add(rgb_total_bytes)
                 .ok_or_else(|| {
                     RasterError::StreamParse("Cumulative PWG RGB byte count overflow".to_string())
                 })?;
-        if next_cumulative_bytes > max_total_rgb_bytes {
-            return Err(RasterError::StreamParse(format!(
-                "Cumulative PWG RGB size {next_cumulative_bytes} exceeds maximum allowed {max_total_rgb_bytes} bytes"
-            )));
+            if next_cumulative > budget {
+                return Err(RasterError::StreamParse(format!(
+                    "Cumulative PWG RGB size {next_cumulative} exceeds maximum allowed {budget} bytes"
+                )));
+            }
+            *cumulative_rgb_bytes = next_cumulative;
         }
-        cumulative_rgb_bytes = next_cumulative_bytes;
 
         let line_bits = (width as usize)
             .checked_mul(header.bits_per_pixel as usize)
@@ -388,33 +476,29 @@ fn parse_pwg_raster_with_limits(
                 RasterError::StreamParse("PWG scanline bit count overflow".to_string())
             })?;
         let min_line_bytes = line_bits.div_ceil(8);
-        if min_line_bytes > MAX_PWG_LINE_BYTES || (header.bytes_per_line as usize) > MAX_PWG_LINE_BYTES {
+        if min_line_bytes > MAX_PWG_LINE_BYTES || (header.bytes_per_line as usize) > MAX_PWG_LINE_BYTES
+        {
             return Err(RasterError::StreamParse(format!(
                 "PWG scanline byte length exceeds maximum allowed {MAX_PWG_LINE_BYTES} bytes"
             )));
         }
 
-        let page_rgb = if !compressed {
+        let page_rgb = if !self.compressed {
             let row_stride = (header.bytes_per_line as usize).max(min_line_bytes);
-            let page_bytes = row_stride.checked_mul(height as usize).ok_or_else(|| {
-                RasterError::StreamParse("CUPS raster page size overflow".to_string())
-            })?;
-            if stream.len() < page_bytes {
-                return Err(RasterError::StreamParse(format!(
-                    "Truncated uncompressed CUPS raster page: need {page_bytes} bytes, have {}",
-                    stream.len()
-                )));
+            if row_stride.checked_mul(height as usize).is_none() {
+                return Err(RasterError::StreamParse(
+                    "CUPS raster page size overflow".to_string(),
+                ));
             }
-            let mut buf = Vec::with_capacity(rgb_total_bytes);
+            let mut buf = Vec::with_capacity(rgb_total_bytes.min(MAX_PWG_EAGER_PREALLOC_BYTES));
+            let mut row_buf = vec![0u8; row_stride];
             for _ in 0..height {
-                convert_scanline_to_rgb(
-                    &stream[..row_stride],
-                    width,
-                    &header,
-                    little_endian,
-                    &mut buf,
+                read_exact_stream(
+                    &mut self.reader,
+                    &mut row_buf,
+                    "Truncated uncompressed CUPS raster page",
                 )?;
-                stream = &stream[row_stride..];
+                convert_scanline_to_rgb(&row_buf, width, &header, self.little_endian, &mut buf)?;
             }
             buf
         } else {
@@ -432,46 +516,50 @@ fn parse_pwg_raster_with_limits(
                     "PWG compressed scanline {expected_line_bytes} exceeds maximum allowed {MAX_PWG_LINE_BYTES}"
                 )));
             }
+
             let mut lines_decoded = 0u32;
+            let mut line_bytes = Vec::with_capacity(expected_line_bytes);
+            let mut rgb_line = Vec::with_capacity(rgb_line_bytes);
+            let mut pixel_scratch = vec![0u8; pack_unit];
 
-            while lines_decoded < height && !stream.is_empty() {
-                let repeat_count = stream[0] as u32;
-                stream = &stream[1..];
+            while lines_decoded < height {
+                let Some(repeat_byte) = read_u8_stream(&mut self.reader)? else {
+                    return Err(RasterError::StreamParse(format!(
+                        "Unexpected EOF before completing PackBits page ({lines_decoded}/{height} lines)"
+                    )));
+                };
+                let repeat_count = repeat_byte as u32;
 
-                let mut line_bytes = Vec::with_capacity(expected_line_bytes);
+                line_bytes.clear();
                 while line_bytes.len() < expected_line_bytes {
-                    if stream.is_empty() {
+                    let Some(control) = read_u8_stream(&mut self.reader)? else {
                         return Err(RasterError::StreamParse(
                             "Unexpected EOF during PackBits scanline decoding".to_string(),
                         ));
-                    }
-                    let control = stream[0];
-                    stream = &stream[1..];
+                    };
 
                     if control <= 127 {
                         let count = (control as usize) + 1;
-                        if stream.len() < pack_unit {
-                            return Err(RasterError::StreamParse(
-                                "PackBits buffer overrun on identical run".to_string(),
-                            ));
-                        }
-                        let pixel = &stream[..pack_unit];
-                        stream = &stream[pack_unit..];
+                        read_exact_stream(
+                            &mut self.reader,
+                            &mut pixel_scratch,
+                            "PackBits buffer overrun on identical run",
+                        )?;
                         for _ in 0..count {
-                            line_bytes.extend_from_slice(pixel);
+                            line_bytes.extend_from_slice(&pixel_scratch);
                         }
                     } else if control >= 129 {
                         let count = 257 - (control as usize);
                         let needed = count.checked_mul(pack_unit).ok_or_else(|| {
                             RasterError::StreamParse("PackBits literal run size overflow".to_string())
                         })?;
-                        if stream.len() < needed {
-                            return Err(RasterError::StreamParse(
-                                "PackBits buffer overrun on literal run".to_string(),
-                            ));
-                        }
-                        line_bytes.extend_from_slice(&stream[..needed]);
-                        stream = &stream[needed..];
+                        let start = line_bytes.len();
+                        line_bytes.resize(start + needed, 0);
+                        read_exact_stream(
+                            &mut self.reader,
+                            &mut line_bytes[start..start + needed],
+                            "PackBits buffer overrun on literal run",
+                        )?;
                     }
                 }
 
@@ -483,14 +571,8 @@ fn parse_pwg_raster_with_limits(
                     )));
                 }
 
-                let mut rgb_line = Vec::with_capacity(rgb_line_bytes);
-                convert_scanline_to_rgb(
-                    &line_bytes,
-                    width,
-                    &header,
-                    little_endian,
-                    &mut rgb_line,
-                )?;
+                rgb_line.clear();
+                convert_scanline_to_rgb(&line_bytes, width, &header, self.little_endian, &mut rgb_line)?;
 
                 let repetitions = (repeat_count + 1).min(height - lines_decoded);
                 let needed_total = buf
@@ -512,7 +594,29 @@ fn parse_pwg_raster_with_limits(
             buf
         };
 
-        pages.push(RasterPageInput::new(width, height, dpi, page_rgb)?);
+        self.pages_emitted += 1;
+        Ok(Some(RasterPageInput::new(width, height, dpi, page_rgb)?))
+    }
+}
+
+/// Parses a PWG / CUPS Raster v2 (`RaS2`/`2SaR`) or v3 (`RaS3`/`3SaR`) stream into pages.
+pub fn parse_pwg_raster(stream: &[u8]) -> Result<Vec<RasterPageInput>, RasterError> {
+    parse_pwg_raster_with_limits(stream, MAX_PWG_TOTAL_RGB_BYTES, MAX_PWG_PAGES)
+}
+
+fn parse_pwg_raster_with_limits(
+    stream: &[u8],
+    max_total_rgb_bytes: usize,
+    max_pages: usize,
+) -> Result<Vec<RasterPageInput>, RasterError> {
+    let mut reader = PwgRasterReader::with_max_pages(Cursor::new(stream), max_pages)?;
+    let mut pages = Vec::new();
+    let mut cumulative_rgb_bytes = 0usize;
+
+    while let Some(page) =
+        reader.next_page_with_budget(Some(max_total_rgb_bytes), &mut cumulative_rgb_bytes)?
+    {
+        pages.push(page);
     }
 
     if pages.is_empty() {
@@ -534,6 +638,152 @@ pub fn parse_image_from_memory(
     let (width, height) = rgb.dimensions();
     let dpi = default_dpi.unwrap_or(300);
     RasterPageInput::new(width, height, dpi, rgb.into_raw())
+}
+
+/// Streaming multi-format document source (`RaS2`/`2SaR`/`RaS3`/`3SaR` CUPS/PWG Raster,
+/// `%PDF-`, or standard images) yielding decoded RGB pages strictly one at a time.
+pub struct DocumentPageSource<'a> {
+    inner: DocumentPageSourceInner<'a>,
+}
+
+enum DocumentPageSourceInner<'a> {
+    Pwg(PwgRasterReader<Box<dyn BufRead + 'a>>),
+    Pdf {
+        _guard: TempDirGuard,
+        png_paths: Vec<PathBuf>,
+        next_idx: usize,
+        dpi: u32,
+    },
+    Single(Option<RasterPageInput>),
+}
+
+impl DocumentPageSource<'static> {
+    /// Wraps a single in-memory [`RasterPageInput`] page as a [`DocumentPageSource`].
+    pub fn from_page(page: RasterPageInput) -> Self {
+        Self {
+            inner: DocumentPageSourceInner::Single(Some(page)),
+        }
+    }
+}
+
+impl<'a> DocumentPageSource<'a> {
+    /// Opens a buffered document reader without eagerly decoding or buffering
+    /// all multi-page RGB rasters in memory.
+    pub fn from_reader<R: BufRead + 'a>(
+        mut reader: R,
+        default_dpi: Option<u32>,
+    ) -> Result<Self, RasterError> {
+        let prefix = read_prefix(&mut reader, 64)?;
+        if prefix.is_empty() {
+            return Err(RasterError::StreamParse(
+                "Empty print input stream".to_string(),
+            ));
+        }
+
+        let dpi = default_dpi.unwrap_or(600).max(75);
+        if detect_cups_raster_magic(&prefix).is_some() {
+            let chained: Box<dyn BufRead + 'a> =
+                Box::new(BufReader::new(Cursor::new(prefix).chain(reader)));
+            return Ok(Self {
+                inner: DocumentPageSourceInner::Pwg(PwgRasterReader::new(chained)?),
+            });
+        }
+
+        if prefix.starts_with(b"%PDF") || prefix.windows(5).any(|w| w == b"%PDF-") {
+            let work_guard = TempDirGuard::create_private("pixma_pdf")?;
+            let pdf_path = work_guard.path().join("input.pdf");
+            {
+                let mut pdf_file = std::fs::File::create(&pdf_path)?;
+                pdf_file.write_all(&prefix)?;
+                std::io::copy(&mut reader, &mut pdf_file)?;
+                pdf_file.flush()?;
+            }
+            let png_paths = rasterize_pdf_file_to_png_paths(work_guard.path(), &pdf_path, dpi)?;
+            if png_paths.is_empty() {
+                return Err(RasterError::StreamParse(
+                    "PDF rasterization produced 0 pages".to_string(),
+                ));
+            }
+            if png_paths.len() > MAX_PWG_PAGES {
+                return Err(RasterError::StreamParse(format!(
+                    "PDF rasterization exceeded maximum page limit of {MAX_PWG_PAGES}"
+                )));
+            }
+            return Ok(Self {
+                inner: DocumentPageSourceInner::Pdf {
+                    _guard: work_guard,
+                    png_paths,
+                    next_idx: 0,
+                    dpi,
+                },
+            });
+        }
+
+        let mut img_bytes = prefix;
+        reader.read_to_end(&mut img_bytes)?;
+        let page = parse_image_from_memory(&img_bytes, Some(dpi))?;
+        Ok(Self {
+            inner: DocumentPageSourceInner::Single(Some(page)),
+        })
+    }
+
+    /// Returns the next page from the document stream, or `Ok(None)` at EOF.
+    pub fn next_page(&mut self) -> Result<Option<RasterPageInput>, RasterError> {
+        match &mut self.inner {
+            DocumentPageSourceInner::Pwg(reader) => reader.next_page(),
+            DocumentPageSourceInner::Pdf {
+                png_paths,
+                next_idx,
+                dpi,
+                ..
+            } => {
+                let Some(path) = png_paths.get(*next_idx) else {
+                    return Ok(None);
+                };
+                let bytes = std::fs::read(path).map_err(|e| {
+                    RasterError::StreamParse(format!("Failed to read rasterized PDF page: {e}"))
+                })?;
+                let _ = std::fs::remove_file(path);
+                let page = parse_image_from_memory(&bytes, Some(*dpi))?;
+                *next_idx += 1;
+                Ok(Some(page))
+            }
+            DocumentPageSourceInner::Single(opt) => Ok(opt.take()),
+        }
+    }
+
+    /// Collects all remaining pages into memory while enforcing a bounded cumulative RGB budget
+    /// (used only for multi-page impositions like N-Up, Booklet, Reverse Order, and Collated copies).
+    pub fn collect_remaining_bounded(
+        &mut self,
+        max_total_rgb_bytes: usize,
+        max_pages: usize,
+    ) -> Result<Vec<RasterPageInput>, RasterError> {
+        let mut pages = Vec::new();
+        let mut cumulative_rgb_bytes = 0usize;
+        while let Some(page) = self.next_page()? {
+            if pages.len() >= max_pages {
+                return Err(RasterError::StreamParse(format!(
+                    "Document exceeded maximum page limit of {max_pages}"
+                )));
+            }
+            let page_bytes = page.rgb_pixels.len();
+            cumulative_rgb_bytes = cumulative_rgb_bytes
+                .checked_add(page_bytes)
+                .ok_or_else(|| {
+                    RasterError::StreamParse(
+                        "Cumulative multi-page RGB byte count overflow".to_string(),
+                    )
+                })?;
+            if cumulative_rgb_bytes > max_total_rgb_bytes {
+                return Err(RasterError::StreamParse(format!(
+                    "Cumulative multi-page RGB size {cumulative_rgb_bytes} exceeds maximum allowed {max_total_rgb_bytes} bytes"
+                )));
+            }
+            pages.push(page);
+        }
+        Ok(pages)
+    }
 }
 
 /// Decodes a document buffer (`RaS2`/`2SaR`/`RaS3`/`3SaR` PWG/CUPS Raster, multi-page `%PDF` document, or
@@ -605,23 +855,24 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// Rasterizes a multi-page PDF buffer into [`RasterPageInput`] pages at `dpi` using
-/// system `pdftoppm` (or `gs` fallback).
-fn rasterize_pdf_from_memory(
-    pdf_bytes: &[u8],
+fn list_sorted_png_paths(work_dir: &std::path::Path) -> Result<Vec<PathBuf>, RasterError> {
+    let mut png_paths: Vec<PathBuf> = std::fs::read_dir(work_dir)
+        .map_err(|e| RasterError::StreamParse(format!("Failed to read temp PDF dir: {e}")))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
+        .collect();
+    png_paths.sort();
+    Ok(png_paths)
+}
+
+fn rasterize_pdf_file_to_png_paths(
+    work_dir: &std::path::Path,
+    pdf_path: &std::path::Path,
     dpi: u32,
-) -> Result<Vec<RasterPageInput>, RasterError> {
-    use std::process::Command;
+) -> Result<Vec<PathBuf>, RasterError> {
+    use std::process::{Command, Stdio};
 
-    let work_guard = TempDirGuard::create_private("pixma_pdf")?;
-    let work_dir = work_guard.path();
-
-    let pdf_path = work_dir.join("input.pdf");
     let out_prefix = work_dir.join("page");
-    std::fs::write(&pdf_path, pdf_bytes).map_err(|e| {
-        RasterError::StreamParse(format!("Failed to write temp PDF file: {e}"))
-    })?;
-
     let dpi_str = dpi.to_string();
     let max_last_page = (MAX_PWG_PAGES + 1).to_string();
     let pdftoppm_ok = Command::new("pdftoppm")
@@ -636,16 +887,25 @@ fn rasterize_pdf_from_memory(
             pdf_path.to_str().unwrap_or_default(),
             out_prefix.to_str().unwrap_or_default(),
         ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
     if !pdftoppm_ok {
+        // Remove any partial PNGs left behind by a failed pdftoppm attempt before invoking gs.
+        if let Ok(stale) = list_sorted_png_paths(work_dir) {
+            for p in stale {
+                let _ = std::fs::remove_file(p);
+            }
+        }
         let gs_out = format!("{}-%04d.png", out_prefix.display());
         let gs_dpi = format!("-r{dpi}");
         let gs_last_page = format!("-dLastPage={}", MAX_PWG_PAGES + 1);
         let gs_ok = Command::new("gs")
             .args([
+                "-q",
                 "-dSAFER",
                 "-dBATCH",
                 "-dNOPAUSE",
@@ -656,6 +916,8 @@ fn rasterize_pdf_from_memory(
                 &format!("-sOutputFile={gs_out}"),
                 pdf_path.to_str().unwrap_or_default(),
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -667,13 +929,24 @@ fn rasterize_pdf_from_memory(
         }
     }
 
-    let mut png_paths: Vec<std::path::PathBuf> = std::fs::read_dir(work_dir)
-        .map_err(|e| RasterError::StreamParse(format!("Failed to read temp PDF dir: {e}")))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
-        .collect();
-    png_paths.sort();
+    list_sorted_png_paths(work_dir)
+}
 
+/// Rasterizes a multi-page PDF buffer into [`RasterPageInput`] pages at `dpi` using
+/// system `pdftoppm` (or `gs` fallback).
+fn rasterize_pdf_from_memory(
+    pdf_bytes: &[u8],
+    dpi: u32,
+) -> Result<Vec<RasterPageInput>, RasterError> {
+    let work_guard = TempDirGuard::create_private("pixma_pdf")?;
+    let work_dir = work_guard.path();
+
+    let pdf_path = work_dir.join("input.pdf");
+    std::fs::write(&pdf_path, pdf_bytes).map_err(|e| {
+        RasterError::StreamParse(format!("Failed to write temp PDF file: {e}"))
+    })?;
+
+    let png_paths = rasterize_pdf_file_to_png_paths(work_dir, &pdf_path, dpi)?;
     load_rasterized_pdf_pngs(&png_paths, dpi, MAX_PWG_TOTAL_RGB_BYTES, MAX_PWG_PAGES)
 }
 
@@ -1210,15 +1483,18 @@ mod tests {
         hdr[392..396].copy_from_slice(&3u32.to_be_bytes());
         hdr[400..404].copy_from_slice(&1u32.to_be_bytes());
 
-        // 1. 257 tiny 1x1 uncompressed pages must trigger MAX_PWG_PAGES through parse_pwg_raster
-        let mut many_pages = Vec::from(&b"RAS2"[..]);
+        // 1. 257 tiny 1x1 uncompressed (RaS3) pages must trigger MAX_PWG_PAGES through parse_pwg_raster
+        let mut many_pages = Vec::from(&b"RaS3"[..]);
         for _ in 0..=MAX_PWG_PAGES {
             many_pages.extend_from_slice(&hdr);
             many_pages.extend_from_slice(&[10, 20, 30]);
         }
         let page_err = parse_pwg_raster(&many_pages)
             .expect_err("Stream exceeding MAX_PWG_PAGES must be rejected");
-        assert!(matches!(page_err, RasterError::StreamParse(_)));
+        assert!(
+            matches!(page_err, RasterError::StreamParse(ref msg) if msg.contains("maximum page limit")),
+            "unexpected err: {page_err:?}"
+        );
 
         // 2. Cumulative RGB byte budget across pages must be checked before allocating later pages
         let mut hdr_20x20 = hdr;
@@ -1226,7 +1502,7 @@ mod tests {
         hdr_20x20[376..380].copy_from_slice(&20u32.to_be_bytes());
         hdr_20x20[392..396].copy_from_slice(&60u32.to_be_bytes());
 
-        let mut two_pages = Vec::from(&b"RAS2"[..]);
+        let mut two_pages = Vec::from(&b"RaS3"[..]);
         for fill in [1u8, 2u8] {
             two_pages.extend_from_slice(&hdr_20x20);
             two_pages.extend(std::iter::repeat_n(fill, 20 * 20 * 3));
@@ -1234,7 +1510,10 @@ mod tests {
         // Single page is 1200 bytes; two pages total 2400 bytes -> reject under 2000-byte total cap
         let budget_err = parse_pwg_raster_with_limits(&two_pages, 2000, MAX_PWG_PAGES)
             .expect_err("Cumulative multi-page RGB budget must be rejected");
-        assert!(matches!(budget_err, RasterError::StreamParse(_)));
+        assert!(
+            matches!(budget_err, RasterError::StreamParse(ref msg) if msg.contains("Cumulative PWG RGB size")),
+            "unexpected err: {budget_err:?}"
+        );
     }
 
     #[test]
@@ -1281,5 +1560,78 @@ mod tests {
         let rgb_err = load_rasterized_pdf_pngs(&[p1, p2], 300, 2000, MAX_PWG_PAGES)
             .expect_err("Exceeding cumulative PDF RGB byte budget must fail");
         assert!(matches!(rgb_err, RasterError::StreamParse(_)));
+    }
+
+    #[test]
+    fn test_document_page_source_streams_partial_reads_and_truncated_packbits() {
+        struct TinyChunkReader<'a> {
+            inner: &'a [u8],
+            pos: usize,
+            max_chunk: usize,
+        }
+        impl<'a> Read for TinyChunkReader<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.inner.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.max_chunk).min(self.inner.len() - self.pos);
+                buf[..n].copy_from_slice(&self.inner[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        // Build a 3-page PackBits stream where page 2 re-emits RaS2 magic
+        let mut hdr = [0u8; PWG_HEADER_SIZE];
+        hdr[276..280].copy_from_slice(&600u32.to_be_bytes());
+        hdr[280..284].copy_from_slice(&600u32.to_be_bytes());
+        hdr[372..376].copy_from_slice(&2u32.to_be_bytes());
+        hdr[376..380].copy_from_slice(&2u32.to_be_bytes());
+        hdr[384..388].copy_from_slice(&8u32.to_be_bytes());
+        hdr[388..392].copy_from_slice(&24u32.to_be_bytes());
+        hdr[392..396].copy_from_slice(&6u32.to_be_bytes());
+        hdr[400..404].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut stream = Vec::from(&b"RaS2"[..]);
+        for (i, val) in [10u8, 120u8, 240u8].into_iter().enumerate() {
+            if i == 1 {
+                stream.extend_from_slice(b"RaS2");
+            }
+            stream.extend_from_slice(&hdr);
+            // repeat=1 (2 rows), control=1 (repeat pixel 2x = 2px)
+            stream.push(1);
+            stream.push(1);
+            stream.extend_from_slice(&[val, val + 1, val + 2]);
+        }
+
+        // Simulate slow pipe yielding 3 bytes per read call
+        let slow_reader = BufReader::new(TinyChunkReader {
+            inner: &stream,
+            pos: 0,
+            max_chunk: 3,
+        });
+        let mut source = DocumentPageSource::from_reader(slow_reader, Some(600)).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(page) = source.next_page().unwrap() {
+            decoded.push(page);
+        }
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].get_pixel(1, 1), Some([10, 11, 12]));
+        assert_eq!(decoded[1].get_pixel(0, 0), Some([120, 121, 122]));
+        assert_eq!(decoded[2].get_pixel(1, 0), Some([240, 241, 242]));
+
+        // Truncated PackBits page (missing 2nd row) must return StreamParse, not partial page
+        let mut trunc = Vec::from(&b"RaS2"[..]);
+        trunc.extend_from_slice(&hdr);
+        trunc.push(0); // only 1 row instead of height=2
+        trunc.push(1);
+        trunc.extend_from_slice(&[5, 6, 7]);
+        let mut trunc_src =
+            DocumentPageSource::from_reader(BufReader::new(Cursor::new(&trunc)), Some(600))
+                .unwrap();
+        let err = trunc_src
+            .next_page()
+            .expect_err("Truncated PackBits page must return StreamParse");
+        assert!(matches!(err, RasterError::StreamParse(_)));
     }
 }

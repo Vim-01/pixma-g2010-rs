@@ -22,7 +22,7 @@ pub mod pipeline;
 
 pub use cups_reader::{
     generate_test_print_page, parse_document_from_memory, parse_image_from_memory,
-    parse_pwg_raster, RasterPageInput,
+    parse_pwg_raster, DocumentPageSource, PwgRasterReader, RasterPageInput,
 };
 pub use errors::RasterError;
 pub use halftone::{

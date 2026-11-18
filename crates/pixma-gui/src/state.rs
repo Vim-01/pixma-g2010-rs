@@ -3,8 +3,9 @@
 use image::RgbImage;
 use pixma_core::errors::{SafetyInterlockError, SupportCodeInfo};
 use pixma_core::maintenance::{
-    CleaningTarget, CleaningType, MaintenanceAction, MaintenanceRecord, MaintenanceSupervisor,
-    RollerCleanTarget, TestPrintType, INK_FLUSH_CONFIRMATION_TOKEN, MAX_SAFE_D_COUNTER_PERCENT,
+    CleaningTarget, CleaningType, MaintenanceAction, MaintenanceCapabilities, MaintenanceRecord,
+    MaintenanceSupervisor, RollerCleanTarget, TestPrintType, INK_FLUSH_CONFIRMATION_TOKEN,
+    MAX_SAFE_D_COUNTER_PERCENT,
 };
 use pixma_core::models::{DeviceStatus, OperationalState};
 use pixma_core::print_params::{
@@ -229,6 +230,9 @@ pub struct StudioViewModel {
     /// Optional explicit output directory for saved scans (overrides `$XDG_PICTURES_DIR` / `~/Pictures/Scans`).
     #[serde(default)]
     pub scan_output_dir: Option<std::path::PathBuf>,
+    /// Firmware maintenance capabilities (`GetCapability(maintenance)`) when available.
+    #[serde(default)]
+    pub maintenance_capabilities: Option<MaintenanceCapabilities>,
 }
 
 impl Default for StudioViewModel {
@@ -255,6 +259,7 @@ impl Default for StudioViewModel {
             last_scan_path: None,
             last_scan_thumb: None,
             scan_output_dir: None,
+            maintenance_capabilities: None,
         }
     }
 }
@@ -296,6 +301,7 @@ pub enum StudioEvent {
     // Maintenance & safety
     SetInkFlushConfirmation(bool),
     ResetInkFlushConfirmation,
+    SetMaintenanceCapabilities(Option<MaintenanceCapabilities>),
 
     // Status & telemetry
     UpdateDeviceStatus(DeviceStatus),
@@ -420,6 +426,9 @@ impl StudioViewModel {
             StudioEvent::ResetInkFlushConfirmation => {
                 self.ink_flush_confirmed = false;
             }
+            StudioEvent::SetMaintenanceCapabilities(caps) => {
+                self.maintenance_capabilities = caps;
+            }
 
             // Status updates
             StudioEvent::UpdateDeviceStatus(status) => {
@@ -442,6 +451,7 @@ impl StudioViewModel {
                 self.telemetry.snapshot = None;
                 self.telemetry.last_error = Some(err.clone());
                 self.last_error = Some(err.clone());
+                self.maintenance_capabilities = None;
                 self.status_banner = format!("Нет подключения: {err}");
             }
             StudioEvent::UpdateMaintenanceRecord(record) => {
@@ -576,6 +586,20 @@ impl StudioViewModel {
             }
         }
 
+        if let Some(ref caps) = self.maintenance_capabilities {
+            let kind_tok = kind.ivec_xml_value();
+            let target_tok = target.ivec_xml_value();
+            if caps.supports(kind_tok, target_tok) == Some(false) {
+                let allowed = caps.format_summary().unwrap_or_else(|| "unknown".into());
+                let err = format!(
+                    "Firmware rejected {kind:?} for {target:?} (token '{target_tok}'): printer capability allows {allowed}."
+                );
+                self.ink_flush_confirmed = false;
+                self.last_error = Some(err.clone());
+                return Err(err);
+            }
+        }
+
         self.is_busy = true;
         let token = if kind == CleaningType::InkFlush {
             Some(INK_FLUSH_CONFIRMATION_TOKEN)
@@ -599,6 +623,7 @@ impl StudioViewModel {
                 Ok(status)
             }
             Err(e) => {
+                self.ink_flush_confirmed = false;
                 self.last_error = Some(e.clone());
                 Err(e)
             }

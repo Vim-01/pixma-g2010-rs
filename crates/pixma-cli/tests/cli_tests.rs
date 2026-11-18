@@ -505,3 +505,16 @@ async fn test_connect_client_live_fails_closed_when_socket_missing() {
         "connect_client without --mock must fail closed when socket is unavailable"
     );
 }
+
+#[tokio::test]
+async fn test_cli_parse_and_execute_capabilities_on_mock() {
+    let args = vec!["pixma-cli", "--mock", "--json", "capabilities"];
+    let cli = Cli::try_parse_from(args).expect("Failed to parse capabilities");
+    assert_eq!(cli.command, Commands::Capabilities);
+    assert!(cli.json);
+
+    let mut client = connect_client(None, true).await.unwrap();
+    let caps = client.get_maintenance_capabilities().await.unwrap();
+    assert_eq!(caps.supports("regular", "group2"), Some(true));
+    assert_eq!(caps.supports("choke", "all"), Some(true));
+}

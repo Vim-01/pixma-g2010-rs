@@ -275,3 +275,41 @@ async fn test_gui_self_test_runner() {
     let res = run_self_test().await;
     assert!(res.is_ok(), "run_self_test failed: {:?}", res.err());
 }
+
+#[tokio::test]
+async fn test_maintenance_capability_precheck_and_flush_confirm_reset_on_error() {
+    let mut vm = StudioViewModel::default();
+    let mock = MockG2010Transport::new();
+    let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+    let ctrl = G2010Controller::new(AnyTransport::Mock(Box::new(mock)), supervisor);
+    let mut client = DaemonClient::direct(ctrl);
+
+    let caps = client.get_maintenance_capabilities().await.unwrap();
+    vm.handle_event(StudioEvent::SetMaintenanceCapabilities(Some(caps)));
+
+    // Deep + ColorOnly is explicitly absent in mock capabilities -> immediate precheck error
+    let err = vm
+        .dispatch_cleaning(
+            &mut client,
+            CleaningType::Deep,
+            CleaningTarget::ColorOnly,
+            false,
+        )
+        .await
+        .expect_err("Unsupported Deep + ColorOnly must precheck-fail with capability hint");
+    assert!(err.contains("printer capability allows"), "unexpected err: {err}");
+
+    // Failed InkFlush precheck must reset ink_flush_confirmed
+    vm.handle_event(StudioEvent::SetInkFlushConfirmation(true));
+    let flush_err = vm
+        .dispatch_cleaning(
+            &mut client,
+            CleaningType::InkFlush,
+            CleaningTarget::ColorOnly,
+            false,
+        )
+        .await
+        .expect_err("Unsupported InkFlush + ColorOnly must fail");
+    assert!(flush_err.contains("printer capability allows"));
+    assert!(!vm.ink_flush_confirmed);
+}

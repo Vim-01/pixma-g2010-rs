@@ -4,7 +4,7 @@
 //! payloads (supporting JSON and CBOR), and arbitration tokens preventing concurrent
 //! USB interface collisions.
 
-use pixma_core::maintenance::MaintenanceAction;
+use pixma_core::maintenance::{MaintenanceAction, MaintenanceCapabilities};
 use pixma_core::models::{DeviceStatus, OperationalState, UsbHardwareMarker};
 use pixma_core::scan_params::ScanParameters;
 use serde::de::DeserializeOwned;
@@ -335,6 +335,8 @@ pub enum DaemonRequest {
     GetStatus,
     /// Queries full non-blocking hardware + USB marker + arbitrator state snapshot.
     GetLiveSnapshot,
+    /// Queries supported firmware maintenance cleaning capabilities (`GetCapability(maintenance)`).
+    GetMaintenanceCapabilities,
     /// Triggers an authorized maintenance action.
     ExecuteMaintenance {
         action: MaintenanceAction,
@@ -359,6 +361,8 @@ pub enum DaemonResponse {
     Status(DeviceStatus),
     /// Non-blocking full hardware/daemon telemetry snapshot.
     LiveSnapshot(Box<LiveDaemonSnapshot>),
+    /// Firmware maintenance capabilities (`GetCapability(maintenance)`).
+    MaintenanceCapabilities(Result<MaintenanceCapabilities, String>),
     /// Result of an executed maintenance action.
     MaintenanceResult(Result<DeviceStatus, String>),
     /// Result of a raw print stream operation.

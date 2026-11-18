@@ -336,5 +336,38 @@ mod tests {
         client.ping().await.unwrap();
         let snap = client.get_live_snapshot().await.unwrap();
         assert!(snap.hardware_marker.is_mock);
+        let caps = client.get_maintenance_capabilities().await.unwrap();
+        assert_eq!(caps.supports("regular", "group2"), Some(true));
+        assert_eq!(caps.supports("deep", "group2"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_get_maintenance_capabilities_maps_eof_from_legacy_daemon() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "pixmad_legacy_eof_test_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let server_task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Immediately drop connection as a v0.3.0 pixmad does upon unknown CBOR variant
+                drop(stream);
+            }
+        });
+
+        let mut client = DaemonClient::connect_live(Some(&sock_path), None)
+            .await
+            .expect("Must connect to test socket");
+        let err = client
+            .get_maintenance_capabilities()
+            .await
+            .expect_err("Legacy daemon closing socket must map cleanly");
+        assert!(
+            err.to_string().contains("older than v0.3.1"),
+            "unexpected err: {err}"
+        );
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

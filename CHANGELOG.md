@@ -1,5 +1,29 @@
 # Changelog
 
+## [v0.3.1] - 2026-11-19
+
+### Streaming Multi-Page Printing, Maintenance Capability Diagnostics, Ink Flush Targets & Blue-Noise Solid Fix
+
+#### Fixed
+- **USB IVEC Drain & Timeout Handling (`pixma-transport`)**:
+  - Updated `query_ivec_with_drained` to treat `NusbTransport::read_printer` timeouts (`Printer bulk read timed out`) as USB silence capped at 3 empty reads while raising non-matching packet drain capacity to 32 (preventing background GUI status polling from starving `GetCapability(maintenance)`).
+  - Enlarged `query_status_with_drained` and `write_and_drain_optional_reply` buffers to `16384` bytes, drained up to 8 queued replies per step, and validated `NG`/`ERROR` on both drained and matched maintenance responses.
+- **IVEC Capability Parsing (`pixma-protocol`)**:
+  - Switched `parse_maintenance_cleaning_groups` to a tag-stack parser handling nested tags, sibling `<ivec:type>`/`<ivec:inkgroup>` elements, self-closing `<ivec:inkgroup value="..."/>`, and `GetCapabilityResponse` fallback checks.
+- **100% Solid Blue-Noise Quantization (`pixma-raster`)**:
+  - Fixed matrix maximum (`255`) pixel/level drop-outs in `PrintRasterPipeline::compile_ivec_bjraster3_job` (1-bpp and 2-bpp 3-level channels) and `BlueNoiseDitherer::dither_plane_1bit`.
+- **Streaming Multi-Page CUPS/PDF Raster Pipeline (`pixma-protocol`, `pixma-raster`, `pixma-cups`, `pixma-cli`, `pixma-printer-app`)**:
+  - Added streaming decoders (`PwgRasterReader`, `DocumentPageSource`) and `PrintRasterPipeline::compile_ivec_bjraster3_from_source` so multi-page CUPS/PWG Raster (`RaS2`/`RaS3`/`2SaR`/`3SaR`) and PDF print jobs process strictly one decoded RGB page at a time (`O(1)` memory) instead of failing at the 512 MiB cumulative RGB cap (`6+` A4 pages at 600 DPI).
+  - Removed the `vec!`-wide 512 MiB stdin/stdout buffering in `rastertopixma-g2010`, eliminated eager multi-hundred-MB preallocation on `RaS3`/`3SaR` headers over pipes, cleaned partial `pdftoppm` PNGs and isolated child `pdftoppm`/`gs` stdio (`Stdio::null()`, `-q`) before `gs` fallback, and added `BjRaster3Encoder::encode_bjr520_page_prologue` to prevent `ESC [ K` re-emission on jobs exceeding 255 output pages.
+- **Pango Markup Safety & Interlock Reset (`pixma-gui`)**:
+  - Escaped dynamic `adw::ActionRow` titles and subtitles with `gtk::glib::markup_escape_text` so XML tags or `&` in printer diagnostics never blank out text; reset `ink_flush_confirmed` on both `Ok` and `Err` outcomes.
+
+#### Added
+- **Read-Only Firmware Capability Query (`pixma-core`, `pixma-daemon`, `pixma-cli`, `pixma-gui`)**:
+  - Added `MaintenanceCapabilities`, `DaemonRequest::GetMaintenanceCapabilities`, `pixma-cli capabilities`, and one-shot GUI capability discovery (with graceful fallback when connected to older `pixmad`).
+- **System Ink Flush (`choke`) Target Controls (`pixma-gui`)**:
+  - Exposed explicit `All`, `Black`, and `Color` buttons under the `ink_flush_confirmed` safety interlock alongside live firmware capability hints.
+
 ## [v0.3.0] - 2026-11-15
 
 ### Workspace Hardening, Binary IPC Framing & Release Hygiene Audit

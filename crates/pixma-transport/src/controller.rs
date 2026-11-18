@@ -7,7 +7,9 @@ use crate::mock_device::MockG2010Transport;
 use crate::nusb_transport::NusbTransport;
 use crate::traits::UsbTransport;
 use pixma_core::errors::{DriverError, SafetyInterlockError, SupportCodeInfo};
-use pixma_core::maintenance::{MaintenanceAction, MaintenanceSupervisor};
+use pixma_core::maintenance::{
+    MaintenanceAction, MaintenanceCapabilities, MaintenanceSupervisor,
+};
 use pixma_core::models::{DeviceStatus, OperationalState, PrinterModel, UsbHardwareMarker};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_core::safety::{PrintJobTypestate, ValidatedRasterLine};
@@ -214,8 +216,13 @@ impl<T: UsbTransport> G2010Controller<T> {
         Ok(report)
     }
 
+    fn is_printer_read_timeout(err: &DriverError) -> bool {
+        matches!(err, DriverError::Transport(msg) if msg.contains("timed out"))
+    }
+
     /// Sends an IVEC query command and drains unrelated asynchronous job responses
-    /// (`StartJobResponse`, `EndJobResponse`, etc.) ahead of the matching reply.
+    /// (`StartJobResponse`, `EndJobResponse`, stale `GetStatusResponse`, etc.) ahead of
+    /// the matching reply without spinning past USB silence.
     async fn query_ivec_with_drained(
         &mut self,
         cmd: &str,
@@ -223,29 +230,58 @@ impl<T: UsbTransport> G2010Controller<T> {
         label: &str,
         is_match: impl Fn(&ParsedStatusReport) -> bool,
     ) -> Result<(ParsedStatusReport, Vec<ParsedStatusReport>), DriverError> {
+        const MAX_NON_MATCHING_DRAIN: usize = 32;
+        const MAX_EMPTY_OR_TIMEOUT: usize = 3;
+
         self.transport.write_printer(cmd.as_bytes()).await?;
 
         let is_mock = self.transport.is_mock();
         let mut buf = vec![0u8; buf_size];
         let mut drained = Vec::new();
         let mut resent_after_drain = false;
+        let mut non_matching_packets = 0usize;
+        let mut empty_or_timeouts = 0usize;
 
-        for attempt in 0..8 {
-            let bytes_read = self.transport.read_printer(&mut buf).await?;
-            if bytes_read == 0 {
-                if is_mock || attempt == 7 {
-                    return Err(DriverError::Transport(format!(
-                        "Empty {label} reply from printer"
-                    )));
+        loop {
+            let bytes_read = match self.transport.read_printer(&mut buf).await {
+                Ok(0) => {
+                    if is_mock {
+                        return Err(DriverError::Transport(format!(
+                            "Empty {label} reply from printer"
+                        )));
+                    }
+                    empty_or_timeouts += 1;
+                    if empty_or_timeouts >= MAX_EMPTY_OR_TIMEOUT {
+                        return Err(DriverError::Transport(format!(
+                            "Timed out waiting for {label} response from printer"
+                        )));
+                    }
+                    if !drained.is_empty() && !resent_after_drain {
+                        self.transport.write_printer(cmd.as_bytes()).await?;
+                        resent_after_drain = true;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    }
+                    continue;
                 }
-                if !drained.is_empty() && !resent_after_drain {
-                    self.transport.write_printer(cmd.as_bytes()).await?;
-                    resent_after_drain = true;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                Ok(n) => n,
+                Err(err) if !is_mock && Self::is_printer_read_timeout(&err) => {
+                    // NusbTransport::read_printer already waited 250ms before returning timeout;
+                    // treat as USB silence without extra sleep so poll loops stay well under 4s.
+                    empty_or_timeouts += 1;
+                    if empty_or_timeouts >= MAX_EMPTY_OR_TIMEOUT {
+                        return Err(DriverError::Transport(format!(
+                            "Timed out waiting for {label} response from printer"
+                        )));
+                    }
+                    if !drained.is_empty() && !resent_after_drain {
+                        self.transport.write_printer(cmd.as_bytes()).await?;
+                        resent_after_drain = true;
+                    }
+                    continue;
                 }
-                continue;
-            }
+                Err(err) => return Err(err),
+            };
 
             let xml = String::from_utf8_lossy(&buf[..bytes_read]);
             tracing::debug!("Raw {label} XML ({bytes_read} bytes):\n{xml}");
@@ -260,9 +296,10 @@ impl<T: UsbTransport> G2010Controller<T> {
                     report.ivec_response_detail
                 );
                 drained.push(report);
-                if attempt == 7 {
+                non_matching_packets += 1;
+                if non_matching_packets >= MAX_NON_MATCHING_DRAIN {
                     return Err(DriverError::Protocol(format!(
-                        "Printer returned only non-matching IVEC packets to {label}"
+                        "Printer returned only non-matching IVEC packets ({non_matching_packets}) to {label}"
                     )));
                 }
                 continue;
@@ -270,20 +307,16 @@ impl<T: UsbTransport> G2010Controller<T> {
 
             return Ok((report, drained));
         }
-
-        Err(DriverError::Transport(format!(
-            "Timed out waiting for {label} response from printer"
-        )))
     }
 
     /// Queries `GetStatus`, draining any asynchronous job responses (`StartJobResponse`,
-    /// `EndJobResponse`, etc.) ahead of the `GetStatusResponse` in the EP1 IN buffer.
+    /// `EndJobResponse`, stale `GetCapabilityResponse`, etc.) ahead of `GetStatusResponse`.
     async fn query_status_with_drained(
         &mut self,
     ) -> Result<(ParsedStatusReport, Vec<ParsedStatusReport>), DriverError> {
         let cmd = build_get_status_cmd();
         let (mut report, drained) = self
-            .query_ivec_with_drained(&cmd, 4096, "GetStatus", |r| r.is_status_response())
+            .query_ivec_with_drained(&cmd, 16384, "GetStatus", |r| r.is_status_response())
             .await?;
 
         if report.status.serial_number == "UNKNOWN" && self.transport.serial_number() != "UNKNOWN" {
@@ -299,17 +332,22 @@ impl<T: UsbTransport> G2010Controller<T> {
         Ok((report, drained))
     }
 
-    /// Best-effort `GetCapability(servicetype="maintenance")` query used when hardware
-    /// stays Idle after a maintenance command, logging the live XML and returning
-    /// supported `<ivec:inkgroup>` combinations for diagnostics.
-    async fn query_maintenance_capability_summary(&mut self) -> Option<String> {
+    /// Queries live `GetCapability(servicetype="maintenance")` from firmware, validating any
+    /// drained/matched replies and returning both parsed cleaning groups and raw XML.
+    pub async fn query_maintenance_capabilities(
+        &mut self,
+    ) -> Result<MaintenanceCapabilities, DriverError> {
         let cmd = build_get_maintenance_capability_cmd();
-        let (report, _) = self
+        let (report, drained) = self
             .query_ivec_with_drained(&cmd, 16384, "GetCapability(maintenance)", |r| {
                 r.is_capability_response()
             })
-            .await
-            .ok()?;
+            .await?;
+
+        for reply in &drained {
+            Self::validate_ivec_reply_ok(reply)?;
+        }
+        Self::validate_ivec_reply_ok(&report)?;
 
         tracing::info!(
             "Live firmware GetCapability(maintenance) XML ({} bytes):\n{}",
@@ -317,16 +355,21 @@ impl<T: UsbTransport> G2010Controller<T> {
             report.raw_xml
         );
 
-        let groups = parse_maintenance_cleaning_groups(&report.raw_xml).ok()?;
-        if groups.is_empty() {
-            return None;
-        }
-        let summary = groups
-            .into_iter()
-            .map(|(kind, ink_groups)| format!("{kind}=[{}]", ink_groups.join(", ")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("firmware allows: {summary}"))
+        let cleaning_groups = parse_maintenance_cleaning_groups(&report.raw_xml)
+            .map_err(|e| DriverError::Protocol(format!("Failed to parse GetCapability XML: {e}")))?;
+
+        Ok(MaintenanceCapabilities {
+            cleaning_groups,
+            raw_xml: report.raw_xml,
+        })
+    }
+
+    /// Best-effort `GetCapability(servicetype="maintenance")` summary for diagnostics when
+    /// hardware remains Idle after a maintenance command.
+    async fn query_maintenance_capability_summary(&mut self) -> Option<String> {
+        let caps = self.query_maintenance_capabilities().await.ok()?;
+        caps.format_summary()
+            .map(|summary| format!("firmware allows: {summary}"))
     }
 
     fn validate_ivec_reply_ok(report: &ParsedStatusReport) -> Result<(), DriverError> {
@@ -351,14 +394,24 @@ impl<T: UsbTransport> G2010Controller<T> {
 
     async fn write_and_drain_optional_reply(&mut self, data: &[u8]) -> Result<(), DriverError> {
         self.transport.write_printer(data).await?;
-        let mut rx_buf = [0u8; 1024];
-        if let Ok(n) = self.transport.read_printer(&mut rx_buf).await {
-            if n > 0 {
-                let xml = String::from_utf8_lossy(&rx_buf[..n]);
-                tracing::debug!("Maintenance step IVEC reply ({n} bytes):\n{xml}");
-                if let Ok(report) = parse_status_response_with_meta(&xml) {
-                    Self::validate_ivec_reply_ok(&report)?;
+        let mut rx_buf = vec![0u8; 16384];
+        for _ in 0..8 {
+            match self.transport.read_printer(&mut rx_buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let xml = String::from_utf8_lossy(&rx_buf[..n]);
+                    tracing::debug!("Maintenance step IVEC reply ({n} bytes):\n{xml}");
+                    match parse_status_response_with_meta(&xml) {
+                        Ok(report) => Self::validate_ivec_reply_ok(&report)?,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Ignoring non-XML/partial maintenance reply chunk ({n} bytes): {e}"
+                            );
+                        }
+                    }
                 }
+                Err(e) if Self::is_printer_read_timeout(&e) => break,
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -461,6 +514,7 @@ impl<T: UsbTransport> G2010Controller<T> {
             for reply in &drained {
                 Self::validate_ivec_reply_ok(reply)?;
             }
+            Self::validate_ivec_reply_ok(&report)?;
             latest_status = report.status;
 
             if let Some(ref code) = latest_status.support_code {
@@ -1735,5 +1789,66 @@ mod tests {
             .await
             .expect_err("Truncated 1200 DPI scan must error cleanly without panic");
         assert!(err.to_string().contains("Incomplete MP2 scan image data"), "unexpected err: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_maintenance_capabilities_drains_over_8_backlog_and_surfaces_ng() {
+        let mut transport = ScriptedTransport::new(false, "SER123456");
+        // Queue 12 stale GetStatusResponse packets ahead of GetCapabilityResponse (previously failed at attempt 7)
+        for _ in 0..12 {
+            transport
+                .printer_rx
+                .push_back(status_xml("idle", "idle", "0000"));
+        }
+        let cap_resp = br#"<?xml version="1.0" encoding="utf-8" ?>
+<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
+  <ivec:contents>
+    <ivec:operation>GetCapabilityResponse</ivec:operation>
+    <ivec:response>OK</ivec:response>
+    <ivec:param_set servicetype="maintenance">
+      <ivec:Cleaning>
+        <ivec:type value="regular"><ivec:inkgroup>all,group1,group2</ivec:inkgroup></ivec:type>
+        <ivec:type value="deep"><ivec:inkgroup>all,group1</ivec:inkgroup></ivec:type>
+        <ivec:type value="choke"><ivec:inkgroup>all</ivec:inkgroup></ivec:type>
+      </ivec:Cleaning>
+    </ivec:param_set>
+  </ivec:contents>
+</cmd>"#
+            .to_vec();
+        transport.printer_rx.push_back(cap_resp);
+
+        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        let mut controller = G2010Controller::new(transport, supervisor);
+        let caps = controller
+            .query_maintenance_capabilities()
+            .await
+            .expect("Must drain 12 stale status packets and parse capability response");
+        assert_eq!(caps.supports("regular", "group2"), Some(true));
+        assert_eq!(caps.supports("deep", "group2"), Some(false));
+        assert_eq!(caps.supports("choke", "all"), Some(true));
+        assert_eq!(caps.supports("choke", "group2"), Some(false));
+
+        // Case 2: Drained NG reply in front of GetCapabilityResponse must fail rather than drop NG
+        let mut ng_transport = ScriptedTransport::new(false, "SER123456");
+        let ng_cleaning = br#"<?xml version="1.0" encoding="utf-8" ?>
+<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
+  <ivec:contents>
+    <ivec:operation>CleaningResponse</ivec:operation>
+    <ivec:response>NG</ivec:response>
+    <ivec:response_detail>InvalidGroup</ivec:response_detail>
+  </ivec:contents>
+</cmd>"#
+            .to_vec();
+        ng_transport.printer_rx.push_back(ng_cleaning);
+        ng_transport.printer_rx.push_back(
+            br#"<?xml version="1.0" encoding="utf-8" ?><cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/"><ivec:contents><ivec:operation>GetCapabilityResponse</ivec:operation><ivec:response>OK</ivec:response></ivec:contents></cmd>"#.to_vec(),
+        );
+        let supervisor = MaintenanceSupervisor::in_memory(MaintenanceRecord::default());
+        let mut ng_ctrl = G2010Controller::new(ng_transport, supervisor);
+        let err = ng_ctrl
+            .query_maintenance_capabilities()
+            .await
+            .expect_err("NG in drained packet must be surfaced");
+        assert!(err.to_string().contains("InvalidGroup"), "unexpected err: {err}");
     }
 }

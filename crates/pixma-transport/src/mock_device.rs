@@ -242,6 +242,29 @@ impl UsbTransport for MockG2010Transport {
                 self.recorded_ivec_ops.push("GetStatus".to_string());
                 let xml = self.generate_status_xml();
                 self.printer_rx_queue.extend(xml.as_bytes());
+            } else if text.contains("GetCapability") {
+                self.recorded_ivec_ops.push("GetCapability".to_string());
+                let cap_xml = r#"<?xml version="1.0" encoding="utf-8" ?>
+<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
+  <ivec:contents>
+    <ivec:operation>GetCapabilityResponse</ivec:operation>
+    <ivec:response>OK</ivec:response>
+    <ivec:param_set servicetype="maintenance">
+      <ivec:Cleaning>
+        <ivec:type value="regular">
+          <ivec:inkgroup>all,group1,group2</ivec:inkgroup>
+        </ivec:type>
+        <ivec:type value="deep">
+          <ivec:inkgroup>all,group1</ivec:inkgroup>
+        </ivec:type>
+        <ivec:type value="choke">
+          <ivec:inkgroup>all</ivec:inkgroup>
+        </ivec:type>
+      </ivec:Cleaning>
+    </ivec:param_set>
+  </ivec:contents>
+</cmd>"#;
+                self.printer_rx_queue.extend(cap_xml.as_bytes());
             } else if text.contains("Cleaning") {
                 self.recorded_ivec_ops.push("Cleaning".to_string());
                 self.recorded_maintenance_ops.push(text.to_string());

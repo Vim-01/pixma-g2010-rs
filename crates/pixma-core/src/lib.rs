@@ -11,9 +11,10 @@ pub mod scan_params;
 
 pub use errors::{DriverError, HardwareConstraintViolation, SafetyInterlockError, SupportCodeInfo};
 pub use maintenance::{
-    CleaningTarget, CleaningType, MaintenanceAction, MaintenanceRecord, MaintenanceSupervisor,
-    RollerCleanTarget, TestPrintType, DEEP_CLEANING_COOLDOWN, INK_FLUSH_CONFIRMATION_TOKEN,
-    INK_FLUSH_COOLDOWN, MAX_SAFE_D_COUNTER_PERCENT, STANDARD_CLEANING_COOLDOWN,
+    CleaningTarget, CleaningType, MaintenanceAction, MaintenanceCapabilities, MaintenanceRecord,
+    MaintenanceSupervisor, RollerCleanTarget, TestPrintType, DEEP_CLEANING_COOLDOWN,
+    INK_FLUSH_CONFIRMATION_TOKEN, INK_FLUSH_COOLDOWN, MAX_SAFE_D_COUNTER_PERCENT,
+    STANDARD_CLEANING_COOLDOWN,
 };
 pub use models::{
     CartridgeState, DeviceCapabilities, DeviceStatus, InkLevels, OperationalState, PrinterModel,

@@ -7,7 +7,9 @@ use crate::ipc::{
 };
 use crate::server::collect_live_snapshot;
 use pixma_core::errors::DriverError;
-use pixma_core::maintenance::{MaintenanceAction, MaintenanceRecord, MaintenanceSupervisor};
+use pixma_core::maintenance::{
+    MaintenanceAction, MaintenanceCapabilities, MaintenanceRecord, MaintenanceSupervisor,
+};
 use pixma_core::models::DeviceStatus;
 use pixma_core::scan_params::ScanParameters;
 use pixma_transport::controller::{AnyTransport, G2010Controller};
@@ -395,6 +397,45 @@ impl DaemonClient {
             ClientInner::Direct(ctrl) => {
                 let mut guard = ctrl.lock().await;
                 guard.query_status().await
+            }
+        }
+    }
+
+    /// Queries live `GetCapability(servicetype="maintenance")` from firmware,
+    /// mapping legacy daemon disconnect/EOF errors clearly when connected to `pixmad < 0.3.1`.
+    pub async fn get_maintenance_capabilities(
+        &mut self,
+    ) -> Result<MaintenanceCapabilities, DriverError> {
+        fn map_compat_io_err(e: std::io::Error) -> DriverError {
+            match e.kind() {
+                std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset => DriverError::Protocol(format!(
+                    "Daemon disconnected on GetMaintenanceCapabilities (running pixmad may be older than v0.3.1 and need restart/upgrade): {e}"
+                )),
+                _ => DriverError::Io(e),
+            }
+        }
+
+        match &mut self.inner {
+            ClientInner::Socket(stream) => {
+                send_request(stream, &DaemonRequest::GetMaintenanceCapabilities)
+                    .await
+                    .map_err(map_compat_io_err)?;
+                match recv_response(stream).await.map_err(map_compat_io_err)? {
+                    DaemonResponse::MaintenanceCapabilities(Ok(caps)) => Ok(caps),
+                    DaemonResponse::MaintenanceCapabilities(Err(e)) => {
+                        Err(DriverError::Protocol(e))
+                    }
+                    DaemonResponse::Error(e) => Err(DriverError::Protocol(e)),
+                    other => Err(DriverError::Protocol(format!(
+                        "Unexpected response: {other:?}"
+                    ))),
+                }
+            }
+            ClientInner::Direct(ctrl) => {
+                let mut guard = ctrl.lock().await;
+                guard.query_maintenance_capabilities().await
             }
         }
     }

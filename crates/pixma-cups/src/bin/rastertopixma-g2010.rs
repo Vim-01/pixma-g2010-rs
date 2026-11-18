@@ -4,16 +4,14 @@
 //! IVEC XML + PWG Raster wire streams conforming to Canon MegaTank firmware protocol.
 
 use pixma_cups::options::parse_cups_options;
-use pixma_raster::cups_reader::{parse_document_from_memory, RasterPageInput};
+use pixma_raster::cups_reader::DocumentPageSource;
 use pixma_raster::pipeline::PrintRasterPipeline;
 use std::env;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, BufWriter};
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-
+fn run_filter(args: &[String]) -> Result<(), String> {
     // CUPS filter standard argument signature:
     // argv[0] = filter name
     // argv[1] = job-id
@@ -27,69 +25,45 @@ fn main() -> ExitCode {
     let options_str = args.get(5).map(|s| s.as_str()).unwrap_or("");
     let file_arg = args.get(6).map(|s| s.as_str());
 
-    let mut input_data = Vec::new();
-    if let Some(path) = file_arg {
-        if path != "-" && !path.is_empty() {
-            match File::open(path) {
-                Ok(mut file) => {
-                    if let Err(e) = file.read_to_end(&mut input_data) {
-                        eprintln!("ERROR: Failed to read input file '{path}': {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ERROR: Could not open input file '{path}': {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        } else if let Err(e) = io::stdin().read_to_end(&mut input_data) {
-            eprintln!("ERROR: Failed to read from stdin: {e}");
-            return ExitCode::FAILURE;
-        }
-    } else if let Err(e) = io::stdin().read_to_end(&mut input_data) {
-        eprintln!("ERROR: Failed to read from stdin: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    if input_data.is_empty() {
-        eprintln!("ERROR: Empty print input received");
-        return ExitCode::FAILURE;
-    }
-
     let mut config = parse_cups_options(options_str, copies);
     config.job_id = job_id;
+    let target_dpi = Some(config.quality.base_raster_dpi());
 
-    // Parse input into raster pages (supports PWG/CUPS Raster, multi-page PDF, or standard images)
-    let pages: Vec<RasterPageInput> =
-        match parse_document_from_memory(&input_data, Some(config.quality.base_raster_dpi())) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("ERROR: Failed to parse document input: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-    if pages.is_empty() {
-        eprintln!("ERROR: No printable pages extracted from input");
-        return ExitCode::FAILURE;
-    }
+    let stdin = io::stdin();
+    let mut source = if let Some(path) = file_arg.filter(|p| !p.is_empty() && *p != "-") {
+        let file = File::open(path).map_err(|e| format!("Could not open input file '{path}': {e}"))?;
+        DocumentPageSource::from_reader(BufReader::with_capacity(64 * 1024, file), target_dpi)
+            .map_err(|e| format!("Failed to parse document input: {e}"))?
+    } else {
+        DocumentPageSource::from_reader(
+            BufReader::with_capacity(64 * 1024, stdin.lock()),
+            target_dpi,
+        )
+        .map_err(|e| format!("Failed to parse document input: {e}"))?
+    };
 
     let timestamp = pixma_core::current_utc_timestamp_14();
-    let compiled_stream =
-        match PrintRasterPipeline::compile_ivec_bjraster3_job(&pages, &config, &timestamp) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("ERROR: Failed to compile IVEC BJRaster3 job stream: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
+    let output_pages = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+        &mut source,
+        &config,
+        &timestamp,
+        &mut stdout,
+    )
+    .map_err(|e| format!("Failed to compile IVEC BJRaster3 job stream: {e}"))?;
 
-    let mut stdout = io::stdout();
-    if let Err(e) = stdout.write_all(&compiled_stream) {
-        eprintln!("ERROR: Failed to write job stream to stdout: {e}");
+    if output_pages == 0 {
+        return Err("No printable pages extracted from input".to_string());
+    }
+
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().collect();
+    if let Err(err) = run_filter(&args) {
+        eprintln!("ERROR: {err}");
         return ExitCode::FAILURE;
     }
-    let _ = stdout.flush();
-
     ExitCode::SUCCESS
 }

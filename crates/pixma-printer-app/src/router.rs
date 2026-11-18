@@ -18,9 +18,11 @@ use pixma_core::maintenance::MaintenanceAction;
 use pixma_core::models::{DeviceStatus, OperationalState};
 use pixma_core::print_params::PrintJobConfig;
 use pixma_daemon::DaemonClient;
-use pixma_raster::cups_reader::{parse_document_from_memory, RasterPageInput};
+use pixma_raster::cups_reader::DocumentPageSource;
 use pixma_raster::pipeline::PrintRasterPipeline;
+use pixma_raster::RasterError;
 use serde::{Deserialize, Serialize};
+use std::io::{BufReader, Cursor};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -293,49 +295,45 @@ async fn handle_ipp_request(
                 }
             }
 
-            // Ingest PWG raster, multi-page PDF, or standard image at target hardware base DPI
-            let target_dpi = config.quality.base_raster_dpi();
-            let pages: Result<Vec<RasterPageInput>, _> =
-                parse_document_from_memory(&req.data, Some(target_dpi));
+            // Stream PWG raster, multi-page PDF, or standard image page-by-page
+            // Scoped synchronously so non-Send BufRead wrappers never span across `.await`.
+            let job_stream = {
+                let target_dpi = config.quality.base_raster_dpi();
+                let mut source = match DocumentPageSource::from_reader(
+                    BufReader::new(Cursor::new(req.data.as_slice())),
+                    Some(target_dpi),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to parse document payload: {e}");
+                        let resp = IppResponse::new(
+                            req.version_major,
+                            req.version_minor,
+                            raster_error_to_ipp_status(&e),
+                            req.request_id,
+                        );
+                        return Ok(ipp_binary_response(resp.to_bytes()));
+                    }
+                };
 
-            let pages = match pages {
-                Ok(p) if !p.is_empty() => p,
-                Ok(_) => {
-                    let resp = IppResponse::new(
-                        req.version_major,
-                        req.version_minor,
-                        STATUS_CLIENT_ERROR_BAD_REQUEST,
-                        req.request_id,
-                    );
-                    return Ok(ipp_binary_response(resp.to_bytes()));
-                }
-                Err(e) => {
-                    tracing::error!("Failed to parse document payload: {e}");
-                    let resp = IppResponse::new(
-                        req.version_major,
-                        req.version_minor,
-                        STATUS_CLIENT_ERROR_BAD_REQUEST,
-                        req.request_id,
-                    );
-                    return Ok(ipp_binary_response(resp.to_bytes()));
-                }
-            };
-
-            let timestamp = pixma_core::current_utc_timestamp_14();
-            let job_stream = match PrintRasterPipeline::compile_ivec_bjraster3_job(
-                &pages, &config, &timestamp,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
+                let timestamp = pixma_core::current_utc_timestamp_14();
+                let mut stream = Vec::new();
+                if let Err(e) = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+                    &mut source,
+                    &config,
+                    &timestamp,
+                    &mut stream,
+                ) {
                     tracing::error!("Failed to compile IVEC BJRaster3 print stream: {e}");
                     let resp = IppResponse::new(
                         req.version_major,
                         req.version_minor,
-                        STATUS_SERVER_ERROR_INTERNAL,
+                        raster_error_to_ipp_status(&e),
                         req.request_id,
                     );
                     return Ok(ipp_binary_response(resp.to_bytes()));
                 }
+                stream
             };
 
             // Stream to device via bound client or fail-closed live USB/daemon connection
@@ -483,6 +481,17 @@ async fn handle_post_maintenance(
     }
 }
 
+fn raster_error_to_ipp_status(err: &RasterError) -> u16 {
+    match err {
+        RasterError::NoPages
+        | RasterError::StreamParse(_)
+        | RasterError::InvalidDimensions { .. }
+        | RasterError::BufferLengthMismatch { .. }
+        | RasterError::ImageDecode(_) => STATUS_CLIENT_ERROR_BAD_REQUEST,
+        _ => STATUS_SERVER_ERROR_INTERNAL,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +550,35 @@ mod tests {
                 resolve_request_printer_uri(&h, fallback),
                 fallback,
                 "malicious Host header '{bad}' must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn raster_error_to_ipp_status_distinguishes_client_parse_vs_server_io() {
+        let io_err = RasterError::Io(std::io::Error::other("disk full"));
+        assert_eq!(
+            raster_error_to_ipp_status(&io_err),
+            STATUS_SERVER_ERROR_INTERNAL
+        );
+
+        let client_errs = [
+            RasterError::NoPages,
+            RasterError::StreamParse("bad magic".to_string()),
+            RasterError::InvalidDimensions {
+                width: 0,
+                height: 10,
+            },
+            RasterError::BufferLengthMismatch {
+                expected: 12,
+                actual: 3,
+            },
+        ];
+        for err in &client_errs {
+            assert_eq!(
+                raster_error_to_ipp_status(err),
+                STATUS_CLIENT_ERROR_BAD_REQUEST,
+                "unexpected status for {err:?}"
             );
         }
     }

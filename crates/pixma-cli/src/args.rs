@@ -49,6 +49,9 @@ pub enum Commands {
     /// Query real-time hardware status, ink levels, and diagnostic error codes.
     Status,
 
+    /// Query live firmware maintenance capabilities (`GetCapability`, read-only).
+    Capabilities,
+
     /// Execute print head cleaning routine.
     Clean {
         /// Cleaning type: regular (standard), deep (heavy), or flush (system choke).

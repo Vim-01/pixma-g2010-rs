@@ -4,14 +4,14 @@
 //! MegaTank ink separation, and wire protocol compilation into wire-ready
 //! IVEC + PWG Raster (`RaS2`) or IVEC + BJRaster3 (`ESC (`) byte streams.
 
-use crate::cups_reader::RasterPageInput;
+use crate::cups_reader::{DocumentPageSource, RasterPageInput, MAX_MULTI_PAGE_COLLECT_RGB_BYTES};
 use crate::errors::RasterError;
 use crate::halftone::{
     get_blue_noise_matrix_64x64, BlueNoiseDitherer, DitherAlgorithm, ErrorDiffusionDitherer,
 };
 use crate::layout::{apply_borderless_extension, apply_page_layout};
 use pixma_color::{ColorPipeline, InkSeparator};
-use pixma_core::print_params::PrintJobConfig;
+use pixma_core::print_params::{PageLayout, PrintJobConfig};
 use pixma_core::safety::{MechanicalBounds, ValidatedRasterLine};
 use pixma_protocol::bjraster3::BjRaster3Encoder;
 use pixma_protocol::ivec::{
@@ -20,6 +20,7 @@ use pixma_protocol::ivec::{
     build_start_job,
 };
 use pixma_protocol::pwg_raster::{encode_pwg_page, PwgRasterHeader};
+use std::io::Write;
 
 /// The primary print raster pipeline orchestrator.
 pub struct PrintRasterPipeline;
@@ -43,98 +44,31 @@ impl PrintRasterPipeline {
             return Err(RasterError::NoPages);
         }
 
-        let dpi = config.quality.base_raster_dpi();
-        let max_carriage_dots = MechanicalBounds::max_carriage_dots_for_dpi(dpi)?;
-        let max_page_length_dots = MechanicalBounds::max_page_height_dots_for_dpi(dpi)?;
-
-        // Compute destination printable area dots from paper size and borderless mode
-        let (printable_w, printable_h) = config
-            .paper_size
-            .printable_area_dots(dpi, config.borderless.is_borderless());
-
-        let target_w = printable_w.clamp(1, max_carriage_dots);
-        let target_h = printable_h.clamp(1, max_page_length_dots);
+        let (target_w, target_h) = resolve_printable_target_dots(config)?;
 
         // 1. Layout imposition
         let laid_out_pages = apply_page_layout(pages, config.layout, target_w, target_h)?;
 
-        // 2. Borderless overscan extension
-        let extended_pages: Vec<RasterPageInput> = laid_out_pages
-            .into_iter()
-            .map(|p| apply_borderless_extension(&p, config.borderless))
-            .collect();
-
-        // 3. Page ordering: reverse order, copies, and collation
+        // 2. Page ordering: reverse order, copies, and collation
         let ordered_pages = apply_page_ordering(
-            extended_pages,
+            laid_out_pages,
             config.reverse_order,
             config.copies,
             config.collate,
         );
 
-        // 4. Color processing & ink separation validation
+        // 3. Borderless overscan, color processing & ink separation validation
         let color_pipe = ColorPipeline::new(config.color);
         let separator = InkSeparator::new(config.media_type);
 
         let mut rendered_pages = Vec::with_capacity(ordered_pages.len());
-
         for page in &ordered_pages {
-            let width = page.width;
-            let height = page.height;
-            let mut page_lines = Vec::with_capacity(height as usize);
-
-            if config.color.grayscale {
-                // Monochrome path: 8-bit SGray validated raster lines
-                for y in 0..height {
-                    let start = (y as usize) * (width as usize) * 3;
-                    let end = start + (width as usize) * 3;
-                    let mut rgb_line = page.rgb_pixels[start..end].to_vec();
-
-                    color_pipe.transform_scanline(&mut rgb_line);
-
-                    // `color_pipe.transform_scanline` in grayscale mode already converts
-                    // each pixel to `(gray, gray, gray)` via `rgb_to_sgray_fixed_point` + LUT.
-                    let gray_bytes: Vec<u8> = (0..width as usize)
-                        .map(|i| rgb_line[i * 3])
-                        .collect();
-
-                    let validated_line = ValidatedRasterLine::try_new(gray_bytes, width, dpi, 1)?;
-                    page_lines.push(validated_line);
-                }
-            } else {
-                // Color path: 24-bit sRGB validated raster lines
-                for y in 0..height {
-                    let start = (y as usize) * (width as usize) * 3;
-                    let end = start + (width as usize) * 3;
-                    let mut rgb_line = page.rgb_pixels[start..end].to_vec();
-
-                    color_pipe.transform_scanline(&mut rgb_line);
-
-                    // HARDWARE INTERLOCK VERIFICATION:
-                    // On glossy/coated media, Pigment Black (PGBK) cannot adhere to silica coating
-                    // and must be strictly 0. Verify that InkSeparator separates with k_pgbk == 0.
-                    if config.media_type.requires_composite_cmy_black() {
-                        for i in 0..width as usize {
-                            let cmyk = separator.separate_pixel(
-                                rgb_line[i * 3],
-                                rgb_line[i * 3 + 1],
-                                rgb_line[i * 3 + 2],
-                            );
-                            if cmyk.k_pgbk != 0 {
-                                return Err(RasterError::SafetyViolation(
-                                    "Pigment black (PGBK) must be 0 on glossy/coated media"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                    }
-
-                    let validated_line = ValidatedRasterLine::try_new(rgb_line, width, dpi, 3)?;
-                    page_lines.push(validated_line);
-                }
-            }
-
-            rendered_pages.push(page_lines);
+            rendered_pages.push(render_single_page_to_validated_lines(
+                page,
+                config,
+                &color_pipe,
+                &separator,
+            )?);
         }
 
         Ok(rendered_pages)
@@ -295,169 +229,398 @@ impl PrintRasterPipeline {
         config: &PrintJobConfig,
         _timestamp: &str,
     ) -> Result<Vec<u8>, RasterError> {
-        let rendered_pages = Self::render_pages_to_validated_lines(pages, config)?;
-        let separator = InkSeparator::new(config.media_type);
         let mut stream = Vec::new();
+        compile_ivec_bjraster3_pages_to_writer(pages, config, &mut stream)?;
+        Ok(stream)
+    }
 
-        // 1. StartJob (<ivec:bidi>0</ivec:bidi>)
-        stream.extend_from_slice(build_bjraster_start_job(config.job_id).as_bytes());
+    /// Returns `true` when `config` can render and emit each input page sequentially
+    /// without buffering multiple decoded RGB pages in memory.
+    pub fn can_stream_page_by_page(config: &PrintJobConfig) -> bool {
+        !config.reverse_order
+            && (config.copies <= 1 || !config.collate)
+            && matches!(
+                config.layout,
+                PageLayout::Normal
+                    | PageLayout::FitToPage
+                    | PageLayout::Scaled { .. }
+                    | PageLayout::Poster { .. }
+            )
+    }
 
-        // 2. VendorCmd ModeShift (ijmode=1 -> binary BJRaster3 stream)
-        stream.extend_from_slice(build_bjraster_mode_shift(config.job_id).as_bytes());
+    /// Compiles an IVEC + ModeShift + BJR520 job stream directly from a streaming
+    /// [`DocumentPageSource`], keeping only one decoded RGB page in memory at a time
+    /// for sequential page-independent layouts, and returns the number of output pages emitted.
+    pub fn compile_ivec_bjraster3_from_source<W: Write>(
+        source: &mut DocumentPageSource<'_>,
+        config: &PrintJobConfig,
+        _timestamp: &str,
+        writer: &mut W,
+    ) -> Result<usize, RasterError> {
+        if !Self::can_stream_page_by_page(config) {
+            let pages = source.collect_remaining_bounded(MAX_MULTI_PAGE_COLLECT_RGB_BYTES, 256)?;
+            return compile_ivec_bjraster3_pages_to_writer(&pages, config, writer);
+        }
 
-        // Determine hardware 600 DPI printable grid geometry
-        let (raw_w_600, raw_h_600) = config.paper_size.printable_area_dots(600, false);
-        let (printable_w_600, printable_h_600) = match config.paper_size {
-            pixma_core::print_params::PaperSize::A4 => (4791u32, 6816u32),
-            pixma_core::print_params::PaperSize::Letter => (4933u32, 6400u32),
-            pixma_core::print_params::PaperSize::Photo4x6 => (2233u32, 3400u32),
-            _ => (raw_w_600.min(4791), (raw_h_600 / 8) * 8),
-        };
-        let total_bands = (printable_h_600 as usize / 8).max(1);
-        let dot_w = printable_w_600 as usize;
-        let bytes_1bpp = dot_w.div_ceil(8);
-        let bytes_2bpp = dot_w.div_ceil(4);
+        let mut curr_opt = source.next_page()?;
+        if curr_opt.is_none() {
+            return Err(RasterError::NoPages);
+        }
+
+        let (target_w, target_h) = resolve_printable_target_dots(config)?;
+        let (printable_w_600, printable_h_600) = compute_bjr520_geometry(config);
+        let color_pipe = ColorPipeline::new(config.color);
+        let separator = InkSeparator::new(config.media_type);
         let blue_noise = get_blue_noise_matrix_64x64();
+        let copies = config.copies.max(1) as usize;
+        let mut output_pages = 0usize;
+        let mut started = false;
 
-        // 3. Per-page BJR520 prologue, 8-line ESC ( F bands, and epilogue
-        for (page_idx, page_lines) in rendered_pages.iter().enumerate() {
-            let page_no = (page_idx + 1) as u8;
-            let is_last_page = page_idx + 1 == rendered_pages.len();
+        while let Some(src_page) = curr_opt.take() {
+            let sheets = apply_page_layout(
+                std::slice::from_ref(&src_page),
+                config.layout,
+                target_w,
+                target_h,
+            )?;
+            drop(src_page);
 
-            // Smart Print per-page auto-monochrome detection:
-            // On plain/uncoated media, if every pixel on this page is neutral (black/gray/white),
-            // switch the hardware page prologue to Monochrome (`ESC ( c = 0x31`, `ESC ( L = "K"`)
-            // so only the Pigment Black (`BH-4` / `PGBK`) printhead is engaged for this page.
-            let page_grayscale = config.color.grayscale
-                || (!config.media_type.requires_composite_cmy_black()
-                    && is_page_neutral_monochrome(page_lines));
+            let num_sheets = sheets.len();
+            if num_sheets == 0 {
+                return Err(RasterError::NoPages);
+            }
 
-            let mut page_config = config.clone();
-            page_config.color.grayscale = page_grayscale;
+            for (sheet_idx, sheet) in sheets.into_iter().enumerate() {
+                let mut page_lines_opt = Some(render_single_page_to_validated_lines(
+                    &sheet,
+                    config,
+                    &color_pipe,
+                    &separator,
+                )?);
+                drop(sheet);
 
-            stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_prologue(
-                &page_config,
-                page_no,
-                printable_w_600,
-                printable_h_600,
-            ));
-
-            let scale = if !page_lines.is_empty() && page_lines[0].dpi() == 300 {
-                2usize
-            } else {
-                1usize
-            };
-
-            let mut c_band = vec![Vec::new(); 8];
-            let mut m_band = vec![Vec::new(); 8];
-            let mut y_band = vec![Vec::new(); 8];
-            let mut k_band = vec![Vec::new(); 8];
-
-            for band_idx in 0..total_bands {
-                for row in 0..8 {
-                    c_band[row].clear();
-                    m_band[row].clear();
-                    y_band[row].clear();
-                    k_band[row].clear();
-
-                    let y_600 = band_idx * 8 + row;
-                    let src_y = y_600 / scale;
-                    let Some(line) = page_lines.get(src_y) else {
-                        continue;
-                    };
-                    let raw = line.as_bytes();
-                    // Fast path: completely white scanline needs 0 ink droplets
-                    if raw.iter().all(|&b| b == 0xFF) {
-                        continue;
-                    }
-
-                    let bn_row_start = (y_600 & 63) * 64;
-                    let bn_row = &blue_noise[bn_row_start..bn_row_start + 64];
-                    let src_w = line.dot_width() as usize;
-
-                    if line.bytes_per_pixel() == 1 || page_grayscale {
-                        k_band[row].resize(bytes_1bpp, 0);
-                        let bpp = line.bytes_per_pixel() as usize;
-                        for px in 0..dot_w {
-                            let sx = (px / scale).min(src_w.saturating_sub(1));
-                            let g = if bpp == 3 {
-                                let base = sx * 3;
-                                ((raw[base] as u16 + raw[base + 1] as u16 + raw[base + 2] as u16 + 1)
-                                    / 3) as u8
-                            } else {
-                                raw[sx * bpp]
-                            };
-                            if g < 255 {
-                                let k = if g < 16 { 255 } else { 255 - g };
-                                let thr = bn_row[px & 63];
-                                if k > thr {
-                                    k_band[row][px >> 3] |= 1 << (7 - (px & 7));
-                                }
-                            }
-                        }
-                    } else {
-                        c_band[row].resize(bytes_2bpp, 0);
-                        m_band[row].resize(bytes_2bpp, 0);
-                        y_band[row].resize(bytes_1bpp, 0);
-                        k_band[row].resize(bytes_1bpp, 0);
-
-                        for px in 0..dot_w {
-                            let sx = (px / scale).min(src_w.saturating_sub(1));
-                            let base = sx * 3;
-                            let r = raw[base];
-                            let g = raw[base + 1];
-                            let b = raw[base + 2];
-                            if (r & g & b) == 0xFF {
-                                continue;
-                            }
-
-                            let cmyk = separator.separate_pixel(r, g, b);
-                            let thr = bn_row[px & 63];
-                            let thr_lo = thr >> 1;
-                            let thr_hi = 128 + thr_lo;
-                            let shift_2bpp = (3 - (px & 3)) * 2;
-                            let bit_1bpp = 1u8 << (7 - (px & 7));
-
-                            if cmyk.c > thr_lo {
-                                let lvl: u8 = if cmyk.c > thr_hi { 2 } else { 1 };
-                                c_band[row][px >> 2] |= lvl << shift_2bpp;
-                            }
-                            if cmyk.m > thr_lo {
-                                let lvl: u8 = if cmyk.m > thr_hi { 2 } else { 1 };
-                                m_band[row][px >> 2] |= lvl << shift_2bpp;
-                            }
-                            if cmyk.y > thr {
-                                y_band[row][px >> 3] |= bit_1bpp;
-                            }
-                            if cmyk.k_pgbk > thr {
-                                k_band[row][px >> 3] |= bit_1bpp;
-                            }
-                        }
-                    }
+                if !started {
+                    writer.write_all(build_bjraster_start_job(config.job_id).as_bytes())?;
+                    writer.write_all(build_bjraster_mode_shift(config.job_id).as_bytes())?;
+                    started = true;
                 }
 
-                if page_grayscale {
-                    let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
-                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs));
-                } else {
-                    let c_refs: [&[u8]; 8] = std::array::from_fn(|r| c_band[r].as_slice());
-                    let m_refs: [&[u8]; 8] = std::array::from_fn(|r| m_band[r].as_slice());
-                    let y_refs: [&[u8]; 8] = std::array::from_fn(|r| y_band[r].as_slice());
-                    let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
-                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&c_refs));
-                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&m_refs));
-                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&y_refs));
-                    stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs));
+                for copy_idx in 0..copies {
+                    if let Some(ref page_lines) = page_lines_opt {
+                        write_bjr520_page_body(
+                            page_lines,
+                            config,
+                            &separator,
+                            printable_w_600,
+                            printable_h_600,
+                            blue_noise,
+                            output_pages,
+                            writer,
+                        )?;
+                    }
+
+                    let is_last_copy_of_sheet = copy_idx + 1 == copies;
+                    if is_last_copy_of_sheet {
+                        // Drop the full RGB/scanline page buffer before reading the next page
+                        drop(page_lines_opt.take());
+                    }
+
+                    let is_last_overall = if is_last_copy_of_sheet && sheet_idx + 1 == num_sheets {
+                        curr_opt = source.next_page()?;
+                        curr_opt.is_none()
+                    } else {
+                        false
+                    };
+                    writer.write_all(&BjRaster3Encoder::encode_bjr520_epilogue(is_last_overall))?;
+                    output_pages += 1;
+                }
+            }
+        }
+
+        writer.write_all(build_end_job("print", config.job_id).as_bytes())?;
+        writer.flush()?;
+        Ok(output_pages)
+    }
+}
+
+fn resolve_printable_target_dots(config: &PrintJobConfig) -> Result<(u32, u32), RasterError> {
+    let dpi = config.quality.base_raster_dpi();
+    let max_carriage_dots = MechanicalBounds::max_carriage_dots_for_dpi(dpi)?;
+    let max_page_length_dots = MechanicalBounds::max_page_height_dots_for_dpi(dpi)?;
+    let (printable_w, printable_h) = config
+        .paper_size
+        .printable_area_dots(dpi, config.borderless.is_borderless());
+    Ok((
+        printable_w.clamp(1, max_carriage_dots),
+        printable_h.clamp(1, max_page_length_dots),
+    ))
+}
+
+fn render_single_page_to_validated_lines(
+    laid_out_page: &RasterPageInput,
+    config: &PrintJobConfig,
+    color_pipe: &ColorPipeline,
+    separator: &InkSeparator,
+) -> Result<Vec<ValidatedRasterLine>, RasterError> {
+    let page = apply_borderless_extension(laid_out_page, config.borderless);
+    let dpi = config.quality.base_raster_dpi();
+    let width = page.width;
+    let height = page.height;
+    let mut page_lines = Vec::with_capacity(height as usize);
+
+    if config.color.grayscale {
+        for y in 0..height {
+            let start = (y as usize) * (width as usize) * 3;
+            let end = start + (width as usize) * 3;
+            let mut rgb_line = page.rgb_pixels[start..end].to_vec();
+
+            color_pipe.transform_scanline(&mut rgb_line);
+
+            // `color_pipe.transform_scanline` in grayscale mode already converts
+            // each pixel to `(gray, gray, gray)` via `rgb_to_sgray_fixed_point` + LUT.
+            let gray_bytes: Vec<u8> = (0..width as usize).map(|i| rgb_line[i * 3]).collect();
+
+            let validated_line = ValidatedRasterLine::try_new(gray_bytes, width, dpi, 1)?;
+            page_lines.push(validated_line);
+        }
+    } else {
+        for y in 0..height {
+            let start = (y as usize) * (width as usize) * 3;
+            let end = start + (width as usize) * 3;
+            let mut rgb_line = page.rgb_pixels[start..end].to_vec();
+
+            color_pipe.transform_scanline(&mut rgb_line);
+
+            // HARDWARE INTERLOCK VERIFICATION:
+            // On glossy/coated media, Pigment Black (PGBK) cannot adhere to silica coating
+            // and must be strictly 0. Verify that InkSeparator separates with k_pgbk == 0.
+            if config.media_type.requires_composite_cmy_black() {
+                for i in 0..width as usize {
+                    let cmyk = separator.separate_pixel(
+                        rgb_line[i * 3],
+                        rgb_line[i * 3 + 1],
+                        rgb_line[i * 3 + 2],
+                    );
+                    if cmyk.k_pgbk != 0 {
+                        return Err(RasterError::SafetyViolation(
+                            "Pigment black (PGBK) must be 0 on glossy/coated media".to_string(),
+                        ));
+                    }
                 }
             }
 
-            stream.extend_from_slice(&BjRaster3Encoder::encode_bjr520_epilogue(is_last_page));
+            let validated_line = ValidatedRasterLine::try_new(rgb_line, width, dpi, 3)?;
+            page_lines.push(validated_line);
+        }
+    }
+
+    Ok(page_lines)
+}
+
+fn compute_bjr520_geometry(config: &PrintJobConfig) -> (u32, u32) {
+    let (raw_w_600, raw_h_600) = config.paper_size.printable_area_dots(600, false);
+    match config.paper_size {
+        pixma_core::print_params::PaperSize::A4 => (4791u32, 6816u32),
+        pixma_core::print_params::PaperSize::Letter => (4933u32, 6400u32),
+        pixma_core::print_params::PaperSize::Photo4x6 => (2233u32, 3400u32),
+        _ => (raw_w_600.min(4791), (raw_h_600 / 8) * 8),
+    }
+}
+
+fn compile_ivec_bjraster3_pages_to_writer<W: Write>(
+    pages: &[RasterPageInput],
+    config: &PrintJobConfig,
+    writer: &mut W,
+) -> Result<usize, RasterError> {
+    let rendered_pages = PrintRasterPipeline::render_pages_to_validated_lines(pages, config)?;
+    let separator = InkSeparator::new(config.media_type);
+    let (printable_w_600, printable_h_600) = compute_bjr520_geometry(config);
+    let blue_noise = get_blue_noise_matrix_64x64();
+
+    writer.write_all(build_bjraster_start_job(config.job_id).as_bytes())?;
+    writer.write_all(build_bjraster_mode_shift(config.job_id).as_bytes())?;
+
+    let total_pages = rendered_pages.len();
+    for (page_idx, page_lines) in rendered_pages.iter().enumerate() {
+        let is_last_page = page_idx + 1 == total_pages;
+        write_bjr520_page_body(
+            page_lines,
+            config,
+            &separator,
+            printable_w_600,
+            printable_h_600,
+            blue_noise,
+            page_idx,
+            writer,
+        )?;
+        writer.write_all(&BjRaster3Encoder::encode_bjr520_epilogue(is_last_page))?;
+    }
+
+    writer.write_all(build_end_job("print", config.job_id).as_bytes())?;
+    writer.flush()?;
+    Ok(total_pages)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_bjr520_page_body<W: Write>(
+    page_lines: &[ValidatedRasterLine],
+    config: &PrintJobConfig,
+    separator: &InkSeparator,
+    printable_w_600: u32,
+    printable_h_600: u32,
+    blue_noise: &[u8; 4096],
+    output_page_idx: usize,
+    writer: &mut W,
+) -> Result<(), RasterError> {
+    let total_bands = (printable_h_600 as usize / 8).max(1);
+    let dot_w = printable_w_600 as usize;
+    let bytes_1bpp = dot_w.div_ceil(8);
+    let bytes_2bpp = dot_w.div_ceil(4);
+
+    let is_first_page = output_page_idx == 0;
+    let page_id = ((output_page_idx % 255) + 1) as u8;
+
+    // Smart Print per-page auto-monochrome detection:
+    // On plain/uncoated media, if every pixel on this page is neutral (black/gray/white),
+    // switch the hardware page prologue to Monochrome (`ESC ( c = 0x31`, `ESC ( L = "K"`)
+    // so only the Pigment Black (`BH-4` / `PGBK`) printhead is engaged for this page.
+    let page_grayscale = config.color.grayscale
+        || (!config.media_type.requires_composite_cmy_black()
+            && is_page_neutral_monochrome(page_lines));
+
+    let mut page_config = config.clone();
+    page_config.color.grayscale = page_grayscale;
+
+    writer.write_all(&BjRaster3Encoder::encode_bjr520_page_prologue(
+        &page_config,
+        is_first_page,
+        page_id,
+        printable_w_600,
+        printable_h_600,
+    ))?;
+
+    let scale = if !page_lines.is_empty() && page_lines[0].dpi() == 300 {
+        2usize
+    } else {
+        1usize
+    };
+
+    let mut c_band = vec![Vec::new(); 8];
+    let mut m_band = vec![Vec::new(); 8];
+    let mut y_band = vec![Vec::new(); 8];
+    let mut k_band = vec![Vec::new(); 8];
+
+    for band_idx in 0..total_bands {
+        for row in 0..8 {
+            c_band[row].clear();
+            m_band[row].clear();
+            y_band[row].clear();
+            k_band[row].clear();
+
+            let y_600 = band_idx * 8 + row;
+            let src_y = y_600 / scale;
+            let Some(line) = page_lines.get(src_y) else {
+                continue;
+            };
+            let raw = line.as_bytes();
+            // Fast path: completely white scanline needs 0 ink droplets
+            if raw.iter().all(|&b| b == 0xFF) {
+                continue;
+            }
+
+            let bn_row_start = (y_600 & 63) * 64;
+            let bn_row = &blue_noise[bn_row_start..bn_row_start + 64];
+            let src_w = line.dot_width() as usize;
+
+            if line.bytes_per_pixel() == 1 || page_grayscale {
+                k_band[row].resize(bytes_1bpp, 0);
+                let bpp = line.bytes_per_pixel() as usize;
+                for px in 0..dot_w {
+                    let sx = (px / scale).min(src_w.saturating_sub(1));
+                    let g = if bpp == 3 {
+                        let base = sx * 3;
+                        ((raw[base] as u16 + raw[base + 1] as u16 + raw[base + 2] as u16 + 1) / 3)
+                            as u8
+                    } else {
+                        raw[sx * bpp]
+                    };
+                    if g < 255 {
+                        let k = if g < 16 { 255 } else { 255 - g };
+                        if quantize_bn_1bpp(k, bn_row[px & 63]) {
+                            k_band[row][px >> 3] |= 1 << (7 - (px & 7));
+                        }
+                    }
+                }
+            } else {
+                c_band[row].resize(bytes_2bpp, 0);
+                m_band[row].resize(bytes_2bpp, 0);
+                y_band[row].resize(bytes_1bpp, 0);
+                k_band[row].resize(bytes_1bpp, 0);
+
+                for px in 0..dot_w {
+                    let sx = (px / scale).min(src_w.saturating_sub(1));
+                    let base = sx * 3;
+                    let r = raw[base];
+                    let g = raw[base + 1];
+                    let b = raw[base + 2];
+                    if (r & g & b) == 0xFF {
+                        continue;
+                    }
+
+                    let cmyk = separator.separate_pixel(r, g, b);
+                    let thr = bn_row[px & 63];
+                    let shift_2bpp = (3 - (px & 3)) * 2;
+                    let bit_1bpp = 1u8 << (7 - (px & 7));
+
+                    let c_lvl = quantize_bn_2bpp_3level(cmyk.c, thr);
+                    if c_lvl > 0 {
+                        c_band[row][px >> 2] |= c_lvl << shift_2bpp;
+                    }
+                    let m_lvl = quantize_bn_2bpp_3level(cmyk.m, thr);
+                    if m_lvl > 0 {
+                        m_band[row][px >> 2] |= m_lvl << shift_2bpp;
+                    }
+                    if quantize_bn_1bpp(cmyk.y, thr) {
+                        y_band[row][px >> 3] |= bit_1bpp;
+                    }
+                    if quantize_bn_1bpp(cmyk.k_pgbk, thr) {
+                        k_band[row][px >> 3] |= bit_1bpp;
+                    }
+                }
+            }
         }
 
-        // 4. EndJob
-        stream.extend_from_slice(build_end_job("print", config.job_id).as_bytes());
+        if page_grayscale {
+            let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
+            writer.write_all(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs))?;
+        } else {
+            let c_refs: [&[u8]; 8] = std::array::from_fn(|r| c_band[r].as_slice());
+            let m_refs: [&[u8]; 8] = std::array::from_fn(|r| m_band[r].as_slice());
+            let y_refs: [&[u8]; 8] = std::array::from_fn(|r| y_band[r].as_slice());
+            let k_refs: [&[u8]; 8] = std::array::from_fn(|r| k_band[r].as_slice());
+            writer.write_all(&BjRaster3Encoder::encode_bjr520_band_esc_f(&c_refs))?;
+            writer.write_all(&BjRaster3Encoder::encode_bjr520_band_esc_f(&m_refs))?;
+            writer.write_all(&BjRaster3Encoder::encode_bjr520_band_esc_f(&y_refs))?;
+            writer.write_all(&BjRaster3Encoder::encode_bjr520_band_esc_f(&k_refs))?;
+        }
+    }
 
-        Ok(stream)
+    Ok(())
+}
+
+fn quantize_bn_1bpp(val: u8, thr: u8) -> bool {
+    val == 255 || val > thr
+}
+
+fn quantize_bn_2bpp_3level(val: u8, thr: u8) -> u8 {
+    let thr_lo = thr >> 1;
+    let thr_hi = 128 + thr_lo;
+    if val == 255 || val > thr_hi {
+        2
+    } else if val > thr_lo {
+        1
+    } else {
+        0
     }
 }
 
@@ -719,5 +882,154 @@ mod tests {
             PrintRasterPipeline::render_pages_to_validated_lines(&[page], &glossy_config).unwrap();
         assert_eq!(rendered.len(), 1);
         assert!(!rendered[0].is_empty());
+    }
+
+    #[test]
+    fn test_bjr520_blue_noise_solid_255_and_zero_have_no_matrix_dropouts() {
+        let bn = get_blue_noise_matrix_64x64();
+        for &thr in bn.iter() {
+            assert!(
+                quantize_bn_1bpp(255, thr),
+                "1-bpp solid 255 must never drop out at threshold {thr}"
+            );
+            assert!(
+                !quantize_bn_1bpp(0, thr),
+                "1-bpp 0 must never emit droplet at threshold {thr}"
+            );
+            assert_eq!(
+                quantize_bn_2bpp_3level(255, thr),
+                2,
+                "2-bpp solid 255 must always emit max level 2 at threshold {thr}"
+            );
+            assert_eq!(
+                quantize_bn_2bpp_3level(0, thr),
+                0,
+                "2-bpp 0 must always emit 0 at threshold {thr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_ivec_bjraster3_from_source_matches_buffered_and_guards_empty() {
+        use std::io::{BufReader, Cursor};
+
+        // 1. Empty input emits 0 bytes and returns Err before StartJob
+        let mut empty_out = Vec::new();
+        let empty_err =
+            DocumentPageSource::from_reader(BufReader::new(Cursor::new(b"" as &[u8])), Some(600))
+                .err()
+                .expect("empty stream must fail");
+        assert!(matches!(empty_err, RasterError::StreamParse(_)));
+        assert!(empty_out.is_empty());
+
+        // Header-only PWG stream (0 pages) emits 0 bytes and returns NoPages
+        let mut hdr_only_source = DocumentPageSource::from_reader(
+            BufReader::new(Cursor::new(b"RaS2" as &[u8])),
+            Some(600),
+        )
+        .unwrap();
+        let no_pages_err = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+            &mut hdr_only_source,
+            &PrintJobConfig::default(),
+            "20261119013500",
+            &mut empty_out,
+        )
+        .expect_err("0-page stream must fail before StartJob");
+        assert!(matches!(no_pages_err, RasterError::NoPages));
+        assert!(empty_out.is_empty());
+
+        // 2. 2-page RaS3 stream matches buffered compile_ivec_bjraster3_job byte-for-byte
+        let mut hdr = [0u8; 1796];
+        hdr[276..280].copy_from_slice(&600u32.to_be_bytes());
+        hdr[280..284].copy_from_slice(&600u32.to_be_bytes());
+        hdr[372..376].copy_from_slice(&8u32.to_be_bytes());
+        hdr[376..380].copy_from_slice(&8u32.to_be_bytes());
+        hdr[384..388].copy_from_slice(&8u32.to_be_bytes());
+        hdr[388..392].copy_from_slice(&24u32.to_be_bytes());
+        hdr[392..396].copy_from_slice(&24u32.to_be_bytes());
+        hdr[400..404].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut pwg_bytes = Vec::from(&b"RaS3"[..]);
+        // Page 1 monochrome, Page 2 colored
+        pwg_bytes.extend_from_slice(&hdr);
+        pwg_bytes.extend(std::iter::repeat_n(0x40u8, 8 * 8 * 3));
+        pwg_bytes.extend_from_slice(&hdr);
+        for _ in 0..(8 * 8) {
+            pwg_bytes.extend_from_slice(&[200, 10, 20]);
+        }
+
+        let config = PrintJobConfig {
+            job_id: 55,
+            paper_size: PaperSize::Photo4x6,
+            quality: PrintQuality::Level3Standard,
+            ..Default::default()
+        };
+        let parsed = crate::cups_reader::parse_pwg_raster(&pwg_bytes).unwrap();
+        let buffered =
+            PrintRasterPipeline::compile_ivec_bjraster3_job(&parsed, &config, "20261119013500")
+                .unwrap();
+
+        let mut source =
+            DocumentPageSource::from_reader(BufReader::new(Cursor::new(&pwg_bytes)), Some(600))
+                .unwrap();
+        let mut streamed = Vec::new();
+        let count = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+            &mut source,
+            &config,
+            "20261119013500",
+            &mut streamed,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(streamed, buffered);
+    }
+
+    #[test]
+    fn test_compile_ivec_bjraster3_over_255_output_pages_does_not_reemit_mode_entry() {
+        use std::io::{BufReader, Cursor};
+
+        let mut hdr = [0u8; 1796];
+        hdr[276..280].copy_from_slice(&600u32.to_be_bytes());
+        hdr[280..284].copy_from_slice(&600u32.to_be_bytes());
+        hdr[372..376].copy_from_slice(&1u32.to_be_bytes());
+        hdr[376..380].copy_from_slice(&1u32.to_be_bytes());
+        hdr[384..388].copy_from_slice(&8u32.to_be_bytes());
+        hdr[388..392].copy_from_slice(&24u32.to_be_bytes());
+        hdr[392..396].copy_from_slice(&3u32.to_be_bytes());
+        hdr[400..404].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut pwg_bytes = Vec::from(&b"RaS3"[..]);
+        pwg_bytes.extend_from_slice(&hdr);
+        pwg_bytes.extend_from_slice(&[255, 255, 255]); // 1x1 blank page
+
+        let config = PrintJobConfig {
+            job_id: 99,
+            paper_size: PaperSize::Photo4x6,
+            quality: PrintQuality::Level3Standard,
+            copies: 257,
+            collate: false,
+            ..Default::default()
+        };
+        let mut source =
+            DocumentPageSource::from_reader(BufReader::new(Cursor::new(&pwg_bytes)), Some(600))
+                .unwrap();
+        let mut out = Vec::new();
+        let pages_emitted = PrintRasterPipeline::compile_ivec_bjraster3_from_source(
+            &mut source,
+            &config,
+            "20261119013500",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(pages_emitted, 257);
+
+        let esc_k_count = out.windows(3).filter(|w| *w == [0x1b, b'[', b'K']).count();
+        assert_eq!(esc_k_count, 1, "ESC [ K must be emitted once per job, never on page 256+");
+
+        let zero_page_id_count = out
+            .windows(6)
+            .filter(|w| *w == [0x1b, b'(', b'q', 0x01, 0x00, 0x00])
+            .count();
+        assert_eq!(zero_page_id_count, 0, "ESC ( q page ID must never be 0");
     }
 }

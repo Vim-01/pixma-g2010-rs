@@ -134,6 +134,48 @@ pub enum MaintenanceAction {
     },
 }
 
+/// Maintenance cleaning capabilities parsed from `GetCapability(servicetype="maintenance")`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MaintenanceCapabilities {
+    /// Supported `(cleaning_type, allowed_ink_groups)` pairs reported by printer firmware
+    /// (for example `("regular", ["all", "group1", "group2"])`).
+    pub cleaning_groups: Vec<(String, Vec<String>)>,
+    /// Raw `GetCapabilityResponse` XML returned by the firmware for diagnostics.
+    pub raw_xml: String,
+}
+
+impl MaintenanceCapabilities {
+    /// Returns `Some(true)` if the firmware explicitly lists `target_ivec` under `kind_ivec`,
+    /// `Some(false)` if `kind_ivec` is listed with a non-empty allowed group list excluding
+    /// `target_ivec`, and `None` when capability data is unavailable or empty.
+    pub fn supports(&self, kind_ivec: &str, target_ivec: &str) -> Option<bool> {
+        let kind_norm = kind_ivec.trim().to_ascii_lowercase();
+        let target_norm = target_ivec.trim().to_ascii_lowercase();
+        let (_, groups) = self
+            .cleaning_groups
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&kind_norm))?;
+        if groups.is_empty() {
+            return None;
+        }
+        Some(groups.iter().any(|g| g.eq_ignore_ascii_case(&target_norm)))
+    }
+
+    /// Formats the allowed `(type, [groups])` list into a concise summary string.
+    pub fn format_summary(&self) -> Option<String> {
+        if self.cleaning_groups.is_empty() {
+            return None;
+        }
+        let summary = self
+            .cleaning_groups
+            .iter()
+            .map(|(kind, ink_groups)| format!("{kind}=[{}]", ink_groups.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(summary)
+    }
+}
+
 /// Persistent state record tracking maintenance history and waste absorber saturation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceRecord {

@@ -41,6 +41,10 @@ pub enum RasterError {
     #[error("Stream parsing error: {0}")]
     StreamParse(String),
 
+    /// Underlying I/O failure reading input or writing compiled output stream.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// Dithering or halftoning processing error.
     #[error("Halftone error: {0}")]
     Halftone(String),

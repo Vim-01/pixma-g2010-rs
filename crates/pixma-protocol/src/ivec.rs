@@ -266,10 +266,16 @@ impl ParsedStatusReport {
 
     /// Returns `true` if this XML message is a `GetCapabilityResponse`.
     pub fn is_capability_response(&self) -> bool {
-        self.ivec_operation.as_deref().is_some_and(|op| {
-            op.eq_ignore_ascii_case("GetCapabilityResponse")
-                || op.eq_ignore_ascii_case("GetCapability")
-        })
+        match self.ivec_operation.as_deref() {
+            Some(op) => {
+                op.eq_ignore_ascii_case("GetCapabilityResponse")
+                    || op.eq_ignore_ascii_case("GetCapability")
+            }
+            None => self.ivec_response.as_deref().is_some_and(|r| {
+                r.eq_ignore_ascii_case("GetCapabilityResponse")
+                    || r.eq_ignore_ascii_case("GetCapability")
+            }),
+        }
     }
 }
 
@@ -550,14 +556,46 @@ pub fn parse_status_response_with_meta(xml: &str) -> Result<ParsedStatusReport, 
     })
 }
 
+/// Merges a cleaning `(kind, groups)` entry into `out`, deduplicating tokens while keeping order.
+fn merge_cleaning_group_entry(
+    out: &mut Vec<(String, Vec<String>)>,
+    kind_opt: Option<String>,
+    groups: Vec<String>,
+) {
+    let Some(kind) = kind_opt else {
+        return;
+    };
+    if let Some((_, existing)) = out.iter_mut().find(|(k, _)| *k == kind) {
+        for g in groups {
+            if !existing.contains(&g) {
+                existing.push(g);
+            }
+        }
+    } else {
+        out.push((kind, groups));
+    }
+}
+
+fn push_csv_inkgroup_tokens(text: &str, current_groups: &mut Vec<String>) {
+    for token in text.split(',').map(|s| s.trim().to_lowercase()) {
+        if !token.is_empty() && !current_groups.contains(&token) {
+            current_groups.push(token);
+        }
+    }
+}
+
 /// Parses `<ivec:Cleaning>` sections from an IVEC `GetCapabilityResponse` (`servicetype="maintenance"`),
 /// returning `(cleaning_type, supported_ink_groups)` pairs such as `("regular", ["all", "group1", "group2"])`.
+///
+/// Supports nested `<ivec:type value="..."><ivec:inkgroup>a,b</ivec:inkgroup></ivec:type>`,
+/// sibling `<ivec:type>...</ivec:type><ivec:inkgroup>...</ivec:inkgroup>`, and self-closing
+/// `<ivec:type value="..."/>` / `<ivec:inkgroup value="..."/>` variants.
 pub fn parse_maintenance_cleaning_groups(xml: &str) -> Result<Vec<(String, Vec<String>)>, ProtocolError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut out = Vec::new();
-    let mut current_tag = String::new();
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut tag_stack: Vec<String> = Vec::new();
     let mut in_cleaning = false;
     let mut current_type: Option<String> = None;
     let mut current_groups: Vec<String> = Vec::new();
@@ -567,10 +605,51 @@ pub fn parse_maintenance_cleaning_groups(xml: &str) -> Result<Vec<(String, Vec<S
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                current_tag = normalize_tag(&name);
-                if current_tag == "cleaning" {
+                let tag = normalize_tag(&name);
+                tag_stack.push(tag.clone());
+                if tag == "cleaning" {
                     in_cleaning = true;
-                } else if in_cleaning && current_tag == "type" {
+                    current_type = None;
+                    current_groups.clear();
+                } else if in_cleaning && tag == "type" {
+                    if current_type.is_some() {
+                        merge_cleaning_group_entry(
+                            &mut out,
+                            current_type.take(),
+                            std::mem::take(&mut current_groups),
+                        );
+                    }
+                    let val_attr = e.attributes().flatten().find_map(|attr| {
+                        attr.key
+                            .as_ref()
+                            .eq_ignore_ascii_case(b"value")
+                            .then(|| String::from_utf8_lossy(&attr.value).trim().to_lowercase())
+                            .filter(|s| !s.is_empty())
+                    });
+                    current_type = val_attr;
+                    current_groups.clear();
+                } else if in_cleaning && tag == "inkgroup" && current_type.is_some() {
+                    if let Some(val) = e.attributes().flatten().find_map(|attr| {
+                        attr.key
+                            .as_ref()
+                            .eq_ignore_ascii_case(b"value")
+                            .then(|| String::from_utf8_lossy(&attr.value).into_owned())
+                    }) {
+                        push_csv_inkgroup_tokens(&val, &mut current_groups);
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = normalize_tag(&name);
+                if in_cleaning && tag == "type" {
+                    if current_type.is_some() {
+                        merge_cleaning_group_entry(
+                            &mut out,
+                            current_type.take(),
+                            std::mem::take(&mut current_groups),
+                        );
+                    }
                     current_type = e.attributes().flatten().find_map(|attr| {
                         attr.key
                             .as_ref()
@@ -579,39 +658,66 @@ pub fn parse_maintenance_cleaning_groups(xml: &str) -> Result<Vec<(String, Vec<S
                             .filter(|s| !s.is_empty())
                     });
                     current_groups.clear();
+                } else if in_cleaning && tag == "inkgroup" && current_type.is_some() {
+                    if let Some(val) = e.attributes().flatten().find_map(|attr| {
+                        attr.key
+                            .as_ref()
+                            .eq_ignore_ascii_case(b"value")
+                            .then(|| String::from_utf8_lossy(&attr.value).into_owned())
+                    }) {
+                        push_csv_inkgroup_tokens(&val, &mut current_groups);
+                    }
                 }
             }
             Ok(Event::Text(ref e)) => {
-                if in_cleaning && current_tag == "inkgroup" && current_type.is_some() {
-                    let text = e
-                        .unescape()
-                        .map_err(|err| ProtocolError::Xml(err.to_string()))?;
-                    for token in text.split(',').map(|s| s.trim().to_lowercase()) {
-                        if !token.is_empty() && !current_groups.contains(&token) {
-                            current_groups.push(token);
+                if in_cleaning {
+                    let top = tag_stack.last().map(String::as_str);
+                    if top == Some("type") {
+                        let text = e
+                            .unescape()
+                            .map_err(|err| ProtocolError::Xml(err.to_string()))?;
+                        let val = text.trim().to_lowercase();
+                        if !val.is_empty() && current_type.is_none() {
+                            current_type = Some(val);
                         }
+                    } else if top == Some("inkgroup") && current_type.is_some() {
+                        let text = e
+                            .unescape()
+                            .map_err(|err| ProtocolError::Xml(err.to_string()))?;
+                        push_csv_inkgroup_tokens(&text, &mut current_groups);
                     }
                 }
             }
             Ok(Event::End(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let tag = normalize_tag(&name);
-                if tag == "type" {
-                    if let Some(kind) = current_type.take() {
-                        out.push((kind, std::mem::take(&mut current_groups)));
-                    }
-                } else if tag == "cleaning" {
+                if tag == "cleaning" {
+                    merge_cleaning_group_entry(
+                        &mut out,
+                        current_type.take(),
+                        std::mem::take(&mut current_groups),
+                    );
                     in_cleaning = false;
-                    current_type = None;
-                    current_groups.clear();
                 }
-                current_tag.clear();
+                while let Some(popped) = tag_stack.pop() {
+                    if popped == tag {
+                        break;
+                    }
+                }
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(e) => return Err(ProtocolError::Xml(e.to_string())),
         }
         buf.clear();
+    }
+
+    if current_type.is_some() {
+        merge_cleaning_group_entry(
+            &mut out,
+            current_type.take(),
+            std::mem::take(&mut current_groups),
+        );
     }
 
     Ok(out)
@@ -1443,6 +1549,36 @@ mod tests {
         assert_eq!(
             groups[1],
             ("deep".to_string(), vec!["all".into(), "group1".into()])
+        );
+
+        // Variant XML shape: sibling tags, self-closing <inkgroup value="..."/>, and repeated types
+        let sibling_cap_resp = r#"<?xml version="1.0" encoding="utf-8" ?>
+<cmd xmlns:ivec="http://www.canon.com/ns/cmd/2008/07/common/">
+  <ivec:contents>
+    <ivec:response>GetCapabilityResponse</ivec:response>
+    <ivec:param_set servicetype="maintenance">
+      <ivec:Cleaning>
+        <ivec:type>regular</ivec:type>
+        <ivec:inkgroup value="all"/>
+        <ivec:inkgroup>group1,group2</ivec:inkgroup>
+        <ivec:type value="deep"/>
+        <ivec:inkgroup>all</ivec:inkgroup>
+      </ivec:Cleaning>
+    </ivec:param_set>
+  </ivec:contents>
+</cmd>"#;
+        let report = parse_status_response_with_meta(sibling_cap_resp).unwrap();
+        assert!(report.is_capability_response());
+        let sib_groups = parse_maintenance_cleaning_groups(sibling_cap_resp).unwrap();
+        assert_eq!(
+            sib_groups,
+            vec![
+                (
+                    "regular".to_string(),
+                    vec!["all".into(), "group1".into(), "group2".into()]
+                ),
+                ("deep".to_string(), vec!["all".into()]),
+            ]
         );
     }
 

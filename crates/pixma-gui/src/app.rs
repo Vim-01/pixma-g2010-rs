@@ -1,6 +1,8 @@
 //! Native Wayland/X11 GTK4 + Libadwaita application for PIXMA G2010 Studio.
 
-use pixma_core::maintenance::{CleaningTarget, CleaningType, RollerCleanTarget, TestPrintType};
+use pixma_core::maintenance::{
+    CleaningTarget, CleaningType, MaintenanceCapabilities, RollerCleanTarget, TestPrintType,
+};
 use pixma_core::models::{CartridgeState, OperationalState};
 use pixma_core::print_params::{
     BorderlessExtension, InkDryingTime, MediaType, PageLayout, PaperGapMode, PaperSize,
@@ -67,6 +69,7 @@ pub enum AppMsg {
         snapshot: Box<LiveDaemonSnapshot>,
     },
     TelemetryDisconnected(String),
+    MaintenanceCapabilitiesReceived(Option<MaintenanceCapabilities>),
 
     // Asynchronous hardware actions
     TriggerRefreshTelemetry,
@@ -101,6 +104,7 @@ pub struct AppModel {
     pub pending_toasts: RefCell<Vec<(String, u32)>>,
     pub last_maint_feedback: Option<Result<String, String>>,
     pub last_scan_error: Option<String>,
+    pub capabilities_fetched: bool,
 }
 
 impl AppModel {
@@ -223,9 +227,10 @@ pub struct AppWidgets {
 
     // Maintenance
     pub maint_status_row: adw::ActionRow,
+    pub maint_capabilities_row: adw::ActionRow,
     pub maint_spinner: gtk::Spinner,
     pub maint_action_buttons: Vec<gtk::Button>,
-    pub flush_execute_btn: gtk::Button,
+    pub flush_execute_buttons: Vec<gtk::Button>,
     pub flush_confirm_switch: gtk::Switch,
     pub align_scales: Vec<gtk::Scale>,
 
@@ -293,6 +298,7 @@ impl SimpleComponent for AppModel {
             pending_toasts: RefCell::new(Vec::new()),
             last_maint_feedback: None,
             last_scan_error: None,
+            capabilities_fetched: false,
         };
 
         let toast_overlay = adw::ToastOverlay::new();
@@ -674,7 +680,13 @@ impl SimpleComponent for AppModel {
         let maint_spinner = gtk::Spinner::new();
         maint_spinner.set_visible(false);
         maint_status_row.add_suffix(&maint_spinner);
+        let maint_capabilities_row = adw::ActionRow::builder()
+            .title("Поддерживаемые группы прошивки (GetCapability)")
+            .subtitle("Ожидание подключения к принтеру...")
+            .subtitle_lines(0)
+            .build();
         maint_status_group.add(&maint_status_row);
+        maint_status_group.add(&maint_capabilities_row);
 
         let maint_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
         maint_box.set_margin_top(10);
@@ -784,21 +796,30 @@ impl SimpleComponent for AppModel {
 
         let flush_btn_row = adw::ActionRow::builder()
             .title("Execute System Ink Flush")
+            .subtitle("Select All, Black (group1), or Color (group2) if allowed by firmware")
             .build();
-        let flush_execute_btn = gtk::Button::builder()
-            .label("Purge Tubes (Ink Flush)")
-            .css_classes(["destructive-action"])
-            .sensitive(false)
-            .build();
-        let s_flush = sender.clone();
-        flush_execute_btn.connect_clicked(move |_| {
-            s_flush.input(AppMsg::TriggerClean(
-                CleaningType::InkFlush,
-                CleaningTarget::All,
-            ));
-        });
-        flush_btn_row.add_suffix(&flush_execute_btn);
+        let make_flush_btn = |label: &str, target: CleaningTarget| -> gtk::Button {
+            let btn = gtk::Button::builder()
+                .label(label)
+                .css_classes(["destructive-action"])
+                .sensitive(false)
+                .build();
+            let s_flush = sender.clone();
+            btn.connect_clicked(move |_| {
+                s_flush.input(AppMsg::TriggerClean(CleaningType::InkFlush, target));
+            });
+            btn
+        };
+        let btn_flush_all = make_flush_btn("All", CleaningTarget::All);
+        let btn_flush_bk = make_flush_btn("Black", CleaningTarget::BlackOnly);
+        let btn_flush_col = make_flush_btn("Color", CleaningTarget::ColorOnly);
+        let flush_btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        flush_btn_box.append(&btn_flush_all);
+        flush_btn_box.append(&btn_flush_bk);
+        flush_btn_box.append(&btn_flush_col);
+        flush_btn_row.add_suffix(&flush_btn_box);
         flush_group.add(&flush_btn_row);
+        let flush_execute_buttons = vec![btn_flush_all, btn_flush_bk, btn_flush_col];
 
         maint_box.append(&flush_group);
 
@@ -1327,9 +1348,10 @@ impl SimpleComponent for AppModel {
             glossy_notice_label,
             print_test_btn,
             maint_status_row,
+            maint_capabilities_row,
             maint_spinner,
             maint_action_buttons,
-            flush_execute_btn,
+            flush_execute_buttons,
             flush_confirm_switch,
             align_scales,
             ink_group,
@@ -1544,10 +1566,40 @@ impl SimpleComponent for AppModel {
             AppMsg::LiveSnapshotReceived { source, snapshot } => {
                 self.vm
                     .handle_event(StudioEvent::ApplyLiveSnapshot { source, snapshot });
+                if !self.capabilities_fetched {
+                    self.capabilities_fetched = true;
+                    let client_arc = self.client.clone();
+                    let is_mock = self.vm.is_mock_mode;
+                    let configured_socket = self.configured_socket.clone();
+                    let s = sender.clone();
+                    tokio::spawn(async move {
+                        let res = run_action_with_client(
+                            client_arc,
+                            is_mock,
+                            configured_socket,
+                            |c| {
+                                Box::pin(async move {
+                                    // Always return Ok(...) to avoid tearing down a healthy DirectUsb handle
+                                    Ok(c.get_maintenance_capabilities()
+                                        .await
+                                        .map_err(|e| e.to_string()))
+                                })
+                            },
+                        )
+                        .await;
+                        let caps_opt = res.ok().and_then(|inner| inner.ok());
+                        s.input(AppMsg::MaintenanceCapabilitiesReceived(caps_opt));
+                    });
+                }
             }
             AppMsg::TelemetryDisconnected(err) => {
+                self.capabilities_fetched = false;
                 self.vm
                     .handle_event(StudioEvent::ReportTelemetryDisconnected(err));
+            }
+            AppMsg::MaintenanceCapabilitiesReceived(caps) => {
+                self.vm
+                    .handle_event(StudioEvent::SetMaintenanceCapabilities(caps));
             }
 
             // Asynchronous hardware actions
@@ -1788,18 +1840,35 @@ impl SimpleComponent for AppModel {
         for btn in &widgets.maint_action_buttons {
             btn.set_sensitive(!maint_locked);
         }
-        widgets
-            .flush_execute_btn
-            .set_sensitive(self.vm.ink_flush_confirmed && !maint_locked);
+        for btn in &widgets.flush_execute_buttons {
+            btn.set_sensitive(self.vm.ink_flush_confirmed && !maint_locked);
+        }
         widgets
             .flush_confirm_switch
             .set_active(self.vm.ink_flush_confirmed);
 
+        let caps_sub = match self.vm.maintenance_capabilities.as_ref() {
+            Some(caps) => caps
+                .format_summary()
+                .map(|s| format!("Прошивка разрешает: {s}"))
+                .unwrap_or_else(|| {
+                    "GetCapabilityResponse получен без тегов <ivec:Cleaning>; все группы доступны"
+                        .to_string()
+                }),
+            None if self.vm.telemetry.connected => {
+                "GetCapability не возвращён (возможно pixmad < 0.3.1); ограничения не применяются"
+                    .to_string()
+            }
+            None => "Ожидание подключения к принтеру...".to_string(),
+        };
+        set_row_subtitle_plain(&widgets.maint_capabilities_row, &caps_sub);
+
         if self.vm.is_busy {
             widgets.maint_spinner.set_visible(true);
             widgets.maint_spinner.start();
-            widgets.maint_status_row.set_title("Выполняется команда...");
-            widgets.maint_status_row.set_subtitle(
+            set_row_title_plain(&widgets.maint_status_row, "Выполняется команда...");
+            set_row_subtitle_plain(
+                &widgets.maint_status_row,
                 self.vm
                     .busy_operation
                     .as_deref()
@@ -1808,36 +1877,36 @@ impl SimpleComponent for AppModel {
         } else if let Some(active_state) = hw_active_state {
             widgets.maint_spinner.set_visible(true);
             widgets.maint_spinner.start();
-            widgets
-                .maint_status_row
-                .set_title("Принтер выполняет обслуживание");
-            widgets.maint_status_row.set_subtitle(&format!(
-                "Реальный ответ принтера: {} ({:?})",
-                format_op_state_ru(active_state),
-                active_state
-            ));
+            set_row_title_plain(
+                &widgets.maint_status_row,
+                "Принтер выполняет обслуживание",
+            );
+            set_row_subtitle_plain(
+                &widgets.maint_status_row,
+                &format!(
+                    "Реальный ответ принтера: {} ({:?})",
+                    format_op_state_ru(active_state),
+                    active_state
+                ),
+            );
         } else if let Some(Err(ref err)) = self.last_maint_feedback {
             widgets.maint_spinner.stop();
             widgets.maint_spinner.set_visible(false);
-            widgets.maint_status_row.set_title("Ошибка / отклонено");
-            widgets
-                .maint_status_row
-                .set_subtitle(&format_concise_error(err));
+            set_row_title_plain(&widgets.maint_status_row, "Ошибка / отклонено");
+            set_row_subtitle_plain(&widgets.maint_status_row, &format_concise_error(err));
         } else if let Some(Ok(ref msg)) = self.last_maint_feedback {
             widgets.maint_spinner.stop();
             widgets.maint_spinner.set_visible(false);
-            widgets.maint_status_row.set_title("Последняя операция");
-            widgets.maint_status_row.set_subtitle(&format!(
-                "{msg} · Текущий статус: {}",
-                self.vm.status_banner
-            ));
+            set_row_title_plain(&widgets.maint_status_row, "Последняя операция");
+            set_row_subtitle_plain(
+                &widgets.maint_status_row,
+                &format!("{msg} · Текущий статус: {}", self.vm.status_banner),
+            );
         } else {
             widgets.maint_spinner.stop();
             widgets.maint_spinner.set_visible(false);
-            widgets.maint_status_row.set_title("Готово к обслуживанию");
-            widgets
-                .maint_status_row
-                .set_subtitle(&self.vm.status_banner);
+            set_row_title_plain(&widgets.maint_status_row, "Готово к обслуживанию");
+            set_row_subtitle_plain(&widgets.maint_status_row, &self.vm.status_banner);
         }
 
         // Tab 4 Status Monitor: Connection + USB Hardware Marker rows
@@ -1921,9 +1990,7 @@ impl SimpleComponent for AppModel {
             }
         }
 
-        widgets
-            .diagnostic_banner_row
-            .set_title(&self.vm.status_banner);
+        set_row_title_plain(&widgets.diagnostic_banner_row, &self.vm.status_banner);
         let banner_sub = match (&self.vm.telemetry.snapshot, &self.vm.telemetry.last_error) {
             (_, Some(err)) => format!("Ошибка связи: {err}"),
             (Some(snap), None) => match (&snap.status.support_code, &snap.status.lcd_code) {
@@ -1933,7 +2000,7 @@ impl SimpleComponent for AppModel {
             },
             (None, None) => "Ожидание реального ответа от принтера".to_string(),
         };
-        widgets.diagnostic_banner_row.set_subtitle(&banner_sub);
+        set_row_subtitle_plain(&widgets.diagnostic_banner_row, &banner_sub);
 
         // Tab 3 ScanGear Pro
         widgets.scan_btn.set_sensitive(!maint_locked);
@@ -1956,16 +2023,12 @@ impl SimpleComponent for AppModel {
             widgets.scan_preview_picture.set_visible(false);
         }
         if let Some(ref scan_err) = self.last_scan_error {
-            widgets.scan_result_row.set_title("Ошибка сканирования");
-            widgets.scan_result_row.set_subtitle(scan_err);
+            set_row_title_plain(&widgets.scan_result_row, "Ошибка сканирования");
+            set_row_subtitle_plain(&widgets.scan_result_row, scan_err);
             widgets.scan_open_btn.set_visible(false);
         } else if let Some(path) = &self.vm.last_scan_path {
-            widgets
-                .scan_result_row
-                .set_title("Scan Acquired & Exported Successfully");
-            widgets
-                .scan_result_row
-                .set_subtitle(&path.display().to_string());
+            set_row_title_plain(&widgets.scan_result_row, "Scan Acquired & Exported Successfully");
+            set_row_subtitle_plain(&widgets.scan_result_row, &path.display().to_string());
             widgets.scan_open_btn.set_visible(true);
         }
     }
@@ -2225,6 +2288,16 @@ fn format_connection_strip(vm: &StudioViewModel, led: ConnectionLedState) -> (St
     }
 }
 
+fn set_row_title_plain(row: &adw::ActionRow, text: &str) {
+    let escaped = gtk::glib::markup_escape_text(text);
+    row.set_title(&escaped);
+}
+
+fn set_row_subtitle_plain(row: &adw::ActionRow, text: &str) {
+    let escaped = gtk::glib::markup_escape_text(text);
+    row.set_subtitle(&escaped);
+}
+
 fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
     if let Some(snap) = vm.telemetry.snapshot.as_ref().filter(|_| vm.telemetry.connected) {
         let mode_str = match &vm.telemetry.source {
@@ -2249,7 +2322,7 @@ fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
                 "Виртуальный эмулятор (--mock), реальная шина USB не используется".to_string()
             }
         };
-        widgets.conn_mode_row.set_subtitle(&mode_str);
+        set_row_subtitle_plain(&widgets.conn_mode_row, &mode_str);
 
         let m = &snap.hardware_marker;
         let marker_full = if m.is_mock {
@@ -2278,11 +2351,12 @@ fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
                 m.serial_number
             )
         };
-        widgets.usb_marker_row.set_subtitle(&marker_full);
-        widgets.usb_endpoints_row.set_subtitle(&m.endpoints_summary);
-        widgets
-            .ieee1284_row
-            .set_subtitle(snap.ieee1284_id.as_deref().unwrap_or("Не передано устройством"));
+        set_row_subtitle_plain(&widgets.usb_marker_row, &marker_full);
+        set_row_subtitle_plain(&widgets.usb_endpoints_row, &m.endpoints_summary);
+        set_row_subtitle_plain(
+            &widgets.ieee1284_row,
+            snap.ieee1284_id.as_deref().unwrap_or("Не передано устройством"),
+        );
 
         let port_str = snap
             .usb_port_status
@@ -2309,7 +2383,7 @@ fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
             fw_str,
             active_str,
         );
-        widgets.usb_port_ivec_row.set_subtitle(&ivec_str);
+        set_row_subtitle_plain(&widgets.usb_port_ivec_row, &ivec_str);
     } else {
         let err = vm
             .telemetry
@@ -2322,15 +2396,14 @@ fn update_connection_detail_rows(widgets: &AppWidgets, vm: &StudioViewModel) {
             .as_deref()
             .map(|h| format!("Удалённый канал ({h}) не активен: "))
             .unwrap_or_default();
-        widgets
-            .conn_mode_row
-            .set_subtitle(&format!("{remote_prefix}{err}"));
-        widgets
-            .usb_marker_row
-            .set_subtitle("Физическое USB-устройство не обнаружено / не отвечает");
-        widgets.usb_endpoints_row.set_subtitle("Нет данных");
-        widgets.ieee1284_row.set_subtitle("Нет данных");
-        widgets.usb_port_ivec_row.set_subtitle("Нет данных");
+        set_row_subtitle_plain(&widgets.conn_mode_row, &format!("{remote_prefix}{err}"));
+        set_row_subtitle_plain(
+            &widgets.usb_marker_row,
+            "Физическое USB-устройство не обнаружено / не отвечает",
+        );
+        set_row_subtitle_plain(&widgets.usb_endpoints_row, "Нет данных");
+        set_row_subtitle_plain(&widgets.ieee1284_row, "Нет данных");
+        set_row_subtitle_plain(&widgets.usb_port_ivec_row, "Нет данных");
     }
 }
 
@@ -2444,6 +2517,7 @@ mod tests {
             pending_toasts: RefCell::new(Vec::new()),
             last_maint_feedback: None,
             last_scan_error: None,
+            capabilities_fetched: false,
         };
 
         model.apply_hardware_task_finished(Ok("Done".to_string()));
@@ -2476,5 +2550,8 @@ mod tests {
         assert!(!model.vm.is_busy);
         assert!(model.last_scan_error.is_none());
         assert_eq!(model.vm.last_scan_path, Some(scan_path));
+
+        let escaped = gtk::glib::markup_escape_text("<ivec:Cleaning> & A/B");
+        assert_eq!(escaped.as_str(), "&lt;ivec:Cleaning&gt; &amp; A/B");
     }
 }

@@ -257,6 +257,14 @@ impl DaemonServer {
                         Self::build_busy_snapshot(&arbitrator, &meta).await
                     }
                 }
+                DaemonRequest::GetMaintenanceCapabilities => {
+                    let _guard = arbitrator.acquire(JobLockKind::Maintenance).await;
+                    let mut ctrl = controller.lock().await;
+                    match ctrl.query_maintenance_capabilities().await {
+                        Ok(caps) => DaemonResponse::MaintenanceCapabilities(Ok(caps)),
+                        Err(e) => DaemonResponse::MaintenanceCapabilities(Err(e.to_string())),
+                    }
+                }
                 DaemonRequest::ExecuteMaintenance {
                     action,
                     confirmation_token,
